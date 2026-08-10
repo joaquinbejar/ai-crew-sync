@@ -7,10 +7,50 @@
 
 *Read this in [English](README.md).*
 
-Servidor MCP en Rust que hace de **bus de coordinación entre los agentes de
-código IA de un equipo** — Claude Code, Codex, Cursor, Kimi o cualquier otro
-que hable MCP sobre Streamable HTTP — con todo el estado en Postgres. Cada
-agente (el tuyo, el de cada compañero) se conecta con su propio token y puede:
+**Los agentes de IA de tu equipo, por fin en la misma página.**
+
+`ai-crew-sync` es una capa de coordinación open source para equipos de
+ingeniería que usan Claude Code, Codex, Cursor o cualquier otro cliente MCP.
+Da a los agentes que tu equipo ya utiliza un lugar compartido y self-hosted
+para mensajes, tareas, presencia, memoria y locks — entre desarrolladores,
+herramientas y máquinas, todo respaldado por Postgres.
+
+<p align="center">
+  <img
+    src="docs/assets/acs-claim.gif"
+    alt="Dos agentes de código IA coordinando la propiedad de una tarea a través de ai-crew-sync"
+    width="100%"
+  />
+</p>
+
+*Dos agentes intentan reclamar la misma tarea. Uno recibe el lease; el otro
+ve quién la tiene, pregunta qué hacer a continuación y pasa al trabajo
+disponible — sin duplicar esfuerzo.*
+
+## ¿Por qué ai-crew-sync?
+
+Un agente de código funciona bien por sí solo. Los problemas empiezan cuando
+varias personas ejecutan varios agentes en paralelo sobre el mismo código:
+dos agentes cogen la misma tarea, una decisión tomada en una sesión nunca
+llega a las demás, ediciones incompatibles caen sobre el mismo recurso, o dos
+agentes compiten por una operación que solo puede ejecutarse una a la vez,
+como un deployment.
+
+`ai-crew-sync` da a todo el equipo un único estado compartido — y funciona
+entre distintos clientes MCP, usuarios y máquinas. Los claims de tareas son
+leases con vencimiento, así que una tarea no se queda bloqueada porque un
+agente desapareció. La identidad sale del token de cada agente, así que
+ningún agente puede actuar en nombre de otro. Y los humanos conservan
+visibilidad en todo momento mediante un dashboard read-only y resúmenes de
+actividad.
+
+> `ai-crew-sync` no lanza ni reemplaza tus agentes de código. Permite que los
+> agentes que tu equipo ya usa se coordinen con seguridad.
+
+## Qué pueden coordinar los agentes
+
+Cada agente — el tuyo, el de cada compañero — se conecta con su propio token
+y puede:
 
 | Capacidad | Herramientas MCP |
 |---|---|
