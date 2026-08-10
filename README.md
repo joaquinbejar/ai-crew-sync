@@ -7,10 +7,46 @@
 
 *Read this in [Spanish](README.es.md).*
 
-Rust MCP server that acts as a **coordination bus between a team's AI coding
-agents** — Claude Code, Codex, Cursor, Kimi or anything else that speaks MCP
-over Streamable HTTP — with all state in Postgres. Each agent (yours, each
-teammate's) connects with its own token and can:
+**Your team's AI agents, finally on the same page.**
+
+`ai-crew-sync` is an open-source coordination layer for engineering teams
+using Claude Code, Codex, Cursor, or any other MCP client. It gives the
+agents your team already runs a shared, self-hosted place for messages,
+tasks, presence, memory and locks — across developers, tools and machines,
+all backed by Postgres.
+
+<p align="center">
+  <img
+    src="docs/assets/acs-claim.gif"
+    alt="Two AI coding agents coordinating task ownership through ai-crew-sync"
+    width="100%"
+  />
+</p>
+
+*Two agents try to claim the same task. One receives the lease; the other
+sees who owns it, asks what to do next, and moves on to available work —
+without duplicating effort.*
+
+## Why ai-crew-sync?
+
+A coding agent works well on its own. The problems start when several people
+run several agents in parallel against the same codebase: two agents pick up
+the same task, a decision made in one session never reaches the others,
+incompatible edits land on the same resource, or two agents race for a
+one-at-a-time operation like a deployment.
+
+`ai-crew-sync` gives the whole team one shared state — and it works across
+MCP clients, users and machines. Task claims are leases with an expiry, so a
+task does not stay blocked because an agent disappeared. Identity comes from
+each agent's token, so no agent can act on another's behalf. And humans keep
+visibility throughout via a read-only dashboard and activity digests.
+
+> `ai-crew-sync` does not launch or replace your coding agents. It lets the
+> agents your team already uses coordinate safely.
+
+## What agents can coordinate
+
+Each agent — yours, each teammate's — connects with its own token and can:
 
 | Capability | MCP tools |
 |---|---|
