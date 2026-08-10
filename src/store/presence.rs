@@ -82,13 +82,28 @@ pub async fn heartbeat(
         WITH up AS (
             INSERT INTO agent_presence
                 (agent_id, session, status, repo, branch, activity, updated_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, now(), now() + make_interval(secs => $7))
+            -- NULLIF on the insert path too: the CASE below only runs on
+            -- conflict, so a first heartbeat for a new or freshly swept
+            -- session stored '' and reported an empty string where the
+            -- update path reports null.
+            VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), now(),
+                    now() + make_interval(secs => $7))
             ON CONFLICT (agent_id, session) DO UPDATE SET
                 status     = EXCLUDED.status,
                 -- keep the previous value when the caller omits a field
                 repo       = COALESCE(EXCLUDED.repo, agent_presence.repo),
                 branch     = COALESCE(EXCLUDED.branch, agent_presence.branch),
-                activity   = COALESCE(EXCLUDED.activity, agent_presence.activity),
+                -- Omitted keeps the previous value; an explicit empty string
+                -- clears it. A session that has just started has not done
+                -- anything yet, and carrying yesterday's line forward is how
+                -- a status board ends up lying with a straight face.
+                -- Tested against the parameter, not EXCLUDED: the insert
+                -- above NULLIFs it, so EXCLUDED.activity no longer carries
+                -- the empty string that means "clear".
+                activity   = CASE
+                                 WHEN $6 = '' THEN NULL
+                                 ELSE COALESCE(EXCLUDED.activity, agent_presence.activity)
+                             END,
                 updated_at = now(),
                 expires_at = EXCLUDED.expires_at
             RETURNING agent_id, status, repo, branch, activity, updated_at, expires_at
@@ -114,6 +129,24 @@ pub async fn heartbeat(
     .bind(ttl as f64)
     .fetch_one(pool)
     .await?;
+
+    // Sweep this agent's long-dead rows. Nothing else ever deleted a presence
+    // row: before sessions that was bounded at one per agent, but a row per
+    // distinct session label grows without limit, and a label used once stays
+    // for good. An hour past expiry keeps "offline recently" visible while
+    // still clearing the orphan a sessionless hook left behind.
+    //
+    // Best-effort: presence is a status line, and failing to tidy it must not
+    // fail the heartbeat that was the actual request.
+    let _ = sqlx::query(
+        "DELETE FROM agent_presence
+          WHERE agent_id = $1 AND session <> $2
+            AND expires_at < now() - interval '1 hour'",
+    )
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .execute(pool)
+    .await;
 
     let (name, display_name, status, repo, branch, activity, updated_at, online) = row;
     Ok(AgentInfo {
