@@ -11,6 +11,13 @@
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 STATUS="${1:-active}"
+# Clamped before it reaches a payload. The python path would encode a
+# surprising value safely, but the fallback below interpolates it straight
+# into JSON, where one quote is malformed output rather than a bad status.
+case "$STATUS" in
+    active|idle|busy|blocked) ;;
+    *) STATUS=active ;;
+esac
 RESET="${2:-}"
 TTL=900
 [ "$STATUS" = "idle" ] && TTL=120

@@ -82,7 +82,12 @@ pub async fn heartbeat(
         WITH up AS (
             INSERT INTO agent_presence
                 (agent_id, session, status, repo, branch, activity, updated_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, now(), now() + make_interval(secs => $7))
+            -- NULLIF on the insert path too: the CASE below only runs on
+            -- conflict, so a first heartbeat for a new or freshly swept
+            -- session stored '' and reported an empty string where the
+            -- update path reports null.
+            VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), now(),
+                    now() + make_interval(secs => $7))
             ON CONFLICT (agent_id, session) DO UPDATE SET
                 status     = EXCLUDED.status,
                 -- keep the previous value when the caller omits a field
@@ -92,8 +97,11 @@ pub async fn heartbeat(
                 -- clears it. A session that has just started has not done
                 -- anything yet, and carrying yesterday's line forward is how
                 -- a status board ends up lying with a straight face.
+                -- Tested against the parameter, not EXCLUDED: the insert
+                -- above NULLIFs it, so EXCLUDED.activity no longer carries
+                -- the empty string that means "clear".
                 activity   = CASE
-                                 WHEN EXCLUDED.activity = '' THEN NULL
+                                 WHEN $6 = '' THEN NULL
                                  ELSE COALESCE(EXCLUDED.activity, agent_presence.activity)
                              END,
                 updated_at = now(),

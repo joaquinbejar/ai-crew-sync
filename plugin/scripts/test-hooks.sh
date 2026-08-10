@@ -131,6 +131,30 @@ case "$out" in
     *) ok "an unexpanded \${VAR} is dropped rather than sent" ;;
 esac
 
+# Anything the server would reject is dropped, so the hook degrades to the
+# shared session instead of failing every call. A newline is the one that
+# matters most: in a header that is injection, not a bad label.
+for bad in 'has space' 'a/b' "$(printf 'x\ny: z')" "$(printf 'ctrl\001')" \
+           'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; do
+    out="$(call_with_session "$bad")"
+    case "$out" in
+        *X-Crew-Session*) bad "a rejectable session label is dropped" "$bad -> $out" ;;
+    esac
+done
+ok "labels the server would reject are dropped, not sent"
+
+# --- a surprising status cannot produce malformed JSON -----------------------
+# The python path encodes safely; the fallback interpolates straight into JSON,
+# where one quote is broken output rather than a bad status.
+: > "$CAPTURE"
+(cd "$REPO_DIR" && BUS_URL=x BUS_TOKEN=y sh "$WORK/bin/heartbeat.sh" 'evil"status') >/dev/null 2>&1
+cut -f2 "$CAPTURE" | tail -1 | python3 -c '
+import json, sys
+args = json.load(sys.stdin)
+assert args["status"] == "active", args
+' 2>/dev/null && ok "an unknown status is clamped rather than interpolated" \
+    || bad "status is clamped" "$(cut -f2 "$CAPTURE" | tail -1)"
+
 # --- session start clears the stale activity line ----------------------------
 # Omitted fields keep their previous value, so without this the last thing the
 # previous run announced stands as the current session's activity forever.

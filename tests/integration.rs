@@ -3500,6 +3500,19 @@ async fn an_empty_activity_clears_it_and_dead_rows_are_swept() {
         "clearing the activity must not disturb the other fields"
     );
 
+    // The first heartbeat of a *new* session, which is the path SessionStart
+    // actually takes: the clear ran only on conflict, so a fresh row stored an
+    // empty string where the update path stored null. The original test only
+    // covered clear-after-set and could never have caught it.
+    let fresh = connect_with_session(&h.base, &token, "brand-new").await;
+    let first = call(&fresh, "heartbeat", json!({"activity": ""})).await;
+    assert_eq!(
+        first["activity"],
+        Value::Null,
+        "a new session's first heartbeat must clear, not store '': {first}"
+    );
+    let _ = fresh.cancel().await;
+
     // A row from a session that is long gone is swept on the next heartbeat.
     // Nothing else ever deleted one, and a row per distinct label grows without
     // limit once sessions exist.
