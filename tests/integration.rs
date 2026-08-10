@@ -3466,3 +3466,88 @@ async fn your_own_general_session_can_announce_to_your_other_windows() {
     }
     h.shutdown().await;
 }
+
+#[tokio::test]
+async fn an_empty_activity_clears_it_and_dead_rows_are_swept() {
+    let h = require_db!("t_presence_hygiene");
+    let token = seed_agent(&h.pool, "layerv", "joaquin").await;
+    let market = connect_with_session(&h.base, &token, "market-data").await;
+
+    call(
+        &market,
+        "heartbeat",
+        json!({"repo": "Layer-V/market-data", "activity": "rewriting the feed"}),
+    )
+    .await;
+
+    // Omitting the field keeps it: a mid-session ping from the hook must not
+    // wipe what the model announced.
+    let kept = call(&market, "heartbeat", json!({"branch": "main"})).await;
+    assert_eq!(kept["activity"], "rewriting the feed");
+    assert_eq!(kept["branch"], "main");
+
+    // An explicit empty string clears it. Without this a session that starts
+    // again carries the previous run's line forever, because nothing else ever
+    // overwrites an omitted field.
+    let cleared = call(&market, "heartbeat", json!({"activity": ""})).await;
+    assert_eq!(
+        cleared["activity"],
+        Value::Null,
+        "an empty activity must clear, not store an empty string: {cleared}"
+    );
+    assert_eq!(
+        cleared["repo"], "Layer-V/market-data",
+        "clearing the activity must not disturb the other fields"
+    );
+
+    // A row from a session that is long gone is swept on the next heartbeat.
+    // Nothing else ever deleted one, and a row per distinct label grows without
+    // limit once sessions exist.
+    sqlx::query(sqlx::AssertSqlSafe(
+        "INSERT INTO agent_presence (agent_id, session, status, activity, updated_at, expires_at)
+         SELECT id, 'gone', 'active', 'stopping for the day', now() - interval '3 days',
+                now() - interval '3 days'
+           FROM agents WHERE name = 'joaquin'"
+            .to_owned(),
+    ))
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    let before: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM agent_presence WHERE session = 'gone'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(before.0, 1);
+
+    call(&market, "heartbeat", json!({})).await;
+
+    let after: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM agent_presence WHERE session = 'gone'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(after.0, 0, "a long-dead session row must not live forever");
+
+    // A row that only just expired is kept, so "offline recently" still reads.
+    sqlx::query(sqlx::AssertSqlSafe(
+        "INSERT INTO agent_presence (agent_id, session, status, updated_at, expires_at)
+         SELECT id, 'recent', 'active', now(), now() - interval '1 minute'
+           FROM agents WHERE name = 'joaquin'"
+            .to_owned(),
+    ))
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    call(&market, "heartbeat", json!({})).await;
+    let recent: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM agent_presence WHERE session = 'recent'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(recent.0, 1, "a just-expired session is still worth showing");
+
+    let _ = market.cancel().await;
+    h.shutdown().await;
+}

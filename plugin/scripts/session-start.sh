@@ -6,7 +6,9 @@ set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 [ -n "${BUS_URL:-}" ] && [ -n "${BUS_TOKEN:-}" ] || exit 0
 
-"$DIR/heartbeat.sh" active >/dev/null 2>&1 || true
+# reset: a new session has not done anything yet, so the previous run's
+# activity line must not stand as this one's.
+"$DIR/heartbeat.sh" active reset >/dev/null 2>&1 || true
 command -v python3 >/dev/null 2>&1 || exit 0
 
 # team_digest takes 1-336; anything else (empty, non-numeric, out of range)

@@ -88,7 +88,14 @@ pub async fn heartbeat(
                 -- keep the previous value when the caller omits a field
                 repo       = COALESCE(EXCLUDED.repo, agent_presence.repo),
                 branch     = COALESCE(EXCLUDED.branch, agent_presence.branch),
-                activity   = COALESCE(EXCLUDED.activity, agent_presence.activity),
+                -- Omitted keeps the previous value; an explicit empty string
+                -- clears it. A session that has just started has not done
+                -- anything yet, and carrying yesterday's line forward is how
+                -- a status board ends up lying with a straight face.
+                activity   = CASE
+                                 WHEN EXCLUDED.activity = '' THEN NULL
+                                 ELSE COALESCE(EXCLUDED.activity, agent_presence.activity)
+                             END,
                 updated_at = now(),
                 expires_at = EXCLUDED.expires_at
             RETURNING agent_id, status, repo, branch, activity, updated_at, expires_at
@@ -114,6 +121,24 @@ pub async fn heartbeat(
     .bind(ttl as f64)
     .fetch_one(pool)
     .await?;
+
+    // Sweep this agent's long-dead rows. Nothing else ever deleted a presence
+    // row: before sessions that was bounded at one per agent, but a row per
+    // distinct session label grows without limit, and a label used once stays
+    // for good. An hour past expiry keeps "offline recently" visible while
+    // still clearing the orphan a sessionless hook left behind.
+    //
+    // Best-effort: presence is a status line, and failing to tidy it must not
+    // fail the heartbeat that was the actual request.
+    let _ = sqlx::query(
+        "DELETE FROM agent_presence
+          WHERE agent_id = $1 AND session <> $2
+            AND expires_at < now() - interval '1 hour'",
+    )
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .execute(pool)
+    .await;
 
     let (name, display_name, status, repo, branch, activity, updated_at, online) = row;
     Ok(AgentInfo {

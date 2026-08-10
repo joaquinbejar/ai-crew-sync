@@ -86,6 +86,72 @@ assert isinstance(h, int) and 1 <= h <= 336, h
 done
 ok "BUS_DIGEST_HOURS guard keeps the digest request well-formed"
 
+# --- bus-call.sh sends the session header ------------------------------------
+# The bug: every hook goes through bus-call.sh, which sent only Authorization,
+# so the hook layer was person-scoped while the MCP connection beside it was
+# session-scoped. They wrote different presence rows.
+#
+# Kept in its own directory: $WORK/bin holds the *fake* bus-call the other
+# tests assert against, and overwriting it with the real one silently breaks
+# them.
+mkdir -p "$WORK/bcall"
+cp "$ROOT/bus-call.sh" "$WORK/bcall/bus-call.sh"
+cat > "$WORK/bcall/curl" <<'FAKECURL'
+#!/bin/sh
+printf '%s\n' "$*" >> "$CURLLOG"
+FAKECURL
+chmod +x "$WORK/bcall/curl"
+CURLLOG="$WORK/curl.txt"
+export CURLLOG
+
+call_with_session() {
+    : > "$CURLLOG"
+    BUS_SESSION="$1" BUS_URL=http://example.invalid/mcp BUS_TOKEN=acs_test \
+        PATH="$WORK/bcall:$PATH" sh "$WORK/bcall/bus-call.sh" whoami >/dev/null 2>&1
+    cat "$CURLLOG"
+}
+
+out="$(call_with_session market-data)"
+case "$out" in
+    *"X-Crew-Session: market-data"*) ok "bus-call sends the session header" ;;
+    *) bad "bus-call sends the session header" "$out" ;;
+esac
+
+out="$(call_with_session "")"
+case "$out" in
+    *X-Crew-Session*) bad "unset BUS_SESSION sends no header" "$out" ;;
+    *) ok "unset BUS_SESSION sends no header, not an empty one" ;;
+esac
+
+# A client whose config format has no default syntax passes the template
+# through; the server rejects it, so the hook must not send it either.
+out="$(call_with_session '${BUS_SESSION}')"
+case "$out" in
+    *X-Crew-Session*) bad "unexpanded template is not sent" "$out" ;;
+    *) ok "an unexpanded \${VAR} is dropped rather than sent" ;;
+esac
+
+# --- session start clears the stale activity line ----------------------------
+# Omitted fields keep their previous value, so without this the last thing the
+# previous run announced stands as the current session's activity forever.
+: > "$CAPTURE"
+(cd "$REPO_DIR" && BUS_URL=x BUS_TOKEN=y sh "$WORK/bin/heartbeat.sh" active reset) >/dev/null 2>&1
+cut -f2 "$CAPTURE" | tail -1 | python3 -c '
+import json, sys
+args = json.load(sys.stdin)
+assert args.get("activity") == "", args
+' 2>/dev/null && ok "session-start heartbeat clears the activity line" \
+    || bad "reset clears activity" "$(cut -f2 "$CAPTURE" | tail -1)"
+
+: > "$CAPTURE"
+(cd "$REPO_DIR" && BUS_URL=x BUS_TOKEN=y sh "$WORK/bin/heartbeat.sh" active) >/dev/null 2>&1
+cut -f2 "$CAPTURE" | tail -1 | python3 -c '
+import json, sys
+args = json.load(sys.stdin)
+assert "activity" not in args, args
+' 2>/dev/null && ok "a mid-session heartbeat leaves the activity alone" \
+    || bad "plain heartbeat omits activity" "$(cut -f2 "$CAPTURE" | tail -1)"
+
 # --- the Stop drain: oldest unanswered question, once each -------------------
 cp "$ROOT/stop-drain.sh" "$WORK/bin/stop-drain.sh"
 
@@ -172,8 +238,12 @@ assert "reply_to: 11" in ctx, ctx
 ' 2>/dev/null && ok "the second question is not lost behind the first" \
     || bad "drain loses a queued question" "$out"
 
-# Unconfigured bus: silent, as every hook must be.
-out="$(printf '{"session_id":"sess-f"}' | TMPDIR="$WORK" sh "$WORK/bin/stop-drain.sh" 2>/dev/null)"
+# Unconfigured bus: silent, as every hook must be. `env -u` rather than simply
+# not passing them: a developer machine that is connected to a real bus has
+# both exported from the shell profile, and the test would otherwise assert
+# nothing while appearing to pass on CI, where they happen to be absent.
+out="$(printf '{"session_id":"sess-f"}' \
+    | env -u BUS_URL -u BUS_TOKEN TMPDIR="$WORK" sh "$WORK/bin/stop-drain.sh" 2>/dev/null)"
 [ -z "$out" ] && ok "no BUS_URL/BUS_TOKEN means the hook does nothing" \
     || bad "drain without a configured bus" "$out"
 
