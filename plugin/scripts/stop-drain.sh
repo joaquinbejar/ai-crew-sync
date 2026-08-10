@@ -67,17 +67,45 @@ def for_this_window(m):
     addressed = m.get("to_session")
     return addressed is None or addressed == my_session
 
-# A question is a direct message someone else's agent is blocked on: ask_agent
-# marks it, and post_message can too.
-questions = [
-    m for m in messages
-    if isinstance(m, dict)
-    and m.get("to")
-    and m.get("from") != me
-    and for_this_window(m)
-    and (m.get("metadata") or {}).get("question") is True
-    and isinstance(m.get("id"), int)
-]
+def sent_by_this_window(m):
+    """Own messages are not news — but "own" is this window, not this person.
+
+    Comparing the agent alone meant a message from dani/coordination to
+    dani/risk-engine was dropped as mine, so two windows of one person could
+    address each other and never reach each other unprompted. Both sides
+    sessionless compares equal, so a single-window user is unchanged.
+    """
+    return m.get("from") == me and (m.get("from_session") or "") == my_session
+
+def is_question(m):
+    """One malformed message must not mute the hook for every other.
+
+    metadata is whatever the sender put there, and some clients stringify it,
+    so this cannot assume a dict. The whole block used to be one comprehension
+    ending in `|| true`: a single bad row raised, aborted it, and suppressed
+    every pending question for that turn — silently, for as long as the row
+    stayed in the 50-message window.
+    """
+    try:
+        if not isinstance(m, dict) or not isinstance(m.get("id"), int):
+            return False
+        if not m.get("to") or sent_by_this_window(m) or not for_this_window(m):
+            return False
+        metadata = m.get("metadata")
+        if isinstance(metadata, str):
+            # Best effort: the server reconstructs these now, but a message
+            # written by an older server is still in the window.
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                return False
+        return isinstance(metadata, dict) and metadata.get("question") is True
+    except Exception:
+        return False
+
+# A question is a direct message someone else's window is blocked on:
+# ask_agent marks it, and post_message can too.
+questions = [m for m in messages if is_question(m)]
 if not questions:
     raise SystemExit(0)
 
@@ -88,6 +116,8 @@ answered = {
     m["reply_to"] for m in messages
     if isinstance(m, dict) and m.get("from") == me and isinstance(m.get("reply_to"), int)
 }
+# Replies from a sibling window count too: the asker is unblocked either way,
+# and raising a question somebody already answered helps nobody.
 
 # Loop guard. A Stop hook that blocks unconditionally traps the session going
 # round forever, so each question is only ever blocked on once — if the model

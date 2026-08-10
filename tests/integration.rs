@@ -3640,3 +3640,62 @@ async fn the_summary_projects_a_named_session_over_the_shared_row() {
     }
     h.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_stringified_metadata_object_is_stored_as_an_object() {
+    let h = require_db!("t_metadata_shape");
+    let a = seed_agent(&h.pool, "layerv", "joaquin").await;
+    let b = seed_agent(&h.pool, "layerv", "dani").await;
+    let joaquin = connect(&h.base, &a).await;
+    let dani = connect(&h.base, &b).await;
+
+    // What some MCP clients actually send: the object serialised. Stored
+    // verbatim it is unusable — the Stop drain reads metadata["question"] and
+    // finds a string, so the capability the skill documents does not work.
+    let sent = call(
+        &joaquin,
+        "post_message",
+        json!({"to": "dani", "body": "is it green?",
+               "metadata": "{\"question\": true}"}),
+    )
+    .await;
+    assert_eq!(
+        sent["message"]["metadata"]["question"], true,
+        "a serialised object must be reconstructed: {}",
+        sent["message"]["metadata"]
+    );
+
+    // Deliberately narrow: a string that is not an object is what the caller
+    // asked for, and rewriting it would be guessing.
+    let plain = call(
+        &joaquin,
+        "post_message",
+        json!({"to": "dani", "body": "fyi", "metadata": "just a note"}),
+    )
+    .await;
+    assert_eq!(plain["message"]["metadata"], "just a note");
+
+    // An object still arrives as an object, which was never broken.
+    let obj = call(
+        &joaquin,
+        "post_message",
+        json!({"to": "dani", "body": "q", "metadata": {"question": true}}),
+    )
+    .await;
+    assert_eq!(obj["message"]["metadata"]["question"], true);
+
+    // Same normalisation on tasks, which take metadata too.
+    let task = call(
+        &joaquin,
+        "create_task",
+        json!({"key": "market-data#7", "title": "wire the feed",
+               "metadata": "{\"epic\": \"feeds\"}"}),
+    )
+    .await;
+    assert_eq!(task["metadata"]["epic"], "feeds");
+
+    for client in [joaquin, dani] {
+        let _ = client.cancel().await;
+    }
+    h.shutdown().await;
+}

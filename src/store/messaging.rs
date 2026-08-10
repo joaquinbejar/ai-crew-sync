@@ -387,10 +387,9 @@ pub async fn post_message(
         }
     }
 
-    super::check_metadata("message", input.metadata.as_ref())?;
-    let metadata = input
-        .metadata
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    let metadata_in = super::normalize_metadata(input.metadata);
+    super::check_metadata("message", metadata_in.as_ref())?;
+    let metadata = metadata_in.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
 
     // Message + attachments commit together, so the NOTIFY that wakes
     // teammates only fires once everything is readable.

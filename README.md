@@ -372,6 +372,9 @@ Reply to `from/from_session`, not just to the name, or the answer reaches
 whichever of their windows notices first instead of the one that is blocked
 waiting for it.
 
+A question from one of your **own** windows is surfaced like anyone else's:
+the unit the bus reasons about is the window, not the person.
+
 Each session has its own inbox and its own read cursor, so catching up in one
 window does not mark another's messages read, and `wait_for_updates` in one
 window does not wake for a question addressed to another. Nothing is hidden

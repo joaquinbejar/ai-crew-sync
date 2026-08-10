@@ -288,6 +288,41 @@ case "$out" in
     *) bad "person-addressed question reaches this window" "$out" ;;
 esac
 
+# The bug this fixes: two windows of the SAME agent could address each other
+# and never reach each other unprompted, because the sender was compared per
+# agent. "dani" != "dani" is false, so the message was dropped as my own.
+SELF_CROSS='[{"id":31,"from":"joaquin","from_session":"coordination","to":"joaquin","to_session":"market-data","body":"rebase before you push","metadata":{"question":true}}]'
+SELF_SAME='[{"id":32,"from":"joaquin","from_session":"market-data","to":"joaquin","to_session":"market-data","body":"note to self","metadata":{"question":true}}]'
+
+out="$(drain "$SELF_CROSS" sess-j market-data)"
+case "$out" in
+    *"rebase before you push"*) ok "another window of the same person reaches this one" ;;
+    *) bad "same-agent cross-session question surfaces" "$out" ;;
+esac
+
+out="$(drain "$SELF_SAME" sess-k market-data)"
+[ -z "$out" ] && ok "this window's own message is still not raised to itself" \
+    || bad "own-window message must stay silent" "$out"
+
+# A single malformed message used to abort the whole comprehension and mute
+# every pending question for that turn — silently, and for as long as the bad
+# row stayed in the 50-message window.
+POISON='[{"id":41,"from":"marta","to":"joaquin","body":"stringified","metadata":"{\"question\": true}"},
+         {"id":42,"from":"marta","to":"joaquin","body":"a real question","metadata":{"question":true}},
+         {"id":43,"from":"marta","to":"joaquin","body":"junk","metadata":42}]'
+out="$(drain "$POISON" sess-l market-data)"
+case "$out" in
+    *"stringified"*) ok "a stringified metadata object is still read as a question" ;;
+    *) bad "one bad message must not mute the hook" "$out" ;;
+esac
+
+# ...and the good ones behind it are still reachable on the next turn.
+out="$(drain "$POISON" sess-l market-data)"
+case "$out" in
+    *"a real question"*) ok "the questions behind a malformed one are not lost" ;;
+    *) bad "questions behind a bad row survive" "$out" ;;
+esac
+
 # Unconfigured bus: silent, as every hook must be. `env -u` rather than simply
 # not passing them: a developer machine that is connected to a real bus has
 # both exported from the shell profile, and the test would otherwise assert

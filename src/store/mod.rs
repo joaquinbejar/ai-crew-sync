@@ -23,6 +23,28 @@ pub fn normalize_channel(name: &str) -> String {
 /// document. Bodies, notes and attachments are the places built to carry size.
 pub const MAX_METADATA_BYTES: usize = 16 * 1024;
 
+/// Reconstruct `metadata` that arrived as a serialised object.
+///
+/// Some MCP clients stringify structured arguments, so `{"question": true}`
+/// reaches the server as the *text* `"{\"question\": true}"`. Stored
+/// verbatim it is unusable: the plugin's Stop drain reads
+/// `metadata["question"]` and finds a string, and the capability the skill
+/// documents does not work from that client at all.
+///
+/// Deliberately narrow. Only a string that parses to a JSON **object** is
+/// rewritten — the exact failure mode. Any other string, number or boolean is
+/// stored as sent, because a caller may legitimately want one and guessing at
+/// their intent is how coercion becomes a bug of its own.
+pub fn normalize_metadata(metadata: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    match metadata {
+        Some(serde_json::Value::String(raw)) => match serde_json::from_str(&raw) {
+            Ok(serde_json::Value::Object(map)) => Some(serde_json::Value::Object(map)),
+            _ => Some(serde_json::Value::String(raw)),
+        },
+        other => other,
+    }
+}
+
 /// Reject an oversized `metadata` object before it reaches the database. The
 /// error names the field and the limit so an LLM caller can trim and retry.
 pub fn check_metadata(field: &str, metadata: Option<&serde_json::Value>) -> BusResult<()> {
