@@ -1456,8 +1456,9 @@ async fn webhook_delivery_is_exactly_one_row_per_hook_across_replicas() {
 /// roughly 9ms here and a database round trip roughly 0.5ms, so at 20 channels
 /// an N+1 hides inside the transport: injecting one and running this test at
 /// the old sizes **passed**. At 60 channels the extra round trips dominate and
-/// the two shapes separate cleanly — measured at ~1.2 for one statement
-/// against ~4 for a query per channel.
+/// the two shapes separate cleanly — measured at 2.0-2.1 for one statement
+/// against 4.2-4.3 for a query per channel, which is where the bound below
+/// comes from.
 #[tokio::test]
 async fn the_digest_cost_does_not_grow_with_channel_count() {
     let h = require_db!("t_digest_scale");
