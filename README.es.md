@@ -374,8 +374,8 @@ ask_agent  to: "joaquin/market-data"  question: "¿está verde la suite?"
 Responde a `from/from_session`, no solo al nombre, o la respuesta llega a la
 ventana que se dé cuenta primero en vez de a la que está bloqueada esperándola.
 
-Una pregunta de una ventana **tuya** se surfacea igual que la de cualquier
-otro: la unidad de la que habla el bus es la ventana, no la persona.
+Una pregunta de una ventana **tuya** aparece igual que la de cualquier otro:
+la unidad de la que habla el bus es la ventana, no la persona.
 
 Cada sesión tiene su propio inbox y su propio cursor de lectura, así que ponerse
 al día en una ventana no marca como leídos los mensajes de otra, y

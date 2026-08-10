@@ -112,12 +112,27 @@ if not questions:
 # Answered already: metadata says "this is a question", never "this one is
 # still open". Anything this agent has replied to is settled, so a question
 # answered during normal work must not be raised again on the way out.
-answered = {
-    m["reply_to"] for m in messages
-    if isinstance(m, dict) and m.get("from") == me and isinstance(m.get("reply_to"), int)
-}
-# Replies from a sibling window count too: the asker is unblocked either way,
-# and raising a question somebody already answered helps nobody.
+# Which of my windows has replied to what. A flat set of ids would be wrong:
+# find_answer requires the reply's sender_session to match when ask_agent
+# targeted agent/session, so a sibling window's reply does NOT unblock that
+# asker — and treating it as settled here would suppress the question in the
+# one window whose reply would have counted, leaving the asker blocked for
+# good.
+replies_by_id = {}
+for m in messages:
+    if isinstance(m, dict) and m.get("from") == me and isinstance(m.get("reply_to"), int):
+        replies_by_id.setdefault(m["reply_to"], set()).add(m.get("from_session") or "")
+
+def already_answered(m):
+    who = replies_by_id.get(m.get("id"))
+    if not who:
+        return False
+    # Addressed to the person: any window of mine settles it, because the
+    # asker accepts a reply from any of them.
+    if m.get("to_session") is None:
+        return True
+    # Addressed to this window: only this window's reply is accepted upstream.
+    return my_session in who
 
 # Loop guard. A Stop hook that blocks unconditionally traps the session going
 # round forever, so each question is only ever blocked on once — if the model
@@ -135,7 +150,7 @@ except Exception:
     seen = set()
 
 # Oldest first: the caller who has been blocked longest is the one to unblock.
-pending = sorted(q["id"] for q in questions if q["id"] not in answered and q["id"] not in seen)
+pending = sorted(q["id"] for q in questions if not already_answered(q) and q["id"] not in seen)
 if not pending:
     raise SystemExit(0)
 message_id = pending[0]

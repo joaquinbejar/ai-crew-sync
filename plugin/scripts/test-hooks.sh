@@ -323,6 +323,34 @@ case "$out" in
     *) bad "questions behind a bad row survive" "$out" ;;
 esac
 
+# A sibling window's reply does not settle a question addressed to THIS one.
+# find_answer requires the reply's sender_session to match when ask_agent
+# targeted agent/session, so treating a sibling reply as an answer would
+# suppress the question in the only window whose reply counts — and leave the
+# asker blocked for good.
+SIBLING_REPLIED='[{"id":51,"from":"marta","to":"joaquin","to_session":"market-data","body":"still open for me","metadata":{"question":true}},
+                  {"id":52,"from":"joaquin","from_session":"core-manager","to":"marta","reply_to":51,"body":"answered from the wrong window","metadata":{}}]'
+out="$(drain "$SIBLING_REPLIED" sess-m market-data)"
+case "$out" in
+    *"still open for me"*) ok "a sibling window's reply does not settle this window's question" ;;
+    *) bad "sibling reply must not suppress the question" "$out" ;;
+esac
+
+# This window's own reply does settle it.
+OWN_REPLIED='[{"id":53,"from":"marta","to":"joaquin","to_session":"market-data","body":"q","metadata":{"question":true}},
+              {"id":54,"from":"joaquin","from_session":"market-data","to":"marta","reply_to":53,"body":"done","metadata":{}}]'
+out="$(drain "$OWN_REPLIED" sess-n market-data)"
+[ -z "$out" ] && ok "this window's own reply settles its question" \
+    || bad "own reply settles the question" "$out"
+
+# A person-addressed question is settled by any window of mine: the asker
+# accepts a reply from any of them.
+PERSON_REPLIED='[{"id":55,"from":"marta","to":"joaquin","body":"anyone?","metadata":{"question":true}},
+                 {"id":56,"from":"joaquin","from_session":"core-manager","to":"marta","reply_to":55,"body":"got it","metadata":{}}]'
+out="$(drain "$PERSON_REPLIED" sess-o market-data)"
+[ -z "$out" ] && ok "any window of mine settles a person-addressed question" \
+    || bad "person-addressed question settled by a sibling" "$out"
+
 # Unconfigured bus: silent, as every hook must be. `env -u` rather than simply
 # not passing them: a developer machine that is connected to a real bus has
 # both exported from the shell profile, and the test would otherwise assert
