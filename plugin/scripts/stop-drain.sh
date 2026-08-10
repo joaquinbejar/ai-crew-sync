@@ -35,6 +35,7 @@ WHO="$("$DIR/bus-call.sh" whoami 2>/dev/null || true)"
 
 STATE_DIR="${TMPDIR:-/tmp}"
 export PAYLOAD FEED WHO STATE_DIR
+export BUS_SESSION="${BUS_SESSION:-}"
 
 python3 - <<'PY' 2>/dev/null || true
 import json, os, re
@@ -52,6 +53,20 @@ messages = (feed or {}).get("messages")
 if not messages or not me:
     raise SystemExit(0)
 
+# Addressed to this window, or to the person. `agent/session` narrows who a
+# message is for, so it has to narrow who sees it too — otherwise a question
+# for dani/risk-engine interrupts every one of dani's windows.
+#
+# The server applies the same rule to scope "all" once bus-call.sh sends the
+# session header, so this is the second of two guards rather than the only
+# one. It is worth having: this hook is what *blocks* a session, and a wrong
+# message here is visible to the user immediately.
+my_session = os.environ.get("BUS_SESSION", "").strip().lower()
+
+def for_this_window(m):
+    addressed = m.get("to_session")
+    return addressed is None or addressed == my_session
+
 # A question is a direct message someone else's agent is blocked on: ask_agent
 # marks it, and post_message can too.
 questions = [
@@ -59,6 +74,7 @@ questions = [
     if isinstance(m, dict)
     and m.get("to")
     and m.get("from") != me
+    and for_this_window(m)
     and (m.get("metadata") or {}).get("question") is True
     and isinstance(m.get("id"), int)
 ]

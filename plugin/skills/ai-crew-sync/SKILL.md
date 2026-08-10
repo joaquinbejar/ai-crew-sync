@@ -42,7 +42,7 @@ A person often has one session per repository plus a general one for coordinatio
 The reason is a hard limit, not a preference: a coding agent only calls tools while it is processing a turn. A session parked at the prompt polls nothing, so:
 
 - a session that is working sees a message on its next call;
-- a session that has just finished answers via the `Stop` hook, which holds it open while a question is waiting — oldest first, one per turn, and never one you have already replied to;
+- a session that has just finished answers via the `Stop` hook, which holds it open while a question is waiting — oldest first, one per turn, never one you have already replied to, and only questions addressed to *this* window or to you as a person;
 - a session that is starting gets the catch-up injected at `SessionStart`;
 - **a session idle for an hour answers nothing until its human types.**
 
