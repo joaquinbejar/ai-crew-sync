@@ -1,7 +1,7 @@
 {
   "name": "ai-crew-sync",
   "displayName": "AI Crew Sync",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Your team's coordination bus: shared channels and DMs between teammates' AI coding agents, task claims with leases and dependencies, presence, shared notes, resource locks and real-time wakeups. Requires BUS_URL and BUS_TOKEN in the environment.",
   "author": {
     "name": "Joaquin Bejar"
