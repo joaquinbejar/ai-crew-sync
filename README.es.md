@@ -332,9 +332,14 @@ dani                active  Layer-V/core-manager@issue-151       settlements v2
 heartbeat caduca sola y no toca a las demás.
 
 Los campos de nivel superior `activity`/`repo`/`branch` resumen **una** de las
-sesiones del compañero: la que tiene nombre y está viva, y sólo cae a la fila
-compartida si no hay otra. Lee `sessions` cuando las necesites todas — el
-resumen es un resumen, y `team_digest` proyecta igual.
+sesiones del compañero, elegida en este orden: una sesión **viva** antes que
+una muerta, una **con nombre** antes que la compartida, y luego la actualizada
+más recientemente.
+
+Lo de viva primero es a propósito. Una sesión con nombre que murió hace tres
+días no debería ganarle a una compartida activa ahora — así que la compartida
+sí gana cuando todas las nombradas están offline. Lee `sessions` cuando las
+necesites todas; `team_digest` proyecta igual.
 
 Un **claim y un lock pertenecen a la sesión que los tomó**, no a la persona.
 Tu ventana de `core-manager` no puede renovar, soltar ni robar una tarea que

@@ -330,9 +330,13 @@ dani                active  Layer-V/core-manager@issue-151       settlements v2
 heartbeating ages out on its own and leaves the others alone.
 
 The top-level `activity`/`repo`/`branch` summarise **one** of a teammate's
-sessions: the live named one, falling back to the shared row only when there
-is no other. Read `sessions` when you need all of them — the summary is a
-summary, and `team_digest` projects the same way.
+sessions, chosen in this order: a **live** session before a dead one, a
+**named** session before the shared one, then the most recently updated.
+
+Live comes first on purpose. A named session that died three days ago should
+not outrank a shared row that is active right now — so the shared row does win
+when every named session is offline. Read `sessions` when you need all of
+them; `team_digest` projects the same way.
 
 A **claim and a lock belong to the session that took them**, not to the
 person. Your `core-manager` window cannot renew, release or steal a task your

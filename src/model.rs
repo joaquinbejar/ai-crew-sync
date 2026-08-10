@@ -56,8 +56,11 @@ pub struct AgentInfo {
     /// `X-Crew-Session` header, so a roster of teammates who use no sessions
     /// serialises exactly as it did before sessions existed.
     ///
-    /// The summary describes the agent's live named session when there is one,
-    /// falling back to the shared row only when there is nothing else. Read
+    /// Which row the summary describes, in order: a **live** session before a
+    /// dead one, a **named** session before the shared one, then the most
+    /// recently updated. Live comes first deliberately — a named session that
+    /// died days ago should not outrank a shared row that is active now — so
+    /// the shared row can win while every named session is offline. Read
     /// `sessions` when you need all of them; this is one of several.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub session: Option<String>,
