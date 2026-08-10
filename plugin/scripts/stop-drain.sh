@@ -67,27 +67,72 @@ def for_this_window(m):
     addressed = m.get("to_session")
     return addressed is None or addressed == my_session
 
-# A question is a direct message someone else's agent is blocked on: ask_agent
-# marks it, and post_message can too.
-questions = [
-    m for m in messages
-    if isinstance(m, dict)
-    and m.get("to")
-    and m.get("from") != me
-    and for_this_window(m)
-    and (m.get("metadata") or {}).get("question") is True
-    and isinstance(m.get("id"), int)
-]
+def sent_by_this_window(m):
+    """Own messages are not news — but "own" is this window, not this person.
+
+    Comparing the agent alone meant a message from dani/coordination to
+    dani/risk-engine was dropped as mine, so two windows of one person could
+    address each other and never reach each other unprompted. Both sides
+    sessionless compares equal, so a single-window user is unchanged.
+    """
+    return m.get("from") == me and (m.get("from_session") or "") == my_session
+
+def is_question(m):
+    """One malformed message must not mute the hook for every other.
+
+    metadata is whatever the sender put there, and some clients stringify it,
+    so this cannot assume a dict. The whole block used to be one comprehension
+    ending in `|| true`: a single bad row raised, aborted it, and suppressed
+    every pending question for that turn — silently, for as long as the row
+    stayed in the 50-message window.
+    """
+    try:
+        if not isinstance(m, dict) or not isinstance(m.get("id"), int):
+            return False
+        if not m.get("to") or sent_by_this_window(m) or not for_this_window(m):
+            return False
+        metadata = m.get("metadata")
+        if isinstance(metadata, str):
+            # Best effort: the server reconstructs these now, but a message
+            # written by an older server is still in the window.
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                return False
+        return isinstance(metadata, dict) and metadata.get("question") is True
+    except Exception:
+        return False
+
+# A question is a direct message someone else's window is blocked on:
+# ask_agent marks it, and post_message can too.
+questions = [m for m in messages if is_question(m)]
 if not questions:
     raise SystemExit(0)
 
 # Answered already: metadata says "this is a question", never "this one is
 # still open". Anything this agent has replied to is settled, so a question
 # answered during normal work must not be raised again on the way out.
-answered = {
-    m["reply_to"] for m in messages
-    if isinstance(m, dict) and m.get("from") == me and isinstance(m.get("reply_to"), int)
-}
+# Which of my windows has replied to what. A flat set of ids would be wrong:
+# find_answer requires the reply's sender_session to match when ask_agent
+# targeted agent/session, so a sibling window's reply does NOT unblock that
+# asker — and treating it as settled here would suppress the question in the
+# one window whose reply would have counted, leaving the asker blocked for
+# good.
+replies_by_id = {}
+for m in messages:
+    if isinstance(m, dict) and m.get("from") == me and isinstance(m.get("reply_to"), int):
+        replies_by_id.setdefault(m["reply_to"], set()).add(m.get("from_session") or "")
+
+def already_answered(m):
+    who = replies_by_id.get(m.get("id"))
+    if not who:
+        return False
+    # Addressed to the person: any window of mine settles it, because the
+    # asker accepts a reply from any of them.
+    if m.get("to_session") is None:
+        return True
+    # Addressed to this window: only this window's reply is accepted upstream.
+    return my_session in who
 
 # Loop guard. A Stop hook that blocks unconditionally traps the session going
 # round forever, so each question is only ever blocked on once — if the model
@@ -105,7 +150,7 @@ except Exception:
     seen = set()
 
 # Oldest first: the caller who has been blocked longest is the one to unblock.
-pending = sorted(q["id"] for q in questions if q["id"] not in answered and q["id"] not in seen)
+pending = sorted(q["id"] for q in questions if not already_answered(q) and q["id"] not in seen)
 if not pending:
     raise SystemExit(0)
 message_id = pending[0]

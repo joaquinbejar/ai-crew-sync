@@ -173,10 +173,9 @@ pub async fn create_task(pool: &PgPool, auth: &AuthCtx, input: CreateInput) -> B
         )?),
         None => None,
     };
-    super::check_metadata("task", input.metadata.as_ref())?;
-    let metadata = input
-        .metadata
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    let metadata_in = super::normalize_metadata(input.metadata);
+    super::check_metadata("task", metadata_in.as_ref())?;
+    let metadata = metadata_in.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
 
     let existing: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM tasks WHERE team_id = $1 AND key = $2")

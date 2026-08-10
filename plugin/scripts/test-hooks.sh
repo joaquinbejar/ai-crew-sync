@@ -288,6 +288,69 @@ case "$out" in
     *) bad "person-addressed question reaches this window" "$out" ;;
 esac
 
+# The bug this fixes: two windows of the SAME agent could address each other
+# and never reach each other unprompted, because the sender was compared per
+# agent. "dani" != "dani" is false, so the message was dropped as my own.
+SELF_CROSS='[{"id":31,"from":"joaquin","from_session":"coordination","to":"joaquin","to_session":"market-data","body":"rebase before you push","metadata":{"question":true}}]'
+SELF_SAME='[{"id":32,"from":"joaquin","from_session":"market-data","to":"joaquin","to_session":"market-data","body":"note to self","metadata":{"question":true}}]'
+
+out="$(drain "$SELF_CROSS" sess-j market-data)"
+case "$out" in
+    *"rebase before you push"*) ok "another window of the same person reaches this one" ;;
+    *) bad "same-agent cross-session question surfaces" "$out" ;;
+esac
+
+out="$(drain "$SELF_SAME" sess-k market-data)"
+[ -z "$out" ] && ok "this window's own message is still not raised to itself" \
+    || bad "own-window message must stay silent" "$out"
+
+# A single malformed message used to abort the whole comprehension and mute
+# every pending question for that turn — silently, and for as long as the bad
+# row stayed in the 50-message window.
+POISON='[{"id":41,"from":"marta","to":"joaquin","body":"stringified","metadata":"{\"question\": true}"},
+         {"id":42,"from":"marta","to":"joaquin","body":"a real question","metadata":{"question":true}},
+         {"id":43,"from":"marta","to":"joaquin","body":"junk","metadata":42}]'
+out="$(drain "$POISON" sess-l market-data)"
+case "$out" in
+    *"stringified"*) ok "a stringified metadata object is still read as a question" ;;
+    *) bad "one bad message must not mute the hook" "$out" ;;
+esac
+
+# ...and the good ones behind it are still reachable on the next turn.
+out="$(drain "$POISON" sess-l market-data)"
+case "$out" in
+    *"a real question"*) ok "the questions behind a malformed one are not lost" ;;
+    *) bad "questions behind a bad row survive" "$out" ;;
+esac
+
+# A sibling window's reply does not settle a question addressed to THIS one.
+# find_answer requires the reply's sender_session to match when ask_agent
+# targeted agent/session, so treating a sibling reply as an answer would
+# suppress the question in the only window whose reply counts — and leave the
+# asker blocked for good.
+SIBLING_REPLIED='[{"id":51,"from":"marta","to":"joaquin","to_session":"market-data","body":"still open for me","metadata":{"question":true}},
+                  {"id":52,"from":"joaquin","from_session":"core-manager","to":"marta","reply_to":51,"body":"answered from the wrong window","metadata":{}}]'
+out="$(drain "$SIBLING_REPLIED" sess-m market-data)"
+case "$out" in
+    *"still open for me"*) ok "a sibling window's reply does not settle this window's question" ;;
+    *) bad "sibling reply must not suppress the question" "$out" ;;
+esac
+
+# This window's own reply does settle it.
+OWN_REPLIED='[{"id":53,"from":"marta","to":"joaquin","to_session":"market-data","body":"q","metadata":{"question":true}},
+              {"id":54,"from":"joaquin","from_session":"market-data","to":"marta","reply_to":53,"body":"done","metadata":{}}]'
+out="$(drain "$OWN_REPLIED" sess-n market-data)"
+[ -z "$out" ] && ok "this window's own reply settles its question" \
+    || bad "own reply settles the question" "$out"
+
+# A person-addressed question is settled by any window of mine: the asker
+# accepts a reply from any of them.
+PERSON_REPLIED='[{"id":55,"from":"marta","to":"joaquin","body":"anyone?","metadata":{"question":true}},
+                 {"id":56,"from":"joaquin","from_session":"core-manager","to":"marta","reply_to":55,"body":"got it","metadata":{}}]'
+out="$(drain "$PERSON_REPLIED" sess-o market-data)"
+[ -z "$out" ] && ok "any window of mine settles a person-addressed question" \
+    || bad "person-addressed question settled by a sibling" "$out"
+
 # Unconfigured bus: silent, as every hook must be. `env -u` rather than simply
 # not passing them: a developer machine that is connected to a real bus has
 # both exported from the shell profile, and the test would otherwise assert
