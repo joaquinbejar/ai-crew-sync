@@ -55,6 +55,10 @@ pub struct AgentInfo {
     /// name. Absent for the shared session, used by clients that send no
     /// `X-Crew-Session` header, so a roster of teammates who use no sessions
     /// serialises exactly as it did before sessions existed.
+    ///
+    /// The summary describes the agent's live named session when there is one,
+    /// falling back to the shared row only when there is nothing else. Read
+    /// `sessions` when you need all of them; this is one of several.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub session: Option<String>,
     /// One of `active`, `idle`, `offline`. `offline` means the presence lease

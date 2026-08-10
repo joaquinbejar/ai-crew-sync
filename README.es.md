@@ -331,6 +331,11 @@ dani                active  Layer-V/core-manager@issue-151       settlements v2
 `online_count` cuenta *compañeros*, no sesiones. Una sesión que deja de mandar
 heartbeat caduca sola y no toca a las demás.
 
+Los campos de nivel superior `activity`/`repo`/`branch` resumen **una** de las
+sesiones del compañero: la que tiene nombre y está viva, y sólo cae a la fila
+compartida si no hay otra. Lee `sessions` cuando las necesites todas — el
+resumen es un resumen, y `team_digest` proyecta igual.
+
 Un **claim y un lock pertenecen a la sesión que los tomó**, no a la persona.
 Tu ventana de `core-manager` no puede renovar, soltar ni robar una tarea que
 tiene tu ventana de `market-data`, y el error lo dice:

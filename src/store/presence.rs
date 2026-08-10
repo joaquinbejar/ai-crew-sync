@@ -199,9 +199,14 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
         WHERE a.team_id = $1
           AND a.disabled_at IS NULL
           AND (NOT $2::bool OR COALESCE(p.expires_at > now(), false))
-        -- Within an agent: live sessions first, then the most recent.
+        -- Within an agent: live first, then a *named* session over the shared
+        -- one, then the most recent. The first row is what the top-level
+        -- fields project, and a sessionless row that keeps refreshing would
+        -- otherwise be the summary everyone reads while the real sessions sit
+        -- unread inside sessions[].
         ORDER BY a.name,
                  COALESCE(p.expires_at > now(), false) DESC,
+                 (COALESCE(p.session, '') <> '') DESC,
                  p.updated_at DESC NULLS LAST
         "#,
     )

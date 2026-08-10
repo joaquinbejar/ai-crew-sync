@@ -195,7 +195,13 @@ pub async fn team_digest(
                 SELECT pp.activity, pp.updated_at, pp.expires_at
                 FROM agent_presence pp
                 WHERE pp.agent_id = a.id
-                ORDER BY (pp.expires_at > now()) DESC, pp.updated_at DESC
+                -- Same preference as list_agents: live first, then a named
+                -- session over the shared one. The digest is read by every
+                -- session at start-up, so projecting the wrong row here shows
+                -- the whole team a stale line as somebody's current work.
+                ORDER BY (pp.expires_at > now()) DESC,
+                         (COALESCE(pp.session, '') <> '') DESC,
+                         pp.updated_at DESC
                 LIMIT 1
             ) p ON true
             WHERE a.team_id = $1 AND a.disabled_at IS NULL

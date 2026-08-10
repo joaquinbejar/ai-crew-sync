@@ -329,6 +329,11 @@ dani                active  Layer-V/core-manager@issue-151       settlements v2
 `online_count` counts *teammates*, not sessions. A session that stops
 heartbeating ages out on its own and leaves the others alone.
 
+The top-level `activity`/`repo`/`branch` summarise **one** of a teammate's
+sessions: the live named one, falling back to the shared row only when there
+is no other. Read `sessions` when you need all of them — the summary is a
+summary, and `team_digest` projects the same way.
+
 A **claim and a lock belong to the session that took them**, not to the
 person. Your `core-manager` window cannot renew, release or steal a task your
 `market-data` window is holding, and the refusal says so:
