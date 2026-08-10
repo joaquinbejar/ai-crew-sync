@@ -195,7 +195,7 @@ FAKE
     chmod +x "$WORK/bin/bus-call.sh"
     printf '{"session_id":"%s"}' "$2" \
         | TMPDIR="$WORK" BUS_URL=http://example.invalid/mcp BUS_TOKEN=acs_test \
-          sh "$WORK/bin/stop-drain.sh" 2>/dev/null
+          BUS_SESSION="${3:-}" sh "$WORK/bin/stop-drain.sh" 2>/dev/null
 }
 
 NONE='[{"id":7,"from":"dani","to":"joaquin","body":"fyi","metadata":{}}]'
@@ -261,6 +261,32 @@ assert "newer one" in ctx, ctx
 assert "reply_to: 11" in ctx, ctx
 ' 2>/dev/null && ok "the second question is not lost behind the first" \
     || bad "drain loses a queued question" "$out"
+
+# A question addressed to another window of the same person must not surface
+# here. `agent/session` narrows who a message is for, so it has to narrow who
+# sees it — otherwise every window of dani's is interrupted by a question for
+# one of them.
+OTHER='[{"id":21,"from":"marta","to":"joaquin","to_session":"core-manager","body":"for the other window","metadata":{"question":true}}]'
+MINE='[{"id":22,"from":"marta","to":"joaquin","to_session":"market-data","body":"for this window","metadata":{"question":true}}]'
+PERSON='[{"id":23,"from":"marta","to":"joaquin","body":"for the person","metadata":{"question":true}}]'
+
+out="$(drain "$OTHER" sess-g market-data)"
+[ -z "$out" ] && ok "a question for another window does not surface here" \
+    || bad "drain is session-scoped" "$out"
+
+out="$(drain "$MINE" sess-h market-data)"
+case "$out" in
+    *"for this window"*) ok "a question for this window still surfaces" ;;
+    *) bad "drain surfaces its own window's question" "$out" ;;
+esac
+
+# Person-addressed DMs reach every window, which is what addressing a person
+# has always meant.
+out="$(drain "$PERSON" sess-i market-data)"
+case "$out" in
+    *"for the person"*) ok "a person-addressed question reaches every window" ;;
+    *) bad "person-addressed question reaches this window" "$out" ;;
+esac
 
 # Unconfigured bus: silent, as every hook must be. `env -u` rather than simply
 # not passing them: a developer machine that is connected to a real bus has
