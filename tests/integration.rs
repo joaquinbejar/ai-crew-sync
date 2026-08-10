@@ -3564,3 +3564,79 @@ async fn an_empty_activity_clears_it_and_dead_rows_are_swept() {
     let _ = market.cancel().await;
     h.shutdown().await;
 }
+
+#[tokio::test]
+async fn the_summary_projects_a_named_session_over_the_shared_row() {
+    let h = require_db!("t_projection");
+    let token = seed_agent(&h.pool, "layerv", "dani").await;
+    let reader = seed_agent(&h.pool, "layerv", "joaquin").await;
+
+    let shared = connect(&h.base, &token).await;
+    let repo = connect_with_session(&h.base, &token, "risk-engine").await;
+    let joaquin = connect(&h.base, &reader).await;
+
+    // The shape dani hit: a sessionless row carrying an old activity that
+    // keeps refreshing, alongside a real session doing real work.
+    call(
+        &shared,
+        "heartbeat",
+        json!({"repo": "Layer-V/old", "activity": "stopping for the day"}),
+    )
+    .await;
+    call(
+        &repo,
+        "heartbeat",
+        json!({"repo": "Layer-V/risk-engine", "activity": "implementing #169"}),
+    )
+    .await;
+    // Refresh the sessionless row last, so "most recently updated" would pick it.
+    call(&shared, "heartbeat", json!({})).await;
+
+    let seen = call(&joaquin, "list_agents", json!({})).await;
+    let dani = seen["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "dani")
+        .expect("dani is on the bus");
+
+    assert_eq!(
+        dani["activity"], "implementing #169",
+        "the summary must project the named session, not the shared row: {dani}"
+    );
+    assert_eq!(dani["repo"], "Layer-V/risk-engine");
+    assert_eq!(dani["session"], "risk-engine");
+    // Nothing is hidden: both rows are still listed underneath.
+    assert_eq!(dani["sessions"].as_array().unwrap().len(), 2);
+
+    // team_digest reads presence too, and every session reads the digest at
+    // start-up — the same wrong row there tells the whole team a stale line.
+    let digest = call(&joaquin, "team_digest", json!({"hours": 1})).await;
+    let line = digest["agents_seen"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "dani")
+        .expect("dani in the digest")["activity"]
+        .clone();
+    assert_eq!(line, "implementing #169", "{digest}");
+
+    // With no named session at all, the shared row is still the answer rather
+    // than nothing.
+    let solo = seed_agent(&h.pool, "layerv", "carlos").await;
+    let carlos = connect(&h.base, &solo).await;
+    call(&carlos, "heartbeat", json!({"activity": "triaging"})).await;
+    let seen = call(&joaquin, "list_agents", json!({})).await;
+    let row = seen["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "carlos")
+        .unwrap();
+    assert_eq!(row["activity"], "triaging");
+
+    for client in [shared, repo, joaquin, carlos] {
+        let _ = client.cancel().await;
+    }
+    h.shutdown().await;
+}
