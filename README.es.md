@@ -33,7 +33,8 @@ Un agente de código funciona bien por sí solo. Los problemas empiezan cuando
 varias personas ejecutan varios agentes en paralelo sobre el mismo código:
 dos agentes cogen la misma tarea, una decisión tomada en una sesión nunca
 llega a las demás, ediciones incompatibles caen sobre el mismo recurso, o dos
-agentes compiten por una operación de una-a-la-vez como un deployment.
+agentes compiten por una operación que solo puede ejecutarse una a la vez,
+como un deployment.
 
 `ai-crew-sync` da a todo el equipo un único estado compartido — y funciona
 entre distintos clientes MCP, usuarios y máquinas. Los claims de tareas son
