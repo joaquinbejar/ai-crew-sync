@@ -84,6 +84,28 @@ async fn explain_payload_too_large(
         .into_response()
 }
 
+/// How often the shared-row sweep re-runs on a long-lived server. The first
+/// pass runs immediately, so every restart — which is every deploy — clears
+/// what the lazy per-heartbeat sweep cannot reach: rows whose owner never
+/// heartbeats again.
+const PRESENCE_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
+
+async fn run_presence_sweeper(pool: PgPool, ct: CancellationToken) {
+    loop {
+        // Best-effort like the heartbeat sweep: presence hygiene must never
+        // take the server down, and a failed pass just waits for the next.
+        match crate::store::presence::sweep_expired_shared_rows(&pool).await {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(deleted = n, "swept long-dead shared presence rows"),
+            Err(e) => tracing::warn!(error = %e, "presence sweep failed"),
+        }
+        tokio::select! {
+            _ = ct.cancelled() => return,
+            _ = tokio::time::sleep(PRESENCE_SWEEP_INTERVAL) => {}
+        }
+    }
+}
+
 pub fn build_router(pool: PgPool, opts: &ServeOptions, ct: CancellationToken) -> Router {
     // One LISTEN connection feeds every in-process consumer: wait_for_updates
     // long-polls and the webhook dispatcher.
@@ -98,6 +120,7 @@ pub fn build_router(pool: PgPool, opts: &ServeOptions, ct: CancellationToken) ->
         hub.clone(),
         ct.clone(),
     ));
+    tokio::spawn(run_presence_sweeper(pool.clone(), ct.clone()));
 
     let mut config = StreamableHttpServerConfig::default()
         .with_json_response(true)

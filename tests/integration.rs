@@ -3690,6 +3690,94 @@ async fn the_summary_projects_a_named_session_over_the_shared_row() {
 }
 
 #[tokio::test]
+async fn the_sweeper_clears_long_dead_shared_rows() {
+    let mut h = require_db!("t_presence_sweep");
+    let _dani = seed_agent(&h.pool, "layerv", "dani").await;
+    let _joaquin = seed_agent(&h.pool, "layerv", "joaquin").await;
+    let reader = seed_agent(&h.pool, "layerv", "carlos").await;
+
+    // The 0.6.0 shape: a shared-session row whose owner never heartbeats
+    // again, so the lazy per-heartbeat sweep never reaches it. Inserted raw,
+    // like a row surviving an upgrade.
+    sqlx::query(sqlx::AssertSqlSafe(
+        "INSERT INTO agent_presence (agent_id, session, status, activity, updated_at, expires_at)
+         SELECT id, '', 'active', 'stopping for the day', now() - interval '3 days',
+                now() - interval '3 days'
+           FROM agents WHERE name = 'dani'"
+            .to_owned(),
+    ))
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    // A shared row that only just expired must survive: same "offline
+    // recently" grace as the heartbeat sweep.
+    sqlx::query(sqlx::AssertSqlSafe(
+        "INSERT INTO agent_presence (agent_id, session, status, activity, updated_at, expires_at)
+         SELECT id, '', 'active', 'still warm', now(), now() - interval '1 minute'
+           FROM agents WHERE name = 'joaquin'"
+            .to_owned(),
+    ))
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    // A fresh server on the same schema is what a deploy is; its sweeper's
+    // first pass runs immediately. The pass is asynchronous, so poll.
+    let _replica = h.add_replica().await;
+    let mut swept = false;
+    for _ in 0..50 {
+        let left: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM agent_presence WHERE session = '' AND activity = 'stopping for the day'",
+        )
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        if left.0 == 0 {
+            swept = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        swept,
+        "the long-dead shared row must be gone after a restart"
+    );
+
+    let warm: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM agent_presence WHERE activity = 'still warm'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        warm.0, 1,
+        "a recently expired shared row is still worth showing"
+    );
+
+    // What the team actually reads no longer carries the stale line.
+    let carlos = connect(&h.base, &reader).await;
+    let seen = call(&carlos, "list_agents", json!({})).await;
+    let dani = seen["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "dani")
+        .expect("dani is still on the roster");
+    assert_eq!(
+        dani["activity"],
+        Value::Null,
+        "the swept row must not project anywhere: {dani}"
+    );
+    let digest = call(&carlos, "team_digest", json!({"hours": 24})).await;
+    assert!(
+        !digest.to_string().contains("stopping for the day"),
+        "the digest must not resurrect the swept row: {digest}"
+    );
+
+    let _ = carlos.cancel().await;
+    h.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_stringified_metadata_object_is_stored_as_an_object() {
     let h = require_db!("t_metadata_shape");
     let a = seed_agent(&h.pool, "layerv", "joaquin").await;

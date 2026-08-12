@@ -165,6 +165,24 @@ pub async fn heartbeat(
     })
 }
 
+/// Delete shared-session ('') presence rows that are long past expiry,
+/// whoever they belong to. The per-heartbeat sweep above only runs when the
+/// row's *owner* comes back, so a row left by an agent that never heartbeats
+/// again — the 0.6.0 hooks wrote exactly that kind — would otherwise keep its
+/// stale `activity` projecting in `list_agents` and `team_digest` forever.
+/// Server maintenance, not a tool: no auth context, all teams on purpose,
+/// same one-hour grace as the heartbeat sweep so "offline recently" still
+/// reads. Named rows are left alone — they carry real last-seen information.
+pub async fn sweep_expired_shared_rows(pool: &PgPool) -> BusResult<u64> {
+    let res = sqlx::query(
+        "DELETE FROM agent_presence
+          WHERE session = '' AND expires_at < now() - interval '1 hour'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> BusResult<AgentList> {
     // One row per (agent, session). An agent working in three repositories has
     // three presence rows and is still one person, so the rows are folded back
