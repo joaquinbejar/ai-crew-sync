@@ -1,6 +1,6 @@
 [package]
 name = "ai-crew-sync"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.97.1"
 description = "MCP server that lets a team's AI coding agents (Claude Code, Codex, Cursor or any MCP client) exchange messages, coordinate tasks, share presence and keep shared notes, backed by Postgres"
