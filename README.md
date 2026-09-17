@@ -751,3 +751,16 @@ maintainer:
 We appreciate your interest and look forward to your contributions!
 
 **License**: MIT
+
+<!-- related-projects:start -->
+## Related projects
+
+Repositories by the same author that this project depends on, and repositories that depend on it.
+
+### Used by
+
+| Repository | Description |
+|------------|-------------|
+| [homebrew-tap](https://github.com/joaquinbejar/homebrew-tap) | Homebrew formulae for joaquinbejar's tools. *(Homebrew formula)* |
+
+<!-- related-projects:end -->
