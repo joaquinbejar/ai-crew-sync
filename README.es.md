@@ -759,3 +759,16 @@ Para dudas, problemas o feedback, contacta con el mantenedor:
 ¡Gracias por tu interés!
 
 **Licencia**: MIT
+
+<!-- related-projects:start -->
+## Proyectos relacionados
+
+Repositorios del mismo autor de los que depende este proyecto, y repositorios que dependen de él.
+
+### Usado por
+
+| Repository | Description |
+|------------|-------------|
+| [homebrew-tap](https://github.com/joaquinbejar/homebrew-tap) | Homebrew formulae for joaquinbejar's tools. *(Homebrew formula)* |
+
+<!-- related-projects:end -->
