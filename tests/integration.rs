@@ -17,7 +17,7 @@ use ai_crew_sync::{
 };
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, ClientInfo},
+    model::{CallToolRequestParams, ClientConfig},
     service::RunningService,
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -201,14 +201,14 @@ async fn seed_agent(pool: &PgPool, team: &str, agent: &str) -> String {
     raw
 }
 
-type Client = RunningService<rmcp::RoleClient, ClientInfo>;
+type Client = RunningService<rmcp::RoleClient, ClientConfig>;
 
 async fn connect(base: &str, token: &str) -> Client {
     let mut config = StreamableHttpClientTransportConfig::with_uri(format!("{base}/mcp"));
     config.auth_header = Some(token.to_string());
     config.allow_stateless = true;
     let transport = StreamableHttpClientTransport::from_config(config);
-    ClientInfo::default()
+    ClientConfig::default()
         .serve(transport)
         .await
         .expect("mcp handshake")
@@ -224,7 +224,7 @@ async fn connect_with_session(base: &str, token: &str, session: &str) -> Client 
         session.parse().unwrap(),
     );
     let transport = StreamableHttpClientTransport::from_config(config);
-    ClientInfo::default()
+    ClientConfig::default()
         .serve(transport)
         .await
         .expect("mcp handshake")
