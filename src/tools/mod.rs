@@ -9,7 +9,7 @@ pub mod tasks;
 use rmcp::{
     ErrorData, Json, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerConfig},
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
@@ -166,8 +166,8 @@ pub struct DigestArgs {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Bus {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         info.instructions = Some(INSTRUCTIONS.trim().to_string());
         info
     }

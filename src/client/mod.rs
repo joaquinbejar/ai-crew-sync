@@ -17,7 +17,7 @@ use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, ClientInfo},
+    model::{CallToolRequestParams, ClientConfig},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
@@ -304,7 +304,7 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
     }
     let transport = StreamableHttpClientTransport::from_config(config);
 
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve(transport)
         .await
         .context("could not connect to the bus (check --url and --token)")?;
@@ -315,7 +315,7 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
 }
 
 async fn run_command(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>,
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>,
     args: &ClientArgs,
 ) -> anyhow::Result<()> {
     // `tools` is the one command that is not a tool call.
