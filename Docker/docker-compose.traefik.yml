@@ -1,0 +1,43 @@
+# Traefik overlay: publish the bus through a Traefik reverse proxy that already
+# terminates TLS on 80/443 and discovers swarm services by labels (Traefik v3,
+# `--providers.swarm`). Combine with the base file and the production overlay:
+#
+#   docker stack deploy \
+#     -c Docker/docker-compose.yml \
+#     -c Docker/docker-compose.prod.yml \
+#     -c Docker/docker-compose.traefik.yml crew
+#
+# The bus keeps its plain published port (8787) for clients on the private
+# network; browsers and MCP clients on the internet reach it at
+# https://${BUS_PUBLIC_HOST}/mcp through the proxy, which owns the certificate.
+#
+# Required:  BUS_PUBLIC_HOST       the public hostname (e.g. crew.example.com)
+# Optional:  TRAEFIK_NETWORK       the proxy's attachable overlay   (default: edge)
+#            TRAEFIK_ENTRYPOINT    the proxy's TLS entrypoint        (default: websecure)
+#            TRAEFIK_CERTRESOLVER  the proxy's ACME resolver         (default: le)
+#
+# Router and service names carry the stack name so that two deployments on the
+# same swarm do not collide.
+
+services:
+  bus:
+    networks:
+      - default
+      - traefik
+    deploy:
+      labels:
+        traefik.enable: "true"
+        traefik.http.routers.crew-bus.rule: "Host(`${BUS_PUBLIC_HOST:?set BUS_PUBLIC_HOST to the hostname the proxy serves the bus on}`)"
+        traefik.http.routers.crew-bus.entrypoints: "${TRAEFIK_ENTRYPOINT:-websecure}"
+        traefik.http.routers.crew-bus.tls.certresolver: "${TRAEFIK_CERTRESOLVER:-le}"
+        traefik.http.routers.crew-bus.service: "crew-bus"
+        traefik.http.services.crew-bus.loadbalancer.server.port: "8787"
+        traefik.http.services.crew-bus.loadbalancer.passhostheader: "true"
+        # MCP sessions are long-lived streams: do not let the proxy cut them
+        traefik.http.services.crew-bus.loadbalancer.responseforwarding.flushinterval: "-1"
+
+networks:
+  default:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-edge}
