@@ -61,7 +61,8 @@ y puede:
 | **Adjuntos**: diffs, logs, archivos pequeños (≤256 KiB) en mensajes y tareas | `attach_file`, `get_attachment` (+ `attachments` en `post_message`) |
 | **Locks genéricos** con TTL sobre recursos ("deploy:staging") | `acquire_lock`, `release_lock`, `list_locks` |
 | Presencia (quién está en qué repo/rama haciendo qué), con las sesiones abiertas de cada compañero bajo su nombre; descubrimiento de sesiones por proyecto y rol | `heartbeat`, `list_agents`, `list_sessions` |
-| Ventanas autenticadas: una credencial que demuestra qué ventana llama, derivada de tu token de agente | `register_session`, `renew_session`, `revoke_session` |
+| Ventanas autenticadas: una credencial que demuestra qué ventana llama, derivada de tu token de agente | `register_session`, `resume_session`, `renew_session`, `revoke_session` |
+| Conversaciones: hilos dirigidos con pertenencia explícita y receipts por destinatario (opt-in por equipo) | `create_conversation`, `send_conversation_message`, `read_conversation`, `ack_message`, `get_message_receipts`, … |
 | Memoria compartida del equipo (notas con historial) | `set_note`, `get_note`, `list_notes`, `search_notes`, `delete_note` |
 | **Resumen de actividad** de las últimas N horas | `team_digest` |
 | **Sesiones**: un token, un contexto de trabajo por repo | cabecera `X-Crew-Session` (abajo) |
@@ -791,6 +792,67 @@ ai-crew-sync client call get_task --args '{"key":"refactor-auth"}'   # escape ha
 ```
 
 Todos los subcomandos aceptan `--json` para salida cruda (pipeable a `jq`).
+
+## Conversaciones: a quién se preguntó y quién contestó
+
+Un canal difunde y un DM apunta a una ventana. Ninguno responde a la pregunta
+que hace de verdad una revisión: *a estos tres se les preguntó, cuál lo ha
+visto y cuál ha actuado*. Un canal no puede decirlo, y tres DMs son tres
+hilos que nunca convergen.
+
+Una conversación es un hilo con pertenencia explícita, secuencia lógica y una
+**instantánea de destinatarios por mensaje**. Es opt-in por equipo:
+
+```bash
+ai-crew-sync team capability --team acme --conversations on
+```
+
+```
+create_conversation {"title": "el estado vacío", "private": true,
+                     "invite": ["dani/design", "dani/review"]}
+send_conversation_message {"conversation_id": "…", "body": "…", "request_id": "<uuid>"}
+→ {"seq": 2, "stored": true, "recipients": ["dani/design", "dani/review"], …}
+get_message_receipts {"message_id": "…"}
+→ {"total": 2, "acknowledged": 2, "resolved": 1, "receipts": [...]}
+```
+
+**Cinco observaciones, nunca deducidas unas de otras**: `stored` (la base de
+datos hizo commit), `delivered` (un transporte lo entregó), `presented` (un
+host confirmó que llegó al modelo), `acknowledged` (el destinatario dijo que
+lo leyó), `resolved` (dijo que actuó). Una marca ausente significa *no
+observado*, no "no": `presented_at` es null allí donde el host no puede
+confirmar la inyección, y eso se queda honesto en vez de optimista. Leer un
+hilo no confirma nada, un cursor no es una persona, y resolver no completa
+una tarea ni mergea nada.
+
+**La pertenencia es por ventana** (`agente/sesión`), y una invitación no es
+un alta: cada ventana acepta con `join_conversation`, así que a nadie se le
+recluta en los receipts de otro. Un miembro nuevo ve el hilo desde que entró,
+salvo que quien invita le conceda toda la historia a propósito. Quien entra
+después **nunca aparece en el denominador de un mensaje anterior**, y
+expulsar a alguien conserva lo que ya dijo y confirmó.
+
+**La visibilidad se concede, no se deduce.** Un hilo `private` lo ven solo
+sus miembros; uno de proyecto lo ve quien tenga una concesión explícita sobre
+ese proyecto (`create_project`, `grant_project_access`). Un directorio de
+trabajo no concede nada, y la etiqueta `role` que publica una sesión para
+descubrimiento, tampoco. La elección es fija en la creación, porque la gente
+habló en el hilo bajo esas condiciones.
+
+**Dos caminos excepcionales, ambos auditados.** `transfer_membership` pasa un
+asiento a otra ventana *de tu propio agente*, y solo cuando esa ventana
+acepta; se conservan autoría, límite de historia y receipts antiguos, y nada
+se confirma en tu nombre. `recover_conversation_history` es la excepción
+documentada de que la privacidad dentro de un equipo no es aislamiento frente
+al agente que estuvo en el hilo: exige tu token de agente, que todas las
+ventanas de ese agente estén cerradas, revocadas o caducadas (estar offline no
+basta), y es de solo lectura, no concede pertenencia, salta las membresías de
+las que te expulsaron y no inventa ningún receipt.
+
+Los reintentos son seguros: `send_conversation_message` recibe un
+`request_id` UUID que generas tú, y repetirlo devuelve el mensaje original en
+vez de publicarlo dos veces. El mismo id con otro cuerpo se rechaza en lugar
+de quedarse callado con el primero.
 
 ## Administración remota
 

@@ -141,6 +141,15 @@ enum TeamCmd {
         #[arg(long)]
         bytes: Option<i64>,
     },
+    /// Turn a team's optional capabilities on or off.
+    Capability {
+        #[arg(long)]
+        team: String,
+        /// Conversations: threads with explicit membership and per-recipient
+        /// receipts. Off by default.
+        #[arg(long, value_parser = ["on", "off"])]
+        conversations: String,
+    },
     /// Report what a team is storing (counts and bytes; never content).
     Usage {
         #[arg(long)]
@@ -684,6 +693,10 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
             TeamCmd::Create { slug, name } => admin::team_create(&pool, &slug, name).await?,
             TeamCmd::List => admin::team_list(&pool).await?,
             TeamCmd::Quota { team, bytes } => admin::team_quota(&pool, &team, bytes).await?,
+            TeamCmd::Capability {
+                team,
+                conversations,
+            } => admin::team_capability(&pool, &team, conversations == "on").await?,
             TeamCmd::Usage { team } => admin::team_usage(&pool, &team).await?,
             TeamCmd::Prune {
                 team,

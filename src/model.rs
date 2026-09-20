@@ -501,3 +501,174 @@ pub struct DigestResult {
     pub agents_seen: Vec<DigestAgent>,
     pub active_locks: Vec<LockInfo>,
 }
+
+// ----------------------------------------------------------- conversations --
+
+/// A project: the unit a conversation can be visible to. Access is an
+/// explicit grant, never inferred from a directory or a role label.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProjectInfo {
+    pub id: String,
+    pub name: String,
+    /// Agents with an explicit grant. Only visible to someone who has one.
+    pub members: Vec<String>,
+    pub archived: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProjectList {
+    pub projects: Vec<ProjectInfo>,
+}
+
+/// One conversation as a caller sees it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationInfo {
+    pub id: String,
+    pub title: String,
+    /// `project` (everyone with access to the project can read it) or
+    /// `private` (only its members). Fixed at creation.
+    pub visibility: String,
+    /// Absent for a private conversation.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+    pub archived: bool,
+    /// Highest logical sequence in the thread. Messages are paged by this.
+    pub last_seq: i64,
+    /// Your own membership, when you have one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub membership: Option<MembershipInfo>,
+    /// Everyone in the thread. Only returned to a member.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub members: Vec<MembershipInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MembershipInfo {
+    pub membership_id: String,
+    pub agent: String,
+    /// Absent for the shared session.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session: Option<String>,
+    /// `agent/session`, or the bare agent for the shared session.
+    pub address: String,
+    /// `owner`, `moderator`, `participant` or `observer`.
+    pub role: String,
+    /// `invited`, `active`, `left` or `removed`.
+    pub state: String,
+    /// Lowest sequence this member may read; `null` means from the start.
+    pub history_from_seq: Option<i64>,
+    pub invited_at: String,
+    pub accepted_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationList {
+    pub conversations: Vec<ConversationInfo>,
+}
+
+/// What a send returns. `stored` is a fact about persistence, not about
+/// anyone having read anything.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SentMessage {
+    pub message_id: String,
+    pub conversation_id: String,
+    pub seq: i64,
+    /// True when the authoritative backend confirmed persistence. This
+    /// transaction committed.
+    pub stored: bool,
+    /// Who the message was addressed to, snapshotted now. A later join never
+    /// enters this list.
+    pub recipients: Vec<String>,
+    pub created_at: String,
+}
+
+/// One message of a thread.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationMessage {
+    pub message_id: String,
+    pub seq: i64,
+    pub from: String,
+    /// `agent/session` of the sender, for an exact reply.
+    pub from_address: String,
+    pub body: String,
+    pub reply_to: Option<String>,
+    pub metadata: serde_json::Value,
+    pub created_at: String,
+    /// Your own observations on this message, when you are a recipient.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub my_receipt: Option<ReceiptInfo>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationRead {
+    pub conversation_id: String,
+    pub messages: Vec<ConversationMessage>,
+    /// Pass as `after_seq` to continue. Absent when the thread is exhausted.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub next_after_seq: Option<i64>,
+    /// Lowest sequence you may read in this thread.
+    pub history_from_seq: Option<i64>,
+}
+
+/// Five independent observations. An absent timestamp means *not observed*,
+/// never "assumed": a cursor moving is not a person reading, and a host that
+/// cannot confirm injection leaves `presented_at` null.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ReceiptInfo {
+    pub agent: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session: Option<String>,
+    pub address: String,
+    pub stored_at: Option<String>,
+    pub delivered_at: Option<String>,
+    /// Null when the host cannot confirm the message reached the model. That
+    /// is unknown, not "no".
+    pub presented_at: Option<String>,
+    pub acknowledged_at: Option<String>,
+    /// The recipient said it acted on this. It does not complete a task or
+    /// merge anything by itself.
+    pub resolved_at: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MessageReceipts {
+    pub message_id: String,
+    pub seq: i64,
+    /// One entry per recipient at acceptance time.
+    pub receipts: Vec<ReceiptInfo>,
+    pub acknowledged: usize,
+    pub resolved: usize,
+    pub total: usize,
+}
+
+/// What `wait_for_conversation_updates` reports.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationUpdates {
+    pub conversations: Vec<ConversationActivity>,
+    pub waited_seconds: i64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConversationActivity {
+    pub conversation_id: String,
+    pub title: String,
+    /// Highest sequence currently stored in the thread. It is not a read
+    /// cursor: it does not move with what you have read or acknowledged.
+    pub last_seq: i64,
+    /// Messages addressed to you that you have not acknowledged.
+    pub unacknowledged: i64,
+}
+
+/// Result of a membership transfer proposal or acceptance.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TransferResult {
+    pub conversation_id: String,
+    /// The membership that will be superseded once the target accepts.
+    pub from_address: String,
+    pub to_address: String,
+    pub state: String,
+}

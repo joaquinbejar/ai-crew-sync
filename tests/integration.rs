@@ -454,6 +454,7 @@ async fn tools_are_advertised_with_schemas() {
         "list_agents",
         "list_sessions",
         "register_session",
+        "resume_session",
         "renew_session",
         "revoke_session",
         "set_note",
@@ -474,6 +475,58 @@ async fn tools_are_advertised_with_schemas() {
             tool.name
         );
     }
+
+    // A capability that is off is off in the catalogue too. Advertising
+    // eighteen tools that every call rejects is a catalogue that lies, and
+    // the model reading it spends a turn finding out.
+    let optional = [
+        "create_conversation",
+        "list_conversations",
+        "invite_to_conversation",
+        "join_conversation",
+        "leave_conversation",
+        "remove_conversation_member",
+        "archive_conversation",
+        "transfer_membership",
+        "send_conversation_message",
+        "read_conversation",
+        "get_conversation_message",
+        "ack_message",
+        "get_message_receipts",
+        "wait_for_conversation_updates",
+        "create_project",
+        "list_projects",
+        "grant_project_access",
+        "recover_conversation_history",
+    ];
+    for hidden in optional {
+        assert!(
+            !names.contains(&hidden),
+            "conversations are off for this team, so {hidden} must not be advertised"
+        );
+    }
+    let refused = call_expect_error(&client, "create_conversation", json!({"title": "no"})).await;
+    assert!(
+        refused.contains("not enabled"),
+        "the per-call check is still the authorization boundary: {refused}"
+    );
+
+    enable_conversations(&h.pool, "acme").await;
+    let client2 = connect(&h.base, &token).await;
+    let names2: Vec<String> = client2
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for shown in optional {
+        assert!(
+            names2.iter().any(|n| n == shown),
+            "with the capability on, {shown} is advertised"
+        );
+    }
+    let _ = client2.cancel().await;
     let _ = client.cancel().await;
 }
 
@@ -6313,4 +6366,634 @@ async fn mcp_status_with_epoch(base: &str, token: &str, epoch: i64) -> u16 {
         .unwrap()
         .status()
         .as_u16()
+}
+
+// ----------------------------------------------------------- conversations --
+
+/// Turn the capability on for a team, the way an operator does.
+async fn enable_conversations(pool: &PgPool, team: &str) {
+    sqlx::query("UPDATE teams SET conversations_enabled = true WHERE slug = $1")
+        .bind(team)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// A fresh request id for each send; reusing one is how a retry is spotted.
+fn request_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// The property the whole feature exists for: two sessions exchange requests
+/// privately, each reader has its own receipt, and the sender can see who
+/// acknowledged and who resolved. Plus the boundaries: the capability flag,
+/// reading not acknowledging, recipients snapshotted at acceptance, and a
+/// non-member seeing nothing.
+#[tokio::test]
+async fn conversations_carry_private_requests_with_per_recipient_receipts() {
+    let h = require_db!("t_conversations");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    let outsider = seed_agent(&h.pool, "other", "eve").await;
+
+    // Off by default: the tools refuse before an operator enables them.
+    let impl_w = connect_with_session(&h.base, &token, "impl").await;
+    let err = call_expect_error(
+        &impl_w,
+        "create_conversation",
+        json!({"title": "too early", "private": true}),
+    )
+    .await;
+    assert!(err.contains("not enabled for this team"), "{err}");
+    enable_conversations(&h.pool, "acme").await;
+
+    // Three windows of two people, plus a reviewer who is never invited.
+    let design = connect_with_session(&h.base, &dani_token, "design").await;
+    let review = connect_with_session(&h.base, &dani_token, "review").await;
+    let bystander = connect_with_session(&h.base, &token, "bystander").await;
+
+    // A private thread addressed to two exact windows.
+    let convo = call(
+        &impl_w,
+        "create_conversation",
+        json!({"title": "the empty state", "private": true,
+               "invite": ["dani/design", "dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    assert_eq!(convo["visibility"], "private");
+    assert_eq!(convo["membership"]["role"], "owner");
+    assert_eq!(convo["members"].as_array().unwrap().len(), 3);
+
+    // An invitation is not membership: until it is accepted, that window is
+    // not a recipient.
+    let first = call(
+        &impl_w,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "what should the empty state say?",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(first["stored"], true);
+    assert_eq!(first["seq"], 1);
+    assert!(
+        first["recipients"].as_array().unwrap().is_empty(),
+        "nobody has accepted yet: {first}"
+    );
+
+    // Both accept; only the invited window can, not a sibling.
+    let err = call_expect_error(
+        &bystander,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("no invitation for this window"), "{err}");
+    call(
+        &design,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    call(
+        &review,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+
+    let second = call(
+        &impl_w,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "second attempt, with a spinner",
+               "request_id": request_id()}),
+    )
+    .await;
+    let second_id = second["message_id"].as_str().unwrap().to_owned();
+    let mut addressed: Vec<&str> = second["recipients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    addressed.sort();
+    assert_eq!(addressed, vec!["dani/design", "dani/review"]);
+
+    // Reading is not acknowledging.
+    let read = call(
+        &design,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert_eq!(read["messages"].as_array().unwrap().len(), 2);
+    assert!(
+        read["messages"][1]["my_receipt"]["acknowledged_at"].is_null(),
+        "a read must not acknowledge: {read}"
+    );
+    let receipts = call(
+        &impl_w,
+        "get_message_receipts",
+        json!({"message_id": second_id}),
+    )
+    .await;
+    assert_eq!(receipts["total"], 2);
+    assert_eq!(receipts["acknowledged"], 0);
+    assert!(
+        receipts["receipts"][0]["stored_at"].is_string(),
+        "stored is a fact about persistence: {receipts}"
+    );
+    assert!(
+        receipts["receipts"][0]["presented_at"].is_null(),
+        "presentation is unknown, not 'no'"
+    );
+
+    // Independent receipts: one reader acknowledges, the other resolves.
+    call(
+        &design,
+        "ack_message",
+        json!({"message_id": second_id, "note": "looks right"}),
+    )
+    .await;
+    call(
+        &review,
+        "ack_message",
+        json!({"message_id": second_id, "resolved": true, "note": "shipped in 4d21f"}),
+    )
+    .await;
+    let receipts = call(
+        &impl_w,
+        "get_message_receipts",
+        json!({"message_id": second_id}),
+    )
+    .await;
+    assert_eq!(receipts["acknowledged"], 2);
+    assert_eq!(
+        receipts["resolved"], 1,
+        "only one said it acted: {receipts}"
+    );
+    let design_receipt = receipts["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["address"] == "dani/design")
+        .unwrap();
+    assert!(design_receipt["resolved_at"].is_null());
+    assert_eq!(design_receipt["note"], "looks right");
+
+    // A sender does not acknowledge its own message, and a window that was
+    // not addressed has nothing to acknowledge.
+    let err = call_expect_error(&impl_w, "ack_message", json!({"message_id": second_id})).await;
+    assert!(err.contains("not addressed to your window"), "{err}");
+
+    // Idempotency: the same request id returns the original message.
+    let rid = request_id();
+    let once = call(
+        &impl_w,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "retry me", "request_id": rid}),
+    )
+    .await;
+    let twice = call(
+        &impl_w,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "retry me", "request_id": rid}),
+    )
+    .await;
+    assert_eq!(once["message_id"], twice["message_id"]);
+    assert_eq!(once["seq"], twice["seq"]);
+    let err = call_expect_error(
+        &impl_w,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "something else", "request_id": rid}),
+    )
+    .await;
+    assert!(err.contains("already sent a different message"), "{err}");
+
+    // A late joiner never enters an older message's denominator.
+    call(
+        &impl_w,
+        "invite_to_conversation",
+        json!({"conversation_id": cid, "address": "joaquin/bystander"}),
+    )
+    .await;
+    call(
+        &bystander,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    let receipts = call(
+        &impl_w,
+        "get_message_receipts",
+        json!({"message_id": second_id}),
+    )
+    .await;
+    assert_eq!(
+        receipts["total"], 2,
+        "the denominator is frozen: {receipts}"
+    );
+    // And sees only what was said after they joined.
+    let theirs = call(
+        &bystander,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(
+        theirs["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["body"] != "what should the empty state say?"),
+        "a late member must not read earlier history: {theirs}"
+    );
+
+    // A removal keeps history and receipts, and stops access at once.
+    call(
+        &impl_w,
+        "remove_conversation_member",
+        json!({"conversation_id": cid, "address": "dani/design"}),
+    )
+    .await;
+    let err = call_expect_error(
+        &design,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("no such conversation"), "{err}");
+    let receipts = call(
+        &impl_w,
+        "get_message_receipts",
+        json!({"message_id": second_id}),
+    )
+    .await;
+    assert_eq!(
+        receipts["acknowledged"], 2,
+        "a removal is not a rewrite: {receipts}"
+    );
+
+    // Another team sees nothing, by id or otherwise.
+    let eve = connect(&h.base, &outsider).await;
+    enable_conversations(&h.pool, "other").await;
+    let err = call_expect_error(&eve, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(err.contains("no such conversation"), "{err}");
+    let theirs = call(&eve, "list_conversations", json!({})).await;
+    assert!(theirs["conversations"].as_array().unwrap().is_empty());
+
+    for c in [impl_w, design, review, bystander, eve] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The two exceptional paths, and the project boundary. A transfer needs the
+/// target to accept and supersedes rather than rewrites; recovery is
+/// read-only, needs every window of the agent to be gone, and never invents
+/// a receipt. Project access is a grant, not a directory.
+#[tokio::test]
+async fn transfer_needs_acceptance_and_recovery_is_read_only() {
+    let h = require_db!("t_conversations_transfer");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+
+    // A project thread: access is a grant, and a teammate without one sees
+    // nothing even though the thread is not private.
+    let owner = connect_with_session(&h.base, &token, "market-data").await;
+    call(&owner, "create_project", json!({"project": "market-data"})).await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "feed rewrite", "project": "market-data"}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let first = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "starting on the feed", "request_id": request_id()}),
+    )
+    .await;
+    let first_id = first["message_id"].as_str().unwrap().to_owned();
+
+    let dani = connect_with_session(&h.base, &dani_token, "core").await;
+    let err = call_expect_error(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(
+        err.contains("no such conversation"),
+        "a project grant is required: {err}"
+    );
+    call(
+        &owner,
+        "grant_project_access",
+        json!({"project": "market-data", "agent": "dani"}),
+    )
+    .await;
+    let seen = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(seen["messages"].as_array().unwrap().len(), 1, "{seen}");
+    // Project visibility is reading, not membership: there is nothing for a
+    // project reader to acknowledge.
+    let err = call_expect_error(&dani, "ack_message", json!({"message_id": first_id})).await;
+    assert!(err.contains("active member"), "{err}");
+    // And revoking takes effect at once.
+    call(
+        &owner,
+        "grant_project_access",
+        json!({"project": "market-data", "agent": "dani", "grant": false}),
+    )
+    .await;
+    let err = call_expect_error(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(err.contains("no such conversation"), "{err}");
+
+    // Transfer: the owner moves its seat to another window of its own agent.
+    let successor = connect_with_session(&h.base, &token, "market-data-2").await;
+    let err = call_expect_error(
+        &owner,
+        "transfer_membership",
+        json!({"conversation_id": cid, "to": "dani/core"}),
+    )
+    .await;
+    assert!(
+        err.contains("same agent"),
+        "a transfer is not an invitation: {err}"
+    );
+
+    let proposal = call(
+        &owner,
+        "transfer_membership",
+        json!({"conversation_id": cid, "to": "joaquin/market-data-2"}),
+    )
+    .await;
+    assert_eq!(proposal["state"], "proposed");
+    // Nothing has moved yet: the original seat is still active and the
+    // successor is only invited.
+    let before = call(&owner, "list_conversations", json!({})).await;
+    let entry = before["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == cid.as_str())
+        .unwrap();
+    assert_eq!(entry["membership"]["state"], "active");
+    assert_eq!(
+        entry["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["address"] == "joaquin/market-data-2")
+            .unwrap()["state"],
+        "invited"
+    );
+
+    call(
+        &successor,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    let after = call(&successor, "list_conversations", json!({})).await;
+    let mine = after["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == cid.as_str())
+        .expect("the successor holds the seat");
+    assert_eq!(
+        mine["membership"]["role"], "owner",
+        "the role travelled: {mine}"
+    );
+    assert_eq!(mine["membership"]["state"], "active");
+    let superseded = mine["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["address"] == "joaquin/market-data")
+        .unwrap();
+    assert_eq!(
+        superseded["state"], "left",
+        "the old seat is superseded: {superseded}"
+    );
+    // Authorship is untouched: the first message is still from the old window.
+    let msg = call(
+        &successor,
+        "get_conversation_message",
+        json!({"message_id": first_id}),
+    )
+    .await;
+    assert_eq!(msg["from_address"], "joaquin/market-data");
+
+    // Recovery: refused while a window is live, refused with a session
+    // credential, and read-only when every window is gone.
+    let cred = call(
+        &owner,
+        "register_session",
+        json!({"session": "market-data"}),
+    )
+    .await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let err = call_expect_error(
+        &window,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("agent token"), "{err}");
+    let err = call_expect_error(
+        &owner,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("still live"), "offline is not enough: {err}");
+
+    call(&window, "revoke_session", json!({})).await;
+    let recovered = call(
+        &owner,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(!recovered["messages"].as_array().unwrap().is_empty());
+    assert!(
+        recovered["messages"][0]["my_receipt"].is_null(),
+        "recovery observes nothing: {recovered}"
+    );
+    // It is audited, and it granted nothing.
+    let (recoveries,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM conversation_audit WHERE action = 'member.recover'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(recoveries, 1);
+
+    for c in [owner, dani, successor] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Three holes the owner reproduced against a real server, and the shape of
+/// their fixes: a window's seat needs that window's credential, a private
+/// thread is not a project thread, and a receipt is not a way around the
+/// history boundary.
+#[tokio::test]
+async fn a_private_thread_answers_only_to_the_windows_that_are_in_it() {
+    let h = require_db!("t_conversation_boundaries");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    let marta_token = seed_agent(&h.pool, "acme", "marta").await;
+    enable_conversations(&h.pool, "acme").await;
+
+    // A registered window: the credential, not the label, is what proves it.
+    let agent = connect(&h.base, &dani_token).await;
+    let cred = call(&agent, "register_session", json!({"session": "review"})).await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "who is in the room", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+
+    // The parent agent token cannot take its own window's seat, even wearing
+    // the right label. It is told what to do instead.
+    let impostor = connect_with_session(&h.base, &dani_token, "review").await;
+    let err = call_expect_error(
+        &impostor,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("registered window"), "{err}");
+    assert!(err.contains("recover_conversation_history"), "{err}");
+
+    call(
+        &window,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "the private body", "request_id": request_id()}),
+    )
+    .await;
+
+    // Now the seat is held by a window. The same agent token with the same
+    // label is a different caller and sees nothing.
+    let err = call_expect_error(
+        &impostor,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("no such conversation"), "{err}");
+    let err = call_expect_error(
+        &impostor,
+        "get_conversation_message",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(err.contains("no such conversation"), "{err}");
+    // The window itself still reads it.
+    let read = call(
+        &window,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert_eq!(read["messages"][0]["body"], "the private body");
+
+    // Private and project are exclusive, and asking for both is refused
+    // rather than quietly resolved one way.
+    call(&owner, "create_project", json!({"project": "market-data"})).await;
+    let err = call_expect_error(
+        &owner,
+        "create_conversation",
+        json!({"title": "both", "private": true, "project": "market-data"}),
+    )
+    .await;
+    assert!(
+        err.contains("either private or visible to a project"),
+        "{err}"
+    );
+
+    // And a project grant does not reach into a private thread that merely
+    // names the project.
+    call(
+        &owner,
+        "grant_project_access",
+        json!({"project": "market-data", "agent": "marta"}),
+    )
+    .await;
+    let marta = connect_with_session(&h.base, &marta_token, "review").await;
+    sqlx::query(
+        "UPDATE conversations SET project_id = (SELECT id FROM projects WHERE name = 'market-data')
+          WHERE id = $1",
+    )
+    .bind(cid.parse::<Uuid>().unwrap())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let err = call_expect_error(&marta, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(
+        err.contains("no such conversation"),
+        "a private thread stays private however it is labelled: {err}"
+    );
+
+    // A late member is refused the earlier message — and its receipts, which
+    // carry recipient addresses and a free-text note that is often the
+    // discussion itself.
+    call(
+        &window,
+        "ack_message",
+        json!({"message_id": sent["message_id"], "resolved": true,
+               "note": "the note is part of the conversation"}),
+    )
+    .await;
+    call(
+        &owner,
+        "invite_to_conversation",
+        json!({"conversation_id": cid, "address": "marta/review"}),
+    )
+    .await;
+    call(&marta, "join_conversation", json!({"conversation_id": cid})).await;
+    let err = call_expect_error(
+        &marta,
+        "get_conversation_message",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        err.contains("before the point your membership starts"),
+        "{err}"
+    );
+    let err = call_expect_error(
+        &marta,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        err.contains("not yours to read either"),
+        "the receipts of a message you may not read are not a way around it: {err}"
+    );
+    // The sender still reads them, of course.
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert_eq!(receipts["acknowledged"], 1);
+
+    for c in [owner, window, agent, impostor, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
 }

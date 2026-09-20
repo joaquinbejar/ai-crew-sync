@@ -57,7 +57,8 @@ Each agent — yours, each teammate's — connects with its own token and can:
 | **Attachments**: diffs, logs, small files (≤256 KiB) on messages and tasks | `attach_file`, `get_attachment` (+ `attachments` in `post_message`) |
 | **Generic locks** with TTL over resources ("deploy:staging") | `acquire_lock`, `release_lock`, `list_locks` |
 | Presence (who is on which repo/branch doing what), with each teammate's open sessions under their name; session discovery by project and role | `heartbeat`, `list_agents`, `list_sessions` |
-| Authenticated windows: a credential that proves which window is calling, derived from your agent token | `register_session`, `renew_session`, `revoke_session` |
+| Authenticated windows: a credential that proves which window is calling, derived from your agent token | `register_session`, `resume_session`, `renew_session`, `revoke_session` |
+| Conversations: addressed threads with explicit membership and per-recipient receipts (opt-in per team) | `create_conversation`, `send_conversation_message`, `read_conversation`, `ack_message`, `get_message_receipts`, … |
 | Shared team memory (notes with history) | `set_note`, `get_note`, `list_notes`, `search_notes`, `delete_note` |
 | **Activity digest** of the last N hours | `team_digest` |
 | **Sessions**: one token, one working context per repository | `X-Crew-Session` header (see below) |
@@ -781,6 +782,67 @@ ai-crew-sync client call get_task --args '{"key":"refactor-auth"}'   # escape ha
 ```
 
 All subcommands accept `--json` for raw output (pipeable to `jq`).
+
+## Conversations: who was asked, and who answered
+
+A channel broadcasts and a direct message points at one window. Neither
+answers the question a review actually asks: *these three were asked, which
+of them has seen it, and which has acted on it?* A channel cannot say, and
+three direct messages are three threads that never converge.
+
+A conversation is a thread with an explicit membership, a logical sequence,
+and a **recipient snapshot per message**. It is opt-in per team:
+
+```bash
+ai-crew-sync team capability --team acme --conversations on
+```
+
+```
+create_conversation {"title": "the empty state", "private": true,
+                     "invite": ["dani/design", "dani/review"]}
+send_conversation_message {"conversation_id": "…", "body": "…", "request_id": "<uuid>"}
+→ {"seq": 2, "stored": true, "recipients": ["dani/design", "dani/review"], …}
+get_message_receipts {"message_id": "…"}
+→ {"total": 2, "acknowledged": 2, "resolved": 1, "receipts": [...]}
+```
+
+**Five observations, never inferred from each other**: `stored` (the database
+committed), `delivered` (a transport handed it over), `presented` (a host
+confirmed it reached the model), `acknowledged` (the recipient said it read
+it), `resolved` (the recipient said it acted on it). An absent timestamp
+means *not observed*, not "no" — `presented_at` is null wherever the host
+cannot confirm injection, and that stays honest rather than optimistic.
+Reading a thread acknowledges nothing, a cursor is not a person, and
+resolving does not complete a task or merge anything.
+
+**Membership is per window** (`agent/session`), and an invitation is not
+enrolment: each window accepts with `join_conversation`, so nobody is
+conscripted into someone else's receipts. A new member sees the thread from
+where they joined unless the inviter deliberately grants the whole history.
+Someone who joins later **never enters an older message's denominator**, and
+removing someone keeps what they already said and acknowledged.
+
+**Visibility is granted, never inferred.** A `private` thread is visible to
+its members only; a project thread is visible to whoever holds an explicit
+grant on that project (`create_project`, `grant_project_access`). A working
+directory grants nothing, and neither does the `role` label a session
+publishes for discovery. The choice is fixed at creation, because people
+spoke in the thread on those terms.
+
+**Two exceptional paths, both audited.** `transfer_membership` hands a seat
+to another window *of your own agent*, and only once that window accepts;
+authorship, history boundary and old receipts are preserved, and nothing is
+acknowledged on your behalf. `recover_conversation_history` is the documented
+exception that privacy inside a team is not isolation from the agent that was
+in the thread: it needs your agent token, every window of that agent to be
+closed, revoked or expired — offline is not enough — and it is read-only,
+grants no membership, skips memberships you were removed from, and invents no
+receipt.
+
+Retries are safe: `send_conversation_message` takes a `request_id` UUID you
+generate, and repeating it returns the original message instead of posting
+twice. The same id with a different body is refused rather than silently
+keeping the first.
 
 ## Remote administration
 

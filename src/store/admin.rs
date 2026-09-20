@@ -271,6 +271,38 @@ pub async fn team_by_id(pool: &PgPool, id: Uuid) -> BusResult<TeamRow> {
     })
 }
 
+/// Turn a team's conversation capability on or off. Off is the default and
+/// the safe state: installing a release must never expose a new surface.
+pub async fn set_conversations(
+    pool: &PgPool,
+    actor: Actor,
+    team_id: Uuid,
+    enabled: bool,
+) -> BusResult<()> {
+    let mut tx = pool.begin().await?;
+    let changed: Option<(String,)> = sqlx::query_as(
+        "UPDATE teams SET conversations_enabled = $2
+          WHERE id = $1 AND conversations_enabled <> $2 RETURNING slug",
+    )
+    .bind(team_id)
+    .bind(enabled)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((slug,)) = changed {
+        audit(
+            &mut tx,
+            actor,
+            "team.capability",
+            Some(team_id),
+            Some(team_id),
+            serde_json::json!({ "slug": slug, "conversations_enabled": enabled }),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn list_teams(pool: &PgPool) -> BusResult<Vec<TeamRow>> {
     let rows: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
         "SELECT t.id, t.slug, t.name, (SELECT count(*) FROM agents a WHERE a.team_id = t.id)

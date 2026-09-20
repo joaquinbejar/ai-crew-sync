@@ -33,6 +33,23 @@ pub async fn team_list(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Turn conversations on or off for a team.
+pub async fn team_capability(pool: &PgPool, team: &str, conversations: bool) -> anyhow::Result<()> {
+    let id = team_id(pool, team).await?;
+    store::set_conversations(pool, Actor::Cli, id, conversations).await?;
+    println!(
+        "team '{team}': conversations {}",
+        if conversations { "enabled" } else { "disabled" }
+    );
+    if conversations {
+        println!(
+            "Agents of this team now see create_conversation and the rest. Existing tools \
+             are unchanged."
+        );
+    }
+    Ok(())
+}
+
 fn human_bytes(n: i64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = n as f64;

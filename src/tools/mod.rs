@@ -1,4 +1,5 @@
 pub mod attachments;
+pub mod conversations;
 pub mod events;
 pub mod locks;
 pub mod messaging;
@@ -11,7 +12,7 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerConfig},
     service::RequestContext,
-    tool, tool_handler, tool_router,
+    tool, tool_router,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -90,7 +91,8 @@ impl Bus {
             + Self::locks_router()
             + Self::events_router()
             + Self::attachments_router()
-            + Self::sessions_router();
+            + Self::sessions_router()
+            + Self::conversations_router();
         Self {
             db,
             hub,
@@ -286,11 +288,58 @@ impl Bus {
     }
 }
 
-#[tool_handler(router = self.tool_router)]
 impl ServerHandler for Bus {
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         info.instructions = Some(INSTRUCTIONS.trim().to_string());
         info
+    }
+
+    /// The catalogue this caller's team actually has.
+    ///
+    /// An off capability is not only a refusal at call time: advertising
+    /// eighteen tools that every call rejects is a catalogue that lies, and
+    /// the model reading it wastes a turn finding out. The per-call check
+    /// stays exactly where it was — a catalogue is not an authorization
+    /// boundary.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let all = self.tool_router.list_all();
+        let enabled = match auth_of(&context) {
+            Ok(auth) => store::conversations::capability_enabled(&self.db, &auth)
+                .await
+                .unwrap_or(false),
+            // No context to decide with: advertise the always-available
+            // tools rather than guessing a capability on.
+            Err(_) => false,
+        };
+        if enabled {
+            return Ok(rmcp::model::ListToolsResult::with_all_items(all));
+        }
+        let optional: std::collections::HashSet<String> = Self::conversations_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        Ok(rmcp::model::ListToolsResult::with_all_items(
+            all.into_iter()
+                .filter(|t| !optional.contains(t.name.as_ref()))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        self.tool_router
+            .call(rmcp::handler::server::tool::ToolCallContext::new(
+                self, request, context,
+            ))
+            .await
     }
 }
