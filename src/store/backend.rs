@@ -87,12 +87,25 @@ pub trait MessagingBackend: Send + Sync {
         before: chrono::DateTime<chrono::Utc>,
     ) -> impl std::future::Future<Output = BusResult<u64>> + Send;
 
-    /// Ask the backend what it actually holds for a key, for the uncertain
-    /// case: the publish call died without an answer. `None` means it has
-    /// nothing, so a retry is safe.
+    /// Settle an attempt that ended without an answer.
+    ///
+    /// Takes the whole envelope, not just the key, because the honest
+    /// answer for a broker is "present this again under the same
+    /// idempotency key and read what comes back". Inside its deduplication
+    /// window that returns the original sequence; outside it, the body
+    /// lands now. Either way there is one logical message with one
+    /// canonical locator.
+    ///
+    /// What an implementation must **not** do is probe with a throwaway
+    /// message under the real key. A probe that can answer at all is a
+    /// probe that was stored, and it takes the key the body needed — the
+    /// locator then names an empty message and the body never lands.
+    ///
+    /// `None` means the backend holds nothing and nothing was written, so
+    /// the ordinary retry path is safe.
     fn reconcile(
         &self,
-        publish_key: Uuid,
+        envelope: &Envelope,
     ) -> impl std::future::Future<Output = BusResult<Option<Locator>>> + Send;
 }
 
@@ -103,6 +116,11 @@ pub trait MessagingBackend: Send + Sync {
 #[derive(Clone)]
 pub struct PostgresBackend {
     pool: PgPool,
+    /// The team this handle may read for, when it was built for one. A
+    /// locator is opaque and a caller could hold one from anywhere; the
+    /// JetStream adapter checks the team on the envelope it reads back, and
+    /// this is the same check on this side of the boundary.
+    team_id: Option<Uuid>,
     /// Fault injection for the tests. Production constructs `new`, which
     /// leaves every fault off.
     faults: Faults,
@@ -133,9 +151,16 @@ impl PostgresBackend {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
+            team_id: None,
             faults: Faults::default(),
             retryable_left: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// A handle that may only read one team's bodies.
+    pub fn with_team(mut self, team_id: Uuid) -> Self {
+        self.team_id = Some(team_id);
+        self
     }
 
     /// Only the tests construct this.
@@ -143,6 +168,7 @@ impl PostgresBackend {
         let left = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(faults.retryable));
         Self {
             pool,
+            team_id: None,
             faults,
             retryable_left: left,
         }
@@ -204,11 +230,17 @@ impl MessagingBackend for PostgresBackend {
             .0
             .parse()
             .map_err(|_| BusError::invalid("not a locator this backend issued"))?;
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT body FROM conversation_messages WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+        // Scoped to this handle's team when it has one. A locator is opaque
+        // and proves nothing about who may read it.
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT m.body FROM conversation_messages m
+               JOIN conversations c ON c.id = m.conversation_id
+              WHERE m.id = $1 AND ($2::uuid IS NULL OR c.team_id = $2)",
+        )
+        .bind(id)
+        .bind(self.team_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|r| r.0))
     }
 
@@ -219,13 +251,14 @@ impl MessagingBackend for PostgresBackend {
         Ok(0)
     }
 
-    async fn reconcile(&self, publish_key: Uuid) -> BusResult<Option<Locator>> {
+    async fn reconcile(&self, envelope: &Envelope) -> BusResult<Option<Locator>> {
+        // No write: the row is already here, so "did it land" is a lookup.
         let row: Option<(Uuid,)> = sqlx::query_as(
             "SELECT m.id FROM conversation_messages m
                JOIN conversation_outbox o ON o.message_id = m.id
               WHERE o.publish_key = $1 AND m.canonical_locator IS NOT NULL",
         )
-        .bind(publish_key)
+        .bind(envelope.publish_key)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| Locator(r.0.to_string())))

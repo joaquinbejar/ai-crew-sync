@@ -823,10 +823,58 @@ resuelve preguntando al backend qué tiene de verdad para esa clave, no
 adivinando. Los reintentos presentan la misma clave, así que una escritura
 física duplicada acaba en un único locator canónico y no en dos mensajes.
 
-Postgres es el único backend. La frontera existe para poder construir y
-probar el manejo de fallos antes de tener algo externo a lo que culpar;
-volver una conversación a modo síncrono se rechaza mientras quede trabajo
-pendiente, porque si no el hilo se queda con un hueco que nadie cierra.
+Postgres es el backend por defecto, y el único que usa una instalación que
+no toque nada. La frontera existe para poder construir y probar el manejo de
+fallos antes de tener algo externo a lo que culpar; volver una conversación
+a modo síncrono se rechaza mientras quede trabajo pendiente, porque si no el
+hilo se queda con un hueco que nadie cierra.
+
+## JetStream (fase 4: el adaptador, no un despliegue)
+
+Detrás de la frontera de backends hay un adaptador de JetStream. **Una
+instalación por defecto no contacta jamás con un broker**:
+`conversations.backend` es `postgres`, los equipos normales siguen en el
+camino síncrono, y NATS no necesita estar levantado. Mergear o instalar esto
+no mueve los datos de nadie.
+
+Lo que hay, probado contra un broker real en la suite:
+
+- Un **stream por equipo**, en disco y acotado, con el nombre derivado del id
+  del equipo: renombrar un equipo no mueve nada y ningún slug llega al
+  broker. Retención por límites y `DiscardNew`, así que un stream lleno
+  rechaza escrituras nuevas en vez de tirar historia por lo bajo.
+- **Aprovisionar es una acción de operador con su propia credencial.** La de
+  runtime publica y lee, y no puede crear ni borrar streams; un equipo
+  enrutado a JetStream sin aprovisionar falla al arrancar y lo dice, en vez
+  de fallar en el primer mensaje.
+- **NATS es interno.** Ningún subject, stream o consumer es jamás un
+  argumento de cliente, y ACS comprueba él mismo cada ACL.
+- **`stored` sigue significando confirmado.** El adaptador espera el PubAck;
+  una publicación sin confirmar no está almacenada y no se reporta como tal.
+- **Idempotencia** por `Nats-Msg-Id` con la clave del outbox, así que un
+  reintento dentro de la ventana de deduplicación devuelve la secuencia
+  original. Fuera de ella, la reconciliación vuelve a presentar el sobre
+  completo bajo la misma clave, nunca un sondeo vacío que se quedaría con la
+  clave que el cuerpo necesitaba.
+
+### El contrato de 1 MiB necesita subir dos límites, no uno
+
+El `max_message_size` del stream no basta: el `max_payload` del **servidor**
+vale 1 MiB por defecto, y un cuerpo de 1 MiB más sus cabeceras de sobre son
+unos 1.048.800 bytes, rechazado por un par de cientos de bytes. Un despliegue
+que suba solo el límite del stream rechaza exactamente los mensajes que el
+contrato permite.
+
+Arranca el broker con `--max_payload 2MB` (el fixture de test lo hace) y un
+cuerpo en el techo del contrato no lo rechaza ninguno de los dos. Un cuerpo
+por encima del límite del broker falla **fatal** en vez de reintentarse para
+siempre, igual que un stream lleno o una autorización denegada; un timeout o
+una conexión caída siguen siendo reintentables.
+
+El fixture de integración es **obligatorio** desde esta fase: `make test`
+levanta un NATS 2.12 real con JetStream, y si falta, la suite falla de forma
+visible. Un test de broker que se salta a sí mismo no prueba nada y parece un
+pase.
 
 ## Un ejemplo completo: diseño, implementación, revisión
 
