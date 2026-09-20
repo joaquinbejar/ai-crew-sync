@@ -230,21 +230,29 @@ pub async fn token_revoke(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
 /// remotely with the credential this prints.
 pub async fn admin_bootstrap(pool: &PgPool, label: Option<String>) -> anyhow::Result<()> {
     let issued = store::grant_admin(pool, Actor::Cli, None, label).await?;
-    let active = store::list_admins(pool, None)
-        .await?
-        .into_iter()
-        .filter(|c| c.team.is_none() && !c.revoked)
-        .count();
 
+    // The secret first: nothing that can fail stands between the mint and
+    // the one time it is shown.
     println!();
     println!("Global administrative credential — shown once, store it now:");
     println!();
     println!("  {}", issued.token);
     println!();
     println!("Use it from your machine with `ai-crew-sync admin login --url <bus>`.");
-    println!(
-        "{active} global credential(s) are now active; list them with `admin credential list`."
-    );
+
+    // Informational; a failure here must not look like a failed bootstrap.
+    match store::list_admins(pool, None).await {
+        Ok(rows) => {
+            let active = rows
+                .iter()
+                .filter(|c| c.team.is_none() && !c.revoked)
+                .count();
+            println!(
+                "{active} global credential(s) are now active; list them with `admin credential list`."
+            );
+        }
+        Err(e) => eprintln!("(could not count active credentials: {e})"),
+    }
     Ok(())
 }
 
