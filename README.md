@@ -812,17 +812,19 @@ is resolved by asking the backend what it actually holds for the publish key,
 not by guessing. Retries present the same key, so a duplicate physical write
 resolves to one canonical locator rather than two messages.
 
-Postgres is the only backend. The boundary exists so the failure handling can
-be built and tested before there is anything external to blame for it;
-returning a conversation to synchronous mode is refused while work is still
-outstanding, because a thread would otherwise keep a gap nobody drains.
+Postgres is the default backend, and the only one an untouched installation
+uses. The boundary exists so the failure handling could be built and tested
+before there was anything external to blame for it; returning a conversation
+to synchronous mode is refused while work is still outstanding, because a
+thread would otherwise keep a gap nobody drains.
 
-## JetStream (phase 4: the adapter, not a rollout)
+## JetStream: routing a team's conversation bodies
 
-A JetStream adapter exists behind the backend boundary. **A default
-installation never contacts a broker**: `conversations.backend` is
-`postgres`, ordinary teams stay on the synchronous path, and NATS does not
-need to be running. Merging or installing this does not move anyone's data.
+A JetStream adapter sits behind the backend boundary, and a team can be
+routed to it. **A default installation never contacts a broker**:
+`teams.default_backend` is `postgres`, ordinary teams stay on the
+synchronous path, and NATS does not need to be running. Merging, installing
+or upgrading moves nobody's data.
 
 What is in place, proven against a real broker in the test suite:
 
@@ -860,6 +862,67 @@ retryable.
 The integration fixture is **required** from this phase: `make test` starts a
 real NATS 2.12 with JetStream, and a missing broker fails the suite visibly.
 A broker test that skips itself proves nothing and reads like a pass.
+
+### Routing a team, and what routing does not do
+
+Two independent steps, in this order, and neither implies the other:
+
+```bash
+# 1. The stream. An operator action with the PROVISIONING credential —
+#    the server's own credential deliberately cannot create streams.
+ai-crew-sync team stream --team acme --nats-url nats://broker:4222
+
+# 2. The route. From now on, this team's NEW conversations store their
+#    bodies on the broker.
+ai-crew-sync team capability --team acme --backend jetstream
+
+# And the server has to be able to reach it:
+ai-crew-sync serve --nats-url nats://broker:4222 \
+                   --nats-credentials /etc/ai-crew-sync/runtime.creds
+```
+
+**Existing threads are never migrated.** A conversation records the backend
+it was created on and keeps it for life: a thread with half its history in
+each place is the one shape nobody can read. Routing back to Postgres
+affects new conversations only, and is refused while anything is still
+awaiting publication.
+
+A team routed to JetStream on a server started without `--nats-url` does not
+silently fall back — that would split the history. Reads of those threads
+say what is wrong and what to do about it.
+
+### What a reader is told while a body is in flight
+
+On this path `stored` is not the same as accepted, and a read says which is
+which. Every message carries a `publication`:
+
+| `publication` | What it means |
+|---|---|
+| `stored` | The broker acknowledged it. The body is durable. |
+| `pending_publication` | Accepted, not yet confirmed. The body is still readable from its temporary local copy; the receipts' `stored_at` is null, because it is not stored. |
+| `failed` | It will not be published. The message keeps its slot so the gap is visible rather than silent. |
+| `tombstoned` | The backend no longer holds the body (retention, or an operator). The message keeps its sequence, its recipients and its receipts; `unavailable` says why. |
+
+A body the current backend cannot serve does not fail the page: the message
+keeps its place and says what happened to it. Thread order is the sequence,
+never the order the broker happened to confirm in, and a reader's cursor
+cannot walk past a message still in flight.
+
+Access is rechecked at the moment a body is served, not only when the
+message was sent: a membership that ended while a publication was in flight
+stops reading on the very next call.
+
+### Draining, and running the drainer elsewhere
+
+The process that serves requests also drains the outbox by default. An
+attempt that ends without an answer is recorded as **uncertain** — not
+stored, not failed, because either would be a guess — and reconciliation
+presents the same envelope under the same idempotency key: inside the
+broker's dedup window that returns the original sequence, outside it the
+body lands then. One logical message either way.
+
+To run dedicated drainer replicas, start the request-serving ones with
+`--publication-worker false`.
 
 ## A worked example: design, implementation, review
 

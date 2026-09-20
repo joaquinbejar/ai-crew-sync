@@ -600,6 +600,16 @@ pub struct ConversationMessage {
     /// Your own observations on this message, when you are a recipient.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub my_receipt: Option<ReceiptInfo>,
+    /// Where this body stands with the backend that holds it: `stored`
+    /// normally, and `pending_publication`, `failed` or `tombstoned` when
+    /// the body is not here. A thread on the default Postgres backend is
+    /// always `stored`.
+    pub publication: String,
+    /// Why the body is missing, when it is. The message keeps its place in
+    /// the sequence, its sender and its receipts either way: a gap you can
+    /// see and read about is not the same as a gap.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub unavailable: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

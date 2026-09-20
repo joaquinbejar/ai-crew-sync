@@ -829,24 +829,22 @@ fallos antes de tener algo externo a lo que culpar; volver una conversación
 a modo síncrono se rechaza mientras quede trabajo pendiente, porque si no el
 hilo se queda con un hueco que nadie cierra.
 
-## JetStream (fase 4: el adaptador, no un despliegue)
+## JetStream: enrutar los cuerpos de conversación de un equipo
 
-Detrás de la frontera de backends hay un adaptador de JetStream. **Una
-instalación por defecto no contacta jamás con un broker**:
-`conversations.backend` es `postgres`, los equipos normales siguen en el
-camino síncrono, y NATS no necesita estar levantado. Mergear o instalar esto
-no mueve los datos de nadie.
+Detrás de la frontera de backends hay un adaptador de JetStream, y un equipo
+puede enrutarse a él. **Una instalación por defecto no contacta jamás con un
+broker**: `teams.default_backend` es `postgres`, los equipos normales siguen
+en el camino síncrono, y NATS no necesita estar levantado. Instalar,
+mergear o actualizar no mueve los datos de nadie.
 
 Lo que hay, probado contra un broker real en la suite:
 
 - Un **stream por equipo**, en disco y acotado, con el nombre derivado del id
   del equipo: renombrar un equipo no mueve nada y ningún slug llega al
-  broker. Retención por límites y `DiscardNew`, así que un stream lleno
-  rechaza escrituras nuevas en vez de tirar historia por lo bajo.
-- **Aprovisionar es una acción de operador con su propia credencial.** La de
-  runtime publica y lee, y no puede crear ni borrar streams; un equipo
-  enrutado a JetStream sin aprovisionar falla al arrancar y lo dice, en vez
-  de fallar en el primer mensaje.
+  broker. Retención por límites y `DiscardNew`: un stream lleno rechaza
+  escrituras nuevas en vez de tirar historia por lo bajo.
+- **Aprovisionar es una acción de operador con su propia credencial.** La
+  credencial de runtime publica y lee, y no puede crear ni borrar streams.
 - **NATS es interno.** Ningún subject, stream o consumer es jamás un
   argumento de cliente, y ACS comprueba él mismo cada ACL.
 - **`stored` sigue significando confirmado.** El adaptador espera el PubAck;
@@ -861,20 +859,77 @@ Lo que hay, probado contra un broker real en la suite:
 
 El `max_message_size` del stream no basta: el `max_payload` del **servidor**
 vale 1 MiB por defecto, y un cuerpo de 1 MiB más sus cabeceras de sobre son
-unos 1.048.800 bytes, rechazado por un par de cientos de bytes. Un despliegue
-que suba solo el límite del stream rechaza exactamente los mensajes que el
-contrato permite.
+unos 1.048.800 bytes. Un despliegue que suba solo el límite del stream
+rechaza exactamente los mensajes que el contrato permite. Arranca el broker
+con `--max_payload 2MB` (el fixture de test lo hace). Un cuerpo por encima
+del límite del broker falla **fatal** en vez de reintentarse para siempre,
+igual que un stream lleno o una autorización denegada; un timeout o una
+conexión caída siguen siendo reintentables.
 
-Arranca el broker con `--max_payload 2MB` (el fixture de test lo hace) y un
-cuerpo en el techo del contrato no lo rechaza ninguno de los dos. Un cuerpo
-por encima del límite del broker falla **fatal** en vez de reintentarse para
-siempre, igual que un stream lleno o una autorización denegada; un timeout o
-una conexión caída siguen siendo reintentables.
+El fixture de integración es **obligatorio**: `make test` levanta un NATS
+2.12 real con JetStream, y si falta, la suite falla de forma visible. Un test
+de broker que se salta a sí mismo no prueba nada y parece un pase.
 
-El fixture de integración es **obligatorio** desde esta fase: `make test`
-levanta un NATS 2.12 real con JetStream, y si falta, la suite falla de forma
-visible. Un test de broker que se salta a sí mismo no prueba nada y parece un
-pase.
+### Enrutar un equipo, y lo que enrutar NO hace
+
+Dos pasos independientes, en este orden, y ninguno implica al otro:
+
+```bash
+# 1. El stream. Acción de operador con la credencial de APROVISIONAMIENTO:
+#    la del servidor no puede crear streams, a propósito.
+ai-crew-sync team stream --team acme --nats-url nats://broker:4222
+
+# 2. La ruta. Desde ahora, las conversaciones NUEVAS de este equipo guardan
+#    sus cuerpos en el broker.
+ai-crew-sync team capability --team acme --backend jetstream
+
+# Y el servidor tiene que poder llegar:
+ai-crew-sync serve --nats-url nats://broker:4222 \
+                   --nats-credentials /etc/ai-crew-sync/runtime.creds
+```
+
+**Los hilos existentes no se migran nunca.** Una conversación guarda el
+backend en el que nació y se queda con él de por vida: un hilo con media
+historia en cada sitio es la única forma que no puede leer nadie. Volver a
+Postgres afecta solo a las conversaciones nuevas, y se rechaza mientras
+quede algo pendiente de publicar.
+
+Un equipo enrutado a JetStream en un servidor arrancado sin `--nats-url` no
+cae de vuelta a Postgres en silencio — eso partiría la historia. Al leer
+esos hilos se dice qué pasa y qué hacer.
+
+### Qué se le cuenta a quien lee mientras un cuerpo está en vuelo
+
+Por este camino `stored` no es lo mismo que aceptado, y una lectura dice
+cuál de las dos cosas es. Cada mensaje lleva un `publication`:
+
+| `publication` | Qué significa |
+|---|---|
+| `stored` | El broker lo confirmó. El cuerpo es duradero. |
+| `pending_publication` | Aceptado, aún sin confirmar. El cuerpo se lee todavía de su copia local temporal; el `stored_at` de los receipts es nulo, porque no está almacenado. |
+| `failed` | No se va a publicar. El mensaje conserva su hueco para que la laguna se vea en vez de ser silenciosa. |
+| `tombstoned` | El backend ya no tiene el cuerpo (retención, o un operador). El mensaje conserva su secuencia, sus destinatarios y sus receipts; `unavailable` dice por qué. |
+
+Un cuerpo que el backend no puede servir no tumba la página: el mensaje
+mantiene su sitio y cuenta qué le pasó. El orden del hilo es la secuencia,
+jamás el orden en que el broker fue confirmando, y el cursor de quien lee no
+puede saltarse un mensaje que sigue en vuelo.
+
+El acceso se vuelve a comprobar en el momento de servir el cuerpo, no solo
+cuando se envió el mensaje: una pertenencia que terminó mientras había una
+publicación en vuelo deja de leer en la llamada siguiente.
+
+### Drenar, y drenar desde otro sitio
+
+El proceso que atiende peticiones drena también el outbox por defecto. Un
+intento que termina sin respuesta se anota como **incierto** (ni almacenado
+ni fallido: cualquiera de las dos sería una suposición), y la reconciliación
+presenta el mismo sobre con la misma clave de idempotencia: dentro de la
+ventana del broker eso devuelve la secuencia original, y fuera de ella el
+cuerpo aterriza entonces. Un único mensaje lógico en ambos casos.
+
+Para tener réplicas dedicadas a drenar, arranca las que solo atienden
+peticiones con `--publication-worker false`.
 
 ## Un ejemplo completo: diseño, implementación, revisión
 

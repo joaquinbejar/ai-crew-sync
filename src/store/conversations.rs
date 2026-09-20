@@ -29,6 +29,7 @@ use crate::{
         MembershipInfo, MessageReceipts, ProjectInfo, ReceiptInfo, SentMessage, TransferResult, ts,
         ts_opt,
     },
+    store::backend::MessagingBackend,
 };
 
 /// Longest conversation title and project name. Identifiers people type.
@@ -454,6 +455,13 @@ pub async fn access(pool: &PgPool, auth: &AuthCtx, conversation: Uuid) -> BusRes
 }
 
 /// Resolve and require read access in one step.
+/// What a retry is compared against. The body is staged in this row only
+/// until its backend confirms it; the digest stays.
+fn body_digest(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(body.as_bytes()))
+}
+
 /// Refuse a content read to a seat that has not been accepted.
 fn require_accepted(a: &Access) -> BusResult<()> {
     if a.can_read_messages() {
@@ -554,10 +562,17 @@ pub async fn create_conversation(
 
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
+    // The backend is the team's current routing, captured at creation: a
+    // thread never changes backend once it holds messages, because half a
+    // history in each place is the one shape nobody can read.
     let (id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO conversations
-            (team_id, project_id, visibility, title, created_by, created_session)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            (team_id, project_id, visibility, title, created_by, created_session,
+             backend, publication)
+         SELECT $1, $2, $3, $4, $5, $6, t.default_backend,
+                CASE WHEN t.default_backend = 'postgres' THEN 'sync' ELSE 'outbox' END
+           FROM teams t WHERE t.id = $1
+         RETURNING id",
     )
     .bind(auth.team_id)
     .bind(project_id)
@@ -1162,17 +1177,27 @@ pub async fn send(
 
     // Idempotency, under that lock: a retry that raced the original sees it
     // rather than allocating a second sequence.
-    let existing: Option<(Uuid, i64, String, chrono::DateTime<chrono::Utc>, String)> =
-        sqlx::query_as(
-            "SELECT id, seq, body, created_at, publication_state FROM conversation_messages
+    #[allow(clippy::type_complexity)]
+    let existing: Option<(
+        Uuid,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, seq, created_at, publication_state, body_sha256
+           FROM conversation_messages
           WHERE conversation_id = $1 AND request_id = $2",
-        )
-        .bind(id)
-        .bind(input.request_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    if let Some((mid, seq, stored_body, created_at, publication_state)) = existing {
-        if stored_body != body {
+    )
+    .bind(id)
+    .bind(input.request_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((mid, seq, created_at, publication_state, digest)) = existing {
+        // The digest, not the body. Once a publication releases the staging
+        // copy there is no body here to compare with, and a legitimate
+        // retry would be refused as a different message.
+        if digest.as_deref() != Some(body_digest(&body).as_str()) {
             return Err(BusError::conflict(
                 "this request_id already sent a different message. Use a fresh UUID for a \
                  new message; reusing one is how a retry is recognised.",
@@ -1220,8 +1245,8 @@ pub async fn send(
     let (message_id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO conversation_messages
             (conversation_id, seq, sender_agent, sender_session, body, reply_to, metadata,
-             request_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+             request_id, body_sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
     )
     .bind(id)
     .bind(seq)
@@ -1231,6 +1256,7 @@ pub async fn send(
     .bind(input.reply_to)
     .bind(&metadata)
     .bind(input.request_id)
+    .bind(body_digest(&body))
     .fetch_one(&mut *tx)
     .await?;
 
@@ -1316,6 +1342,157 @@ pub async fn send(
     })
 }
 
+/// What is known about one message's body.
+///
+/// A body that cannot be served is **not** an error when reading a thread:
+/// the message keeps its sequence, its sender and its receipts, and the
+/// reason is stated on the message itself. Only a caller who asked for one
+/// specific body gets a refusal.
+pub enum BodyState {
+    Present(String),
+    /// `publication` is the honest status — `pending_publication`, `failed`
+    /// or `tombstoned` — and `why` says what it means for this caller.
+    Missing {
+        publication: &'static str,
+        why: BusError,
+    },
+}
+
+/// The columns resolving a body needs. Read once per message, alongside the
+/// rest of the row, so a page of history is still one query plus whatever
+/// the backend charges for the bodies it actually holds.
+struct BodyRow {
+    body: String,
+    state: String,
+    locator: Option<String>,
+    tombstoned: bool,
+    tombstone_reason: Option<String>,
+}
+
+/// Turn one row into a body or an explained absence.
+///
+/// `backend` must be the conversation's own backend: a locator is only
+/// meaningful to the adapter that issued it, and `Backends::for_conversation`
+/// is how you get the right one.
+async fn resolve_body(
+    pool: &PgPool,
+    backend: &impl crate::store::backend::MessagingBackend,
+    conv_backend: &str,
+    message_id: Uuid,
+    row: BodyRow,
+) -> BusResult<BodyState> {
+    if row.tombstoned {
+        return Ok(BodyState::Missing {
+            publication: "tombstoned",
+            why: BusError::not_found(format!(
+                "this message's body is no longer held by its backend ({}). Its place in \
+                 the thread, its recipients and its receipts remain.",
+                row.tombstone_reason.as_deref().unwrap_or("retention")
+            )),
+        });
+    }
+    // Still in the local row: either Postgres is the backend, or the
+    // publication has not been confirmed and the temporary copy released.
+    if conv_backend == crate::store::backend::PostgresBackend::NAME || !row.body.is_empty() {
+        return Ok(BodyState::Present(row.body));
+    }
+    match row.state.as_str() {
+        "pending_publication" => Ok(BodyState::Missing {
+            publication: "pending_publication",
+            why: BusError::conflict(
+                "this message has been accepted but its backend has not confirmed it yet. \
+                 It is not lost; read it again in a moment.",
+            ),
+        }),
+        "failed" => Ok(BodyState::Missing {
+            publication: "failed",
+            why: BusError::not_found(
+                "this message was never stored by its backend. Its slot is kept so the gap \
+                 is visible rather than silent.",
+            ),
+        }),
+        _ => {
+            let Some(locator) = row.locator else {
+                return Ok(BodyState::Missing {
+                    publication: "failed",
+                    why: BusError::not_found(
+                        "this message has no body and no locator; there is nothing to read",
+                    ),
+                });
+            };
+            match backend
+                .fetch(&crate::store::backend::Locator(locator), message_id)
+                .await?
+            {
+                Some(body) => Ok(BodyState::Present(body)),
+                None => {
+                    // Gone from the backend without a tombstone: record one,
+                    // so the next reader gets an explanation rather than the
+                    // same surprise.
+                    crate::store::outbox::tombstone(pool, message_id, "missing from backend")
+                        .await?;
+                    Ok(BodyState::Missing {
+                        publication: "tombstoned",
+                        why: BusError::not_found(
+                            "this message's body is no longer held by its backend. Its place \
+                             in the thread, its recipients and its receipts remain.",
+                        ),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Fetch one body that may live on another backend.
+///
+/// Access is the caller's business and was already checked; this is storage,
+/// not policy.
+pub async fn body_of(
+    pool: &PgPool,
+    backend: &impl crate::store::backend::MessagingBackend,
+    message_id: Uuid,
+) -> BusResult<String> {
+    let row: Option<(
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT m.body, m.publication_state, m.canonical_locator, c.backend,
+                m.tombstoned_at, m.tombstone_reason
+           FROM conversation_messages m
+           JOIN conversations c ON c.id = m.conversation_id
+          WHERE m.id = $1",
+    )
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((body, state, locator, conv_backend, tombstoned, tombstone_reason)) = row else {
+        return Err(BusError::not_found("no such message"));
+    };
+    let resolved = resolve_body(
+        pool,
+        backend,
+        &conv_backend,
+        message_id,
+        BodyRow {
+            body,
+            state,
+            locator,
+            tombstoned: tombstoned.is_some(),
+            tombstone_reason,
+        },
+    )
+    .await?;
+    match resolved {
+        BodyState::Present(body) => Ok(body),
+        BodyState::Missing { why, .. } => Err(why),
+    }
+}
+
 async fn recipients_of(tx: &mut sqlx::PgConnection, message_id: Uuid) -> BusResult<Vec<String>> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT ag.name, r.session FROM message_recipients r
@@ -1335,6 +1512,7 @@ async fn recipients_of(tx: &mut sqlx::PgConnection, message_id: Uuid) -> BusResu
 /// here, and no cursor is advanced on anyone's behalf.
 pub async fn read(
     pool: &PgPool,
+    backends: &crate::store::routing::Backends,
     auth: &AuthCtx,
     id: Uuid,
     after_seq: Option<i64>,
@@ -1353,6 +1531,7 @@ pub async fn read(
         .unwrap_or(0);
     let after = after_seq.unwrap_or(0).max(floor);
 
+    #[allow(clippy::type_complexity)]
     let rows: Vec<(
         Uuid,
         i64,
@@ -1362,20 +1541,21 @@ pub async fn read(
         Option<Uuid>,
         serde_json::Value,
         chrono::DateTime<chrono::Utc>,
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
     )> = sqlx::query_as(
-        // A message that has been accepted and not yet confirmed is not
-        // history: reading past it would let a cursor walk over a gap that
-        // is about to fill, and a reader would never come back for it. The
-        // page stops at the first one.
+        // Messages awaiting publication are returned, not hidden. Hiding
+        // them let a reader believe the thread ended there; showing each
+        // one with its publication state tells the truth and still stops a
+        // cursor from walking over a gap it never knew about.
         "SELECT m.id, m.seq, ag.name, m.sender_session, m.body, m.reply_to, m.metadata,
-                m.created_at
+                m.created_at, m.publication_state, m.canonical_locator, m.tombstoned_at,
+                m.tombstone_reason
            FROM conversation_messages m
            JOIN agents ag ON ag.id = m.sender_agent
           WHERE m.conversation_id = $1 AND m.seq > $2 AND m.deleted_at IS NULL
-            AND m.seq < COALESCE((SELECT min(p.seq) FROM conversation_messages p
-                                   WHERE p.conversation_id = $1
-                                     AND p.publication_state = 'pending_publication'),
-                                 9223372036854775807)
           ORDER BY m.seq
           LIMIT $3",
     )
@@ -1384,6 +1564,17 @@ pub async fn read(
     .bind(limit)
     .fetch_all(pool)
     .await?;
+
+    // The backend this thread's bodies are on. Resolved once per page, and
+    // on the default installation it is Postgres and costs nothing.
+    let backend = backends.for_conversation(pool, id).await?;
+    let conv_backend = backend.name().to_owned();
+    // The membership that may see these bodies is rechecked *here*, after
+    // the rows are in hand and immediately before any body is served: an
+    // ACL that changed while a publication was in flight takes effect on
+    // this read, not the next one.
+    let a = readable(pool, auth, id).await?;
+    require_accepted(&a)?;
 
     // One query for every receipt on the page. A page of 200 messages used
     // to be 200 extra round trips, which is a read that gets slower exactly
@@ -1397,8 +1588,45 @@ pub async fn read(
     }
 
     let mut messages = Vec::with_capacity(rows.len());
-    for (mid, seq, from, from_session, body, reply_to, metadata, created_at) in rows {
+    for (
+        mid,
+        seq,
+        from,
+        from_session,
+        body,
+        reply_to,
+        metadata,
+        created_at,
+        state,
+        locator,
+        tombstoned,
+        tombstone_reason,
+    ) in rows
+    {
         let my_receipt = mine.remove(&mid);
+        let publication = state.clone();
+        let resolved = resolve_body(
+            pool,
+            &backend,
+            &conv_backend,
+            mid,
+            BodyRow {
+                body,
+                state,
+                locator,
+                tombstoned: tombstoned.is_some(),
+                tombstone_reason,
+            },
+        )
+        .await?;
+        let (body, publication, unavailable) = match resolved {
+            BodyState::Present(body) => (body, publication, None),
+            // One body the backend cannot serve does not fail the page. The
+            // message keeps its sequence and says what happened to it.
+            BodyState::Missing { publication, why } => {
+                (String::new(), publication.to_owned(), Some(why.to_string()))
+            }
+        };
         messages.push(ConversationMessage {
             message_id: mid.to_string(),
             seq,
@@ -1409,9 +1637,25 @@ pub async fn read(
             metadata,
             created_at: ts(created_at),
             my_receipt,
+            publication,
+            unavailable,
         });
     }
-    let next = messages.last().map(|m| m.seq).filter(|s| *s < a.last_seq);
+    // The cursor stops at the first message still awaiting publication. A
+    // caller following it must not step over a sequence that is about to
+    // fill and never come back for it.
+    let first_pending = messages
+        .iter()
+        .find(|m| m.publication == "pending_publication")
+        .map(|m| m.seq);
+    let next = messages
+        .last()
+        .map(|m| m.seq)
+        .map(|last| match first_pending {
+            Some(pending) => last.min(pending - 1),
+            None => last,
+        })
+        .filter(|s| *s < a.last_seq && *s > 0);
     Ok(ConversationRead {
         conversation_id: id.to_string(),
         next_after_seq: next,
@@ -1519,6 +1763,7 @@ async fn receipt_of(
 /// One message, by id.
 pub async fn get_message(
     pool: &PgPool,
+    backends: &crate::store::routing::Backends,
     auth: &AuthCtx,
     message_id: Uuid,
 ) -> BusResult<ConversationMessage> {
@@ -1534,9 +1779,13 @@ pub async fn get_message(
         serde_json::Value,
         chrono::DateTime<chrono::Utc>,
         String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT m.conversation_id, m.seq, ag.name, m.sender_session, m.body, m.reply_to,
-                    m.metadata, m.created_at, m.publication_state
+                    m.metadata, m.created_at, m.publication_state, m.canonical_locator,
+                    m.tombstoned_at, m.tombstone_reason
                FROM conversation_messages m
                JOIN agents ag ON ag.id = m.sender_agent
               WHERE m.id = $1 AND m.deleted_at IS NULL",
@@ -1553,7 +1802,10 @@ pub async fn get_message(
         reply_to,
         metadata,
         created_at,
-        publication_state,
+        state,
+        locator,
+        tombstoned,
+        tombstone_reason,
     )) = row
     else {
         return Err(BusError::not_found("no such message"));
@@ -1562,12 +1814,6 @@ pub async fn get_message(
     // message was sent does not keep reading it.
     let a = readable(pool, auth, conversation_id).await?;
     require_accepted(&a)?;
-    if publication_state == "pending_publication" {
-        return Err(BusError::conflict(
-            "this message has been accepted but its backend has not confirmed it yet. It \
-             is not lost; read it again in a moment.",
-        ));
-    }
     if let Some(m) = &a.membership
         && let Some(floor) = m.history_from_seq
         && seq <= floor
@@ -1580,6 +1826,30 @@ pub async fn get_message(
         Some(m) => receipt_of(pool, message_id, m.id).await?,
         None => None,
     };
+    // The body is fetched only after that recheck passed, and from the
+    // backend this thread actually uses.
+    let backend = backends.for_conversation(pool, conversation_id).await?;
+    let publication = state.clone();
+    let (body, publication, unavailable) = match resolve_body(
+        pool,
+        &backend,
+        backend.name(),
+        message_id,
+        BodyRow {
+            body,
+            state,
+            locator,
+            tombstoned: tombstoned.is_some(),
+            tombstone_reason,
+        },
+    )
+    .await?
+    {
+        BodyState::Present(body) => (body, publication, None),
+        BodyState::Missing { publication, why } => {
+            (String::new(), publication.to_owned(), Some(why.to_string()))
+        }
+    };
     Ok(ConversationMessage {
         message_id: message_id.to_string(),
         seq,
@@ -1590,6 +1860,8 @@ pub async fn get_message(
         metadata,
         created_at: ts(created_at),
         my_receipt,
+        publication,
+        unavailable,
     })
 }
 
@@ -1928,6 +2200,7 @@ async fn supersede_predecessor(
 /// no posting, no receipts, no new membership. Every use is audited.
 pub async fn recover_history(
     pool: &PgPool,
+    backends: &crate::store::routing::Backends,
     auth: &AuthCtx,
     id: Uuid,
     after_seq: Option<i64>,
@@ -2035,29 +2308,65 @@ pub async fn recover_history(
     let next_after_seq = (rows.len() as i64 == limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE))
         .then(|| rows.last().map(|r| r.1))
         .flatten();
+    // Bodies are resolved after the commit, never inside it: the backend
+    // may be a broker, and a network round trip does not belong in a
+    // transaction that holds session rows.
+    let backend = backends.for_conversation(pool, id).await?;
+    let mut messages = Vec::with_capacity(rows.len());
+    for (mid, seq, from, from_session, body, reply_to, metadata, created_at) in rows {
+        let state: (
+            String,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT publication_state, canonical_locator, tombstoned_at, tombstone_reason
+                   FROM conversation_messages WHERE id = $1",
+        )
+        .bind(mid)
+        .fetch_one(pool)
+        .await?;
+        let publication = state.0.clone();
+        let (body, publication, unavailable) = match resolve_body(
+            pool,
+            &backend,
+            backend.name(),
+            mid,
+            BodyRow {
+                body,
+                state: state.0,
+                locator: state.1,
+                tombstoned: state.2.is_some(),
+                tombstone_reason: state.3,
+            },
+        )
+        .await?
+        {
+            BodyState::Present(body) => (body, publication, None),
+            BodyState::Missing { publication, why } => {
+                (String::new(), publication.to_owned(), Some(why.to_string()))
+            }
+        };
+        messages.push(ConversationMessage {
+            message_id: mid.to_string(),
+            seq,
+            from_address: address_of(&from, &from_session),
+            from,
+            body,
+            reply_to: reply_to.map(|r| r.to_string()),
+            metadata,
+            created_at: ts(created_at),
+            // Recovery observes nothing: it is a read, and inventing a
+            // receipt is the one thing it must not do.
+            my_receipt: None,
+            publication,
+            unavailable,
+        });
+    }
     Ok(ConversationRead {
         conversation_id: id.to_string(),
         next_after_seq,
         history_from_seq: None,
-        messages: rows
-            .into_iter()
-            .map(
-                |(mid, seq, from, from_session, body, reply_to, metadata, created_at)| {
-                    ConversationMessage {
-                        message_id: mid.to_string(),
-                        seq,
-                        from_address: address_of(&from, &from_session),
-                        from,
-                        body,
-                        reply_to: reply_to.map(|r| r.to_string()),
-                        metadata,
-                        created_at: ts(created_at),
-                        // Recovery observes nothing: it is a read, and
-                        // inventing a receipt is the one thing it must not do.
-                        my_receipt: None,
-                    }
-                },
-            )
-            .collect(),
+        messages,
     })
 }

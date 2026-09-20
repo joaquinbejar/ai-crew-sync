@@ -382,7 +382,15 @@ impl Bus {
         let auth = auth_of(&ctx)?;
         let id = uuid_arg("conversation_id", &args.conversation_id)?;
         Ok(Json(
-            store::read(&self.db, &auth, id, args.after_seq, args.limit).await?,
+            store::read(
+                &self.db,
+                &self.backends,
+                &auth,
+                id,
+                args.after_seq,
+                args.limit,
+            )
+            .await?,
         ))
     }
 
@@ -397,7 +405,9 @@ impl Bus {
     ) -> Result<Json<crate::model::ConversationMessage>, ErrorData> {
         let auth = auth_of(&ctx)?;
         let message_id = uuid_arg("message_id", &args.message_id)?;
-        Ok(Json(store::get_message(&self.db, &auth, message_id).await?))
+        Ok(Json(
+            store::get_message(&self.db, &self.backends, &auth, message_id).await?,
+        ))
     }
 
     #[tool(
@@ -544,7 +554,15 @@ impl Bus {
         let auth = auth_of(&ctx)?;
         let id = uuid_arg("conversation_id", &args.conversation_id)?;
         Ok(Json(
-            store::recover_history(&self.db, &auth, id, args.after_seq, args.limit).await?,
+            store::recover_history(
+                &self.db,
+                &self.backends,
+                &auth,
+                id,
+                args.after_seq,
+                args.limit,
+            )
+            .await?,
         ))
     }
 }

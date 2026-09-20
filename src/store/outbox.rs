@@ -138,6 +138,52 @@ pub async fn lease(pool: &PgPool, worker: &str) -> BusResult<Option<Lease>> {
     ))
 }
 
+/// Take one specific slot, for reconciliation. The ordinary `lease` picks
+/// what is due; this one is told which.
+async fn lease_one(pool: &PgPool, worker: &str, message_id: Uuid) -> BusResult<Option<Lease>> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(Uuid, Uuid, Uuid, String, String, Uuid, i64, i32)> = sqlx::query_as(
+        "UPDATE conversation_outbox o
+            SET state = 'leased',
+                leased_by = $1,
+                lease_expires_at = now() + make_interval(secs => $3),
+                generation = o.generation + 1,
+                updated_at = now()
+          WHERE o.message_id = $2
+            AND (o.lease_expires_at IS NULL OR o.lease_expires_at < now())
+          RETURNING o.message_id, o.conversation_id, o.team_id, o.backend, o.payload,
+                    o.publish_key, o.generation, o.attempts",
+    )
+    .bind(worker)
+    .bind(message_id)
+    .bind(LEASE_SECS as f64)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(
+            message_id,
+            conversation_id,
+            team_id,
+            backend,
+            payload,
+            publish_key,
+            generation,
+            attempts,
+        )| {
+            Lease {
+                message_id,
+                conversation_id,
+                team_id,
+                backend,
+                payload,
+                publish_key,
+                generation,
+                attempts,
+            }
+        },
+    ))
+}
+
 /// What settling a lease did. Reported so a worker (and a test) can see
 /// whether it was still the holder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,6 +342,29 @@ pub async fn reconcile<B: MessagingBackend>(
     }
 }
 
+/// Publish one leased slot and record what happened.
+///
+/// Nothing is held while this runs: a publish that takes a minute costs a
+/// lease, not a lock.
+pub async fn publish_leased<B: MessagingBackend>(
+    pool: &PgPool,
+    backend: &B,
+    lease: &Lease,
+) -> BusResult<Settled> {
+    let outcome = backend.publish(envelope_of(lease)).await;
+    settle(pool, lease, outcome).await
+}
+
+fn envelope_of(lease: &Lease) -> Envelope {
+    Envelope {
+        message_id: lease.message_id,
+        conversation_id: lease.conversation_id,
+        team_id: lease.team_id,
+        body: lease.payload.clone(),
+        publish_key: lease.publish_key,
+    }
+}
+
 /// One worker pass: lease, publish outside any transaction, settle.
 pub async fn run_once<B: MessagingBackend>(
     pool: &PgPool,
@@ -319,20 +388,7 @@ pub async fn run_once<B: MessagingBackend>(
         release(pool, &lease, "leased by a worker for another backend").await?;
         return Ok(Some(Settled::Fenced));
     }
-    // Nothing is held here. A publish that takes a minute costs a lease,
-    // not a lock.
-    let outcome = backend.publish(envelope_of(&lease)).await;
-    Ok(Some(settle(pool, &lease, outcome).await?))
-}
-
-fn envelope_of(lease: &Lease) -> Envelope {
-    Envelope {
-        message_id: lease.message_id,
-        conversation_id: lease.conversation_id,
-        team_id: lease.team_id,
-        body: lease.payload.clone(),
-        publish_key: lease.publish_key,
-    }
+    Ok(Some(publish_leased(pool, backend, &lease).await?))
 }
 
 /// Put a leased slot back without counting it as an attempt.
@@ -422,5 +478,152 @@ pub async fn set_publication(pool: &PgPool, conversation_id: Uuid, outbox: bool)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+// ---------------------------------------------- publication, and honesty --
+
+/// Settle a lease whose publish ended without an answer.
+///
+/// This is the state a two-system write introduces and a one-system write
+/// never has: the message is neither stored nor failed, and claiming either
+/// would be a guess. The row is marked uncertain, the slot stays, and
+/// [`resolve_uncertain`] asks the backend what actually happened.
+pub async fn mark_uncertain(pool: &PgPool, lease: &Lease, why: &str) -> BusResult<Settled> {
+    let mut tx = pool.begin().await?;
+    let held: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE conversation_outbox
+            SET state = 'pending', leased_by = NULL, lease_expires_at = NULL,
+                next_attempt_at = now() + interval '5 seconds',
+                last_error = $3, updated_at = now()
+          WHERE message_id = $1 AND generation = $2
+          RETURNING message_id",
+    )
+    .bind(lease.message_id)
+    .bind(lease.generation)
+    .bind(why)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if held.is_none() {
+        return Ok(Settled::Fenced);
+    }
+    sqlx::query(
+        "UPDATE conversation_messages SET uncertain_at = COALESCE(uncertain_at, now())
+          WHERE id = $1",
+    )
+    .bind(lease.message_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Settled::Retrying {
+        attempts: lease.attempts,
+    })
+}
+
+/// Ask the backend what it holds for every uncertain slot of a team and
+/// settle each one. Run on reconnect and on a timer; it is the only thing
+/// that turns "we do not know" into a fact.
+pub async fn resolve_uncertain<B: MessagingBackend>(
+    pool: &PgPool,
+    backend: &B,
+    team_id: Uuid,
+) -> BusResult<usize> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT o.message_id, o.backend
+           FROM conversation_outbox o
+           JOIN conversation_messages m ON m.id = o.message_id
+          WHERE o.team_id = $1 AND m.uncertain_at IS NOT NULL",
+    )
+    .bind(team_id)
+    .fetch_all(pool)
+    .await?;
+    let mut resolved = 0;
+    for (message_id, slot_backend) in rows {
+        // Same rule as the drain: only the backend this slot was enqueued
+        // for may answer for it.
+        if slot_backend != backend.name() {
+            continue;
+        }
+        // Take the slot properly. Settling is fenced on holding an
+        // unexpired lease, and an uncertain slot was released when its
+        // outcome became unknown; reconciling without leasing it would
+        // write nothing and then report success.
+        let Some(lease) = lease_one(pool, "reconciler", message_id).await? else {
+            continue;
+        };
+        if let Some(locator) = backend.reconcile(&envelope_of(&lease)).await?
+            && settle(
+                pool,
+                &lease,
+                crate::store::backend::Published::Confirmed(locator),
+            )
+            .await?
+                == Settled::Stored
+        {
+            resolved += 1;
+        }
+        // Nothing found: the write did not land, so the slot stays pending
+        // and the normal retry path takes it. Still uncertain until then,
+        // and still reported as such.
+    }
+    sqlx::query(
+        "UPDATE conversation_messages m SET uncertain_at = NULL
+           FROM conversations c
+          WHERE c.id = m.conversation_id AND c.team_id = $1
+            AND m.uncertain_at IS NOT NULL AND m.publication_state = 'stored'",
+    )
+    .bind(team_id)
+    .execute(pool)
+    .await?;
+    Ok(resolved)
+}
+
+/// Drop the temporary body once its backend holds it. Until this runs, the
+/// body lives in both places on purpose: losing it to a failed publish would
+/// be worse than storing it twice for a moment.
+///
+/// Only touches messages whose backend is not Postgres — there, the row *is*
+/// the storage, and clearing it would delete the history.
+/// `conversation` narrows it to one thread; `None` sweeps everything the
+/// installation holds. `min_age_secs` is the grace period: a reader that
+/// arrives right after the PubAck still gets the local copy rather than a
+/// round trip to the broker.
+pub async fn release_published_bodies(
+    pool: &PgPool,
+    conversation: Option<Uuid>,
+    min_age_secs: i64,
+) -> BusResult<u64> {
+    let done = sqlx::query(
+        "UPDATE conversation_messages m
+            SET body = ''
+           FROM conversations c
+          WHERE ($1::uuid IS NULL OR m.conversation_id = $1)
+            AND c.id = m.conversation_id
+            AND c.backend <> 'postgres'
+            AND m.publication_state = 'stored'
+            AND m.canonical_locator IS NOT NULL
+            AND m.body <> ''
+            AND m.created_at <= now() - make_interval(secs => $2)",
+    )
+    .bind(conversation)
+    .bind(min_age_secs as f64)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// Record that a body is no longer retrievable from its backend. The
+/// message, its sequence, its recipients and its receipts all stay: a gap
+/// that is explained is not the same as a gap.
+pub async fn tombstone(pool: &PgPool, message_id: Uuid, reason: &str) -> BusResult<()> {
+    sqlx::query(
+        "UPDATE conversation_messages
+            SET tombstoned_at = COALESCE(tombstoned_at, now()), tombstone_reason = $2
+          WHERE id = $1",
+    )
+    .bind(message_id)
+    .bind(reason)
+    .execute(pool)
+    .await?;
     Ok(())
 }

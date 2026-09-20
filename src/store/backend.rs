@@ -75,9 +75,16 @@ pub trait MessagingBackend: Send + Sync {
     fn publish(&self, envelope: Envelope) -> impl std::future::Future<Output = Published> + Send;
 
     /// Read a body back by locator, for history.
+    ///
+    /// `message_id` is what the caller believes that locator names, and the
+    /// implementation must check it. A locator is opaque and proves
+    /// nothing: without this, one copied or guessed from another
+    /// conversation of the same team resolves to whatever body happens to
+    /// sit at that position.
     fn fetch(
         &self,
         locator: &Locator,
+        message_id: Uuid,
     ) -> impl std::future::Future<Output = BusResult<Option<String>>> + Send;
 
     /// Drop a body the retention policy no longer keeps. Returns how many
@@ -225,11 +232,16 @@ impl MessagingBackend for PostgresBackend {
         }
     }
 
-    async fn fetch(&self, locator: &Locator) -> BusResult<Option<String>> {
+    async fn fetch(&self, locator: &Locator, message_id: Uuid) -> BusResult<Option<String>> {
         let id: Uuid = locator
             .0
             .parse()
             .map_err(|_| BusError::invalid("not a locator this backend issued"))?;
+        if id != message_id {
+            return Err(BusError::Forbidden(
+                "that locator names another message".to_owned(),
+            ));
+        }
         // Scoped to this handle's team when it has one. A locator is opaque
         // and proves nothing about who may read it.
         let row: Option<(String,)> = sqlx::query_as(

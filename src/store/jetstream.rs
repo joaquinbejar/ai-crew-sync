@@ -286,7 +286,7 @@ impl MessagingBackend for JetStreamBackend {
         }
     }
 
-    async fn fetch(&self, locator: &Locator) -> BusResult<Option<String>> {
+    async fn fetch(&self, locator: &Locator, message_id: Uuid) -> BusResult<Option<String>> {
         let sequence = self.parse_own_locator(&locator.0)?;
         let stream = self
             .context
@@ -306,6 +306,20 @@ impl MessagingBackend for JetStreamBackend {
                 if !ours {
                     return Err(BusError::Forbidden(
                         "that locator belongs to another team".to_owned(),
+                    ));
+                }
+                // And the message the caller asked for. A sequence in the
+                // right stream is not proof that it is the right body: a
+                // locator from another conversation of the same team would
+                // otherwise return whatever sits at that position.
+                let expected = message
+                    .headers
+                    .get("Acs-Message-Id")
+                    .map(|v| v.as_str() == message_id.to_string())
+                    .unwrap_or(false);
+                if !expected {
+                    return Err(BusError::Forbidden(
+                        "that locator names another message".to_owned(),
                     ));
                 }
                 Ok(Some(String::from_utf8_lossy(&message.payload).into_owned()))
