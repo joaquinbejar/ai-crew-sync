@@ -338,6 +338,49 @@ use *bien*, añade las convenciones del equipo al fichero de instrucciones del
 repo (`CLAUDE.md`, `AGENTS.md` o equivalente) — hay un snippet listo en
 `examples/CLAUDE.md-snippet.md`.
 
+### Perfiles locales y valores por proyecto (sin exportar `BUS_TOKEN`)
+
+El cliente de consola (y todo lo que se apoya en él) puede encontrar sus
+credenciales sin exportar nada en cada shell ni usar una función envoltorio.
+Lo hacen dos ficheros locales:
+
+- **Perfiles** — `~/.config/ai-crew-sync/profiles.toml`: qué bus, equipo y
+  agente esperados, y *qué fichero de tokens* guarda la credencial (los mismos
+  `tokens-<equipo>` que escribe `admin token issue --save`). El perfil no
+  contiene ningún secreto.
+- **Valores del proyecto** — `.acs.toml` en la raíz del proyecto, commiteado
+  con el código: nombra un perfil aprobado y el proyecto lógico. Nada más.
+
+```bash
+ai-crew-sync context profile add --name acme --url https://bus.tu-empresa.com:8443 \
+    --team acme --agent joaquin --tokens tokens-acme --default
+cd ~/Repos/acme/market-data
+ai-crew-sync context set-project --profile acme --project market-data --channel market-data
+ai-crew-sync context show      # endpoint, perfil, entrada del token (solo prefijo), proyecto
+ai-crew-sync context verify    # pregunta al bus: debe ser joaquin@acme, o falla
+ai-crew-sync client whoami     # sin BUS_TOKEN
+```
+
+La entrada del token se elige en este orden: `key` de `.acs.toml`, el nombre
+del proyecto, el `key` del perfil y por último `_base`. La precedencia entre
+fuentes es fija y `context show` la imprime:
+
+| Orden | Fuente | Notas |
+|---|---|---|
+| 1 | `--token` / `BUS_TOKEN` (+ `--url` / `BUS_URL`) | Las credenciales explícitas siempre ganan; `.acs.toml` sigue aportando proyecto y canal. Junto con `--profile` es un error, no una elección silenciosa. |
+| 2 | `--profile` / `BUS_PROFILE` | Elección por invocación; nunca reescribe los valores del proyecto. |
+| 3 | `.acs.toml` en la raíz del proyecto | Se encuentra desde cualquier subdirectorio; un worktree enlazado hereda el fichero del worktree principal. |
+| 4 | `default = "…"` en `profiles.toml` | Valor por defecto del usuario. |
+
+Un perfil que no existe localmente es un **error**, lo nombre quien lo nombre:
+un repositorio puede sugerir un perfil, nunca definirlo, y `.acs.toml` se
+rechaza de plano si trae `url`, `token` o una ruta de tokens. Endpoints y
+referencias a credenciales salen solo de tu propio almacén de perfiles, así que
+un repositorio clonado no puede enviar tu token a ningún sitio. Dos ventanas en
+el mismo repositorio eligen perfil de forma independiente (`--profile`) sin
+compartir nada mutable. Las escrituras al almacén de perfiles se serializan
+con un lock y aterrizan de forma atómica con permisos `0600`.
+
 ### Sesiones: una persona, varios repos
 
 Un token identifica a una **persona**, y una persona suele tener varias
@@ -758,7 +801,7 @@ después `cargo run -- serve` (migra al arrancar) y
 
 ### Política de toolchain
 
-El MSRV del crate es el `rust-version` de `Cargo.toml` (**1.97.1**). CI lo
+El MSRV del crate es el `rust-version` de `Cargo.toml` (**1.98.1**). CI lo
 comprueba en cada push: un job con la stable actual (formato, Clippy, tests)
 y otro que compila y testea con el MSRV fijado, así una dependencia que
 exija un compilador más nuevo falla antes de publicar y no en tu

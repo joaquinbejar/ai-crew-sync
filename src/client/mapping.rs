@@ -50,7 +50,22 @@ pub(super) fn attachment_json(
     }))
 }
 
-pub(super) fn to_call(cmd: &ClientCmd) -> anyhow::Result<Option<(&'static str, Value)>> {
+/// The project's defaults, threaded into the calls that can use them. Only
+/// what the resolver proved local and trusted: a repository names a channel,
+/// it never names a credential.
+#[derive(Clone, Debug, Default)]
+pub struct Defaults {
+    pub channel: Option<String>,
+}
+
+pub fn to_call(cmd: &ClientCmd) -> anyhow::Result<Option<(&'static str, Value)>> {
+    to_call_with(cmd, &Defaults::default())
+}
+
+pub fn to_call_with(
+    cmd: &ClientCmd,
+    defaults: &Defaults,
+) -> anyhow::Result<Option<(&'static str, Value)>> {
     let (tool, args): (&str, Value) = match cmd {
         ClientCmd::Whoami => ("whoami", json!({})),
         ClientCmd::Tools => return Ok(None),
@@ -66,6 +81,15 @@ pub(super) fn to_call(cmd: &ClientCmd) -> anyhow::Result<Option<(&'static str, V
                 .iter()
                 .map(|p| attachment_json(p, None))
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            // A message with neither --channel nor --to falls back to the
+            // project's channel, which is what .acs.toml is for. With --to
+            // it stays a direct message, and an explicit --channel wins.
+            let channel = match (channel, to) {
+                (Some(c), _) => Some(c.clone()),
+                (None, Some(_)) => None,
+                (None, None) => defaults.channel.clone(),
+            };
+            let channel = &channel;
             (
                 "post_message",
                 json!({

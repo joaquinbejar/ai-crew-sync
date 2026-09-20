@@ -1,4 +1,4 @@
-use ai_crew_sync::{MIGRATOR, admin, admin_cli, client, serve, webhooks};
+use ai_crew_sync::{MIGRATOR, admin, admin_cli, client, context, serve, webhooks};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
@@ -41,6 +41,10 @@ enum Command {
     /// then administer the bus remotely with it.
     #[command(subcommand)]
     Admin(AdminCmd),
+    /// Local connection context: profiles (which bus, as whom) and project
+    /// defaults (.acs.toml), so clients need no BUS_TOKEN export.
+    #[command(subcommand)]
+    Context(ContextCmd),
     /// Talk to a running bus from the console, as an agent. Everything the MCP
     /// tools can do: send/read messages, claim tasks, notes, presence.
     Client(client::ClientArgs),
@@ -238,6 +242,120 @@ enum AdminCmd {
     Token(AdminTokenCmd),
 }
 
+/// Selection flags shared by the `context` commands: the same inputs the
+/// console client and the proxy resolve with.
+#[derive(Args, Clone)]
+struct ContextSelect {
+    /// Connect with this profile (BUS_PROFILE).
+    #[arg(long, env = "BUS_PROFILE")]
+    profile: Option<String>,
+    /// Directory whose project defaults apply; the current directory by
+    /// default (BUS_PROJECT_DIR).
+    #[arg(long, env = "BUS_PROJECT_DIR")]
+    project_dir: Option<std::path::PathBuf>,
+    /// Explicit token (BUS_TOKEN); wins over every profile.
+    #[arg(long, env = "BUS_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+    /// Explicit endpoint (BUS_URL).
+    #[arg(long, env = "BUS_URL")]
+    url: Option<String>,
+    /// Session label (BUS_SESSION).
+    #[arg(long, env = "BUS_SESSION")]
+    session: Option<String>,
+}
+
+impl ContextSelect {
+    fn inputs(&self) -> anyhow::Result<context::Inputs> {
+        Ok(context::Inputs {
+            config_dir: context::config_dir()?,
+            explicit_url: self.url.clone(),
+            explicit_token: self.token.clone(),
+            explicit_session: self.session.clone(),
+            profile: self.profile.clone(),
+            project_dir: self.project_dir.clone(),
+        })
+    }
+}
+
+#[derive(Subcommand)]
+enum ContextCmd {
+    /// What would be used right here: endpoint, profile, expected identity,
+    /// token entry (prefix only), project. Never prints the secret.
+    Show {
+        #[command(flatten)]
+        select: ContextSelect,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve, then ask the bus who the token really is; fails when it is
+    /// not the agent and team the profile expects.
+    Verify {
+        #[command(flatten)]
+        select: ContextSelect,
+    },
+    /// Write the project's defaults (.acs.toml at the project root): which
+    /// approved profile and logical project every window here uses unless
+    /// it selects otherwise. Never a credential.
+    SetProject {
+        /// Profile name; must exist locally.
+        #[arg(long)]
+        profile: String,
+        /// Logical project name; also the token-file entry. Defaults to the
+        /// directory name.
+        #[arg(long)]
+        project: Option<String>,
+        /// Channel this project's sessions post to by default.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Token-file entry, when it differs from the project name.
+        #[arg(long)]
+        key: Option<String>,
+        /// Project root to write into; the current directory by default.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Manage local profiles (~/.config/ai-crew-sync/profiles.toml).
+    #[command(subcommand)]
+    Profile(ContextProfileCmd),
+}
+
+#[derive(Subcommand)]
+enum ContextProfileCmd {
+    /// Add or replace a profile: endpoint, expected team and agent, and the
+    /// tokens-<team> file holding its credentials.
+    Add {
+        #[arg(long)]
+        name: String,
+        /// Base URL of the bus, e.g. https://bus.example.com:8443
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        team: String,
+        #[arg(long)]
+        agent: String,
+        /// Token file name inside the configuration directory; defaults to
+        /// tokens-<team>.
+        #[arg(long)]
+        tokens: Option<String>,
+        /// Entry to use when the project names none (then `_base`).
+        #[arg(long)]
+        key: Option<String>,
+        /// Also make it the user default.
+        #[arg(long)]
+        default: bool,
+    },
+    List,
+    /// Set (or, with --clear, unset) the user default profile.
+    Default {
+        name: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    Remove {
+        name: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum AdminTeamCmd {
     Add {
@@ -374,6 +492,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Client(args) => return client::run(args).await,
         Command::Admin(cmd) if !admin_needs_database(&cmd) => return run_admin_remote(cmd).await,
+        Command::Context(cmd) => return run_context(cmd).await,
         _ => {}
     }
 
@@ -399,7 +518,9 @@ async fn main() -> anyhow::Result<()> {
 async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
     match command {
         // `main` routes these before opening a pool; they cannot arrive here.
-        Command::McpConfig { .. } | Command::Client(_) => unreachable!("handled in main"),
+        Command::McpConfig { .. } | Command::Client(_) | Command::Context(_) => {
+            unreachable!("handled in main")
+        }
 
         Command::Migrate => {
             MIGRATOR.run(&pool).await?;
@@ -764,6 +885,226 @@ async fn run_admin_remote(cmd: AdminCmd) -> anyhow::Result<()> {
         AdminCmd::Token(AdminTokenCmd::Revoke { team, id }) => {
             api.revoke_token(&team, id).await?;
             println!("token {id} revoked");
+        }
+    }
+    Ok(())
+}
+
+/// The `context` commands: local resolution, no database, no bus except
+/// `verify`.
+async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
+    match cmd {
+        ContextCmd::Show { select, json } => {
+            let resolved = context::resolve(&select.inputs()?)?;
+            let view = resolved.redacted();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&view)?);
+                return Ok(());
+            }
+            let s = |k: &str| view[k].as_str().unwrap_or("-").to_owned();
+            println!("endpoint        {}", s("mcp_url"));
+            println!(
+                "credentials     {} ({})",
+                s("token_prefix"),
+                view["source"].as_str().unwrap_or("?")
+            );
+            println!("profile         {}", s("profile"));
+            match (
+                view["expected_agent"].as_str(),
+                view["expected_team"].as_str(),
+            ) {
+                (Some(a), Some(t)) => println!("expected        {a}@{t}"),
+                _ => println!("expected        (explicit credentials: not checked)"),
+            }
+            if let Some(f) = view["tokens_file"].as_str() {
+                println!("token entry     {} in {f}", s("token_key"));
+            }
+            println!("project         {}", s("project"));
+            println!("channel         {}", s("channel"));
+            println!("project root    {}", s("project_root"));
+            println!("session         {}", s("session"));
+            println!();
+            println!("Run `ai-crew-sync context verify` to confirm the identity with the bus.");
+        }
+        ContextCmd::Verify { select } => {
+            let resolved = context::resolve(&select.inputs()?)?;
+            let v = context::verify(&resolved).await?;
+            println!(
+                "ok: {}@{} at {} ({}{})",
+                v.agent,
+                v.team,
+                resolved.mcp_url,
+                match resolved.source {
+                    context::Source::Explicit => "explicit credentials".to_owned(),
+                    context::Source::ProfileFlag => "profile from --profile".to_owned(),
+                    context::Source::ProjectDefault => "project default".to_owned(),
+                    context::Source::UserDefault => "user default profile".to_owned(),
+                },
+                resolved
+                    .profile
+                    .as_deref()
+                    .map(|p| format!(": '{p}'"))
+                    .unwrap_or_default()
+            );
+        }
+        ContextCmd::SetProject {
+            profile,
+            project,
+            channel,
+            key,
+            dir,
+        } => {
+            let dir = match dir {
+                Some(d) => d,
+                None => std::env::current_dir()?,
+            };
+            let dir = dir
+                .canonicalize()
+                .with_context(|| format!("resolving {}", dir.display()))?;
+            let cfg_dir = context::config_dir()?;
+            let profiles = context::load_profiles(&cfg_dir)?;
+            let profile = context::validate_name("profile name", &profile)?;
+            if !profiles.profiles.contains_key(&profile) {
+                anyhow::bail!(
+                    "profile '{profile}' does not exist locally; add it first with \
+                     `ai-crew-sync context profile add --name {profile} …`. A project may \
+                     only reference approved profiles"
+                );
+            }
+            let project = match project {
+                Some(p) => Some(context::validate_name("project name", &p)?),
+                None => dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| context::validate_name("project name", n))
+                    .transpose()?,
+            };
+            let cfg = context::ProjectConfig {
+                profile: Some(profile),
+                project,
+                channel: channel
+                    .map(|c| c.trim().to_lowercase())
+                    .filter(|c| !c.is_empty()),
+                key: key
+                    .map(|k| context::validate_name("token key", &k))
+                    .transpose()?,
+            };
+            let path =
+                context::with_config_lock(&cfg_dir, || context::write_project_file(&dir, &cfg))?;
+            println!(
+                "project defaults written to {} (profile '{}', project '{}'). Commit it: it holds no secret.",
+                path.display(),
+                cfg.profile.as_deref().unwrap_or_default(),
+                cfg.project.as_deref().unwrap_or("-")
+            );
+        }
+        ContextCmd::Profile(cmd) => {
+            let cfg_dir = context::config_dir()?;
+            match cmd {
+                ContextProfileCmd::Add {
+                    name,
+                    url,
+                    team,
+                    agent,
+                    tokens,
+                    key,
+                    default,
+                } => {
+                    let name = context::validate_name("profile name", &name)?;
+                    let url = admin_cli::normalize_base_url(&url)?;
+                    let team = context::validate_name("team", &team)?;
+                    let agent = context::validate_name("agent", &agent)?;
+                    // Validated before it is written, not only when it is
+                    // read back: a stored profile that `load_profiles` will
+                    // reject is a trap for the next command.
+                    let tokens = context::validate_tokens_ref(
+                        &tokens.unwrap_or_else(|| format!("tokens-{team}")),
+                    )?;
+                    let key = key
+                        .map(|k| context::validate_name("token key", &k))
+                        .transpose()?;
+                    let path = context::update_profiles(&cfg_dir, |p| {
+                        p.profiles.insert(
+                            name.clone(),
+                            context::Profile {
+                                url: url.clone(),
+                                team: team.clone(),
+                                agent: agent.clone(),
+                                tokens: tokens.clone(),
+                                key: key.clone(),
+                            },
+                        );
+                        if default || p.default.is_none() {
+                            p.default = Some(name.clone());
+                        }
+                        Ok(())
+                    })?;
+                    println!(
+                        "profile '{name}' saved in {} (expects {agent}@{team} at {url}, tokens in {tokens})",
+                        path.display()
+                    );
+                    let tokens_path = cfg_dir.join(&tokens);
+                    if !tokens_path.exists() {
+                        println!(
+                            "note: {} does not exist yet; issue a token with `ai-crew-sync admin token issue --team {team} --agent {agent} --save --repo <name>`",
+                            tokens_path.display()
+                        );
+                    }
+                }
+                ContextProfileCmd::List => {
+                    let p = context::load_profiles(&cfg_dir)?;
+                    if p.profiles.is_empty() {
+                        println!("(no profiles — add one with `ai-crew-sync context profile add`)");
+                    }
+                    for (name, prof) in &p.profiles {
+                        let mark = if p.default.as_deref() == Some(name) {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        println!(
+                            "{mark} {name:<20} {}@{:<20} {}  tokens {}{}",
+                            prof.agent,
+                            prof.team,
+                            prof.url,
+                            prof.tokens,
+                            prof.key
+                                .as_deref()
+                                .map(|k| format!(" (key {k})"))
+                                .unwrap_or_default()
+                        );
+                    }
+                }
+                ContextProfileCmd::Default { name, clear } => {
+                    let path = context::update_profiles(&cfg_dir, |p| {
+                        if clear {
+                            p.default = None;
+                            return Ok(());
+                        }
+                        let Some(name) = name.clone() else {
+                            anyhow::bail!("give a profile name, or --clear");
+                        };
+                        if !p.profiles.contains_key(&name) {
+                            anyhow::bail!("no profile named '{name}'");
+                        }
+                        p.default = Some(name);
+                        Ok(())
+                    })?;
+                    println!("default updated in {}", path.display());
+                }
+                ContextProfileCmd::Remove { name } => {
+                    context::update_profiles(&cfg_dir, |p| {
+                        if p.profiles.remove(&name).is_none() {
+                            anyhow::bail!("no profile named '{name}'");
+                        }
+                        if p.default.as_deref() == Some(name.as_str()) {
+                            p.default = None;
+                        }
+                        Ok(())
+                    })?;
+                    println!("profile '{name}' removed (its token file is untouched)");
+                }
+            }
         }
     }
     Ok(())

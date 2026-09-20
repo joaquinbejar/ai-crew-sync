@@ -53,7 +53,7 @@ jobs:
   # needing a newer compiler fails HERE rather than in a user's `cargo install`.
   # Raising this pin is a deliberate change — see the MSRV policy in the README.
   msrv:
-    name: MSRV 1.97.1 (build, tests)
+    name: MSRV 1.98.1 (build, tests)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -71,15 +71,15 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@1.98.1
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
       - name: Assert the pin matches Cargo.toml
         run: |
           declared=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
-          if [ "$declared" != "1.97.1" ]; then
-            echo "Cargo.toml declares rust-version = $declared but this job pins 1.97.1."
+          if [ "$declared" != "1.98.1" ]; then
+            echo "Cargo.toml declares rust-version = $declared but this job pins 1.98.1."
             echo "Update the toolchain here and the MSRV policy in the READMEs."
             exit 1
           fi

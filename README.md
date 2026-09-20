@@ -332,6 +332,48 @@ use them *well*, add the team conventions to the repo's agent instructions
 file (`CLAUDE.md`, `AGENTS.md` or equivalent) — there is a ready-made snippet
 in `examples/CLAUDE.md-snippet.md`.
 
+### Local profiles and project defaults (no `BUS_TOKEN` export)
+
+The console client (and everything built on it) can find its credentials
+without a per-shell export or a wrapper function. Two local files do it:
+
+- **Profiles** — `~/.config/ai-crew-sync/profiles.toml`: which bus, expected
+  team and agent, and *which token file* holds the credential (the same
+  `tokens-<team>` files `admin token issue --save` writes). No secret lives
+  in the profile.
+- **Project defaults** — `.acs.toml` at the project root, committed with the
+  code: names an approved profile and the logical project. Nothing else.
+
+```bash
+ai-crew-sync context profile add --name acme --url https://bus.your-company.com:8443 \
+    --team acme --agent joaquin --tokens tokens-acme --default
+cd ~/Repos/acme/market-data
+ai-crew-sync context set-project --profile acme --project market-data --channel market-data
+ai-crew-sync context show      # endpoint, profile, token entry (prefix only), project
+ai-crew-sync context verify    # asks the bus: must be joaquin@acme, or it fails
+ai-crew-sync client whoami     # no BUS_TOKEN needed
+```
+
+The token entry is chosen in this order: `key` from `.acs.toml`, the project
+name, the profile's `key`, then `_base`. Precedence between sources is fixed
+and printed by `context show`:
+
+| Order | Source | Notes |
+|---|---|---|
+| 1 | `--token` / `BUS_TOKEN` (+ `--url` / `BUS_URL`) | Explicit credentials always win; `.acs.toml` still supplies project and channel. Given together with `--profile`, it is an error rather than a silent choice. |
+| 2 | `--profile` / `BUS_PROFILE` | Per-invocation choice; never rewrites project defaults. |
+| 3 | `.acs.toml` at the project root | Found from any nested directory; a linked git worktree inherits the main worktree's file. |
+| 4 | `default = "…"` in `profiles.toml` | User default. |
+
+A profile that does not exist locally is an **error**, whatever named it: a
+repository can suggest a profile, never define one, and `.acs.toml` is refused
+outright if it carries `url`, `token` or a tokens path. Endpoints and
+credential references come from your own profile store only, so a cloned
+repository cannot send your token anywhere. Two windows in the same repository
+select profiles independently (`--profile`), sharing nothing mutable. Writes to
+the profile store are serialised through a lock and land atomically with mode
+`0600`.
+
 ### Sessions: one person, several repositories
 
 A token identifies a **person**, and a person usually runs several coding
@@ -746,7 +788,7 @@ then `cargo run -- serve` (migrates on startup) and
 
 ### Toolchain policy
 
-The crate's MSRV is the `rust-version` in `Cargo.toml` (**1.97.1**). CI proves
+The crate's MSRV is the `rust-version` in `Cargo.toml` (**1.98.1**). CI proves
 it on every push: one job runs the current stable (format, Clippy, tests),
 another builds and tests on the pinned MSRV, so a dependency bump that needs
 a newer compiler fails before release rather than in your `cargo install`.
