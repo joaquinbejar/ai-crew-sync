@@ -48,3 +48,25 @@ ALTER TABLE teams
 
 COMMENT ON COLUMN teams.default_backend IS
     'Backend new conversations of this team are created on. Existing ones keep theirs.';
+
+-- Routing a team is its own administrative action, and the audit trail has
+-- to be able to say so. 0014 added 'team.capability'; this adds the one
+-- `team capability --backend` writes.
+ALTER TABLE admin_audit
+    DROP CONSTRAINT admin_audit_action_check,
+    ADD CONSTRAINT admin_audit_action_check CHECK (action IN (
+        'team.create', 'team.capability', 'team.backend', 'agent.create',
+        'agent.enable', 'agent.disable', 'token.issue', 'token.revoke',
+        'admin.grant', 'admin.revoke'));
+
+-- The body's digest, kept when the body itself is not.
+--
+-- A retry is recognised by comparing the incoming body with the stored one
+-- under the same request_id. Once publication releases the staging copy
+-- there is no stored body to compare with, and a legitimate retry would be
+-- refused as "a different message". The digest survives the release and
+-- answers the same question.
+ALTER TABLE conversation_messages ADD COLUMN body_sha256 TEXT;
+
+COMMENT ON COLUMN conversation_messages.body_sha256 IS
+    'SHA-256 of the body as sent. Outlives the staging copy, so a retry is still recognised.';

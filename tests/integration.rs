@@ -7505,7 +7505,11 @@ async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
     };
     assert!(locator.0.starts_with("jetstream:"), "{locator:?}");
     assert_eq!(
-        backend.fetch(&locator).await.unwrap().as_deref(),
+        backend
+            .fetch(&locator, message_id)
+            .await
+            .unwrap()
+            .as_deref(),
         Some("the empty state needs a spinner")
     );
 
@@ -7514,7 +7518,7 @@ async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
     // stream that is not theirs, that stream would not hold the sequence
     // anyway, and the envelope's team is checked rather than trusted if it
     // ever got that far.
-    match theirs.fetch(&locator).await {
+    match theirs.fetch(&locator, message_id).await {
         Ok(None) => {}
         Err(e) => {
             let why = e.to_string();
@@ -7553,7 +7557,11 @@ async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
     };
     let landed = backend.reconcile(&unseen).await.unwrap().unwrap();
     assert_eq!(
-        backend.fetch(&landed).await.unwrap().as_deref(),
+        backend
+            .fetch(&landed, unseen.message_id)
+            .await
+            .unwrap()
+            .as_deref(),
         Some("reconciled into existence"),
         "the locator must name the body, not an empty probe"
     );
@@ -7576,10 +7584,23 @@ async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
         .await;
     assert!(matches!(stranger, Published::Fatal(_)), "{stranger:?}");
 
+    // A locator for a different message of the same team is refused too. A
+    // sequence in the right stream is not proof that it is the right body.
+    let err = backend
+        .fetch(&locator, Uuid::new_v4())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("another message"), "{err}");
+
     // A locator naming another stream is refused before it reaches the
     // broker, rather than read as that sequence of this one.
     let forged = Locator(format!("jetstream:ACS_T_{}:1", Uuid::new_v4().simple()));
-    let err = backend.fetch(&forged).await.unwrap_err().to_string();
+    let err = backend
+        .fetch(&forged, Uuid::new_v4())
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("another stream"), "{err}");
 
     // The 1 MiB body contract still fits once headers and framing are added
@@ -7619,18 +7640,26 @@ async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
     // than guessed at.
     assert!(
         backend
-            .fetch(&Locator(format!("jetstream:{}:999999", backend.stream())))
+            .fetch(
+                &Locator(format!("jetstream:{}:999999", backend.stream())),
+                Uuid::new_v4(),
+            )
             .await
             .unwrap()
             .is_none()
     );
     assert!(
         backend
-            .fetch(&Locator("jetstream:ACS_T_x:1".into()))
+            .fetch(&Locator("jetstream:ACS_T_x:1".into()), Uuid::new_v4())
             .await
             .is_err()
     );
-    assert!(backend.fetch(&Locator("nonsense".into())).await.is_err());
+    assert!(
+        backend
+            .fetch(&Locator("nonsense".into()), Uuid::new_v4())
+            .await
+            .is_err()
+    );
 
     // A broker that is not there fails retryably rather than hanging.
     let unreachable = Config::new("nats://127.0.0.1:1");
@@ -7889,6 +7918,21 @@ async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
         "the body is still local"
     );
     assert!(msgs[1]["seq"].as_i64().unwrap() < msgs[2]["seq"].as_i64().unwrap());
+    // And the cursor stops before it. Following the advertised
+    // next_after_seq must not step over a sequence that is about to fill.
+    let pending_seq = msgs[1]["seq"].as_i64().unwrap();
+    let paged = call(
+        &dani,
+        "read_conversation",
+        json!({"conversation_id": cid, "limit": 2}),
+    )
+    .await;
+    assert!(
+        paged["next_after_seq"]
+            .as_i64()
+            .is_none_or(|n| n < pending_seq),
+        "the cursor advanced past a message still in flight: {paged}"
+    );
 
     // Out-of-order completion: the later message is published first. The
     // thread keeps its own order, which is the sequence, not the order the

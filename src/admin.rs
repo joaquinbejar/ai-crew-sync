@@ -95,6 +95,23 @@ pub async fn team_stream(
                  would drop bodies its threads still point at."
             );
         }
+        // Routing new threads elsewhere says nothing about the ones already
+        // there. A conversation keeps the backend it was created on, so its
+        // bodies are still in this stream and deleting it would turn every
+        // one of them into a tombstone.
+        let (still_there,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM conversations WHERE team_id = $1 AND backend = 'jetstream'",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+        if still_there > 0 {
+            anyhow::bail!(
+                "{still_there} conversation(s) of team '{team}' still keep their bodies in \
+                 this stream. Deleting it now would turn every one of those messages into \
+                 a tombstone, and no rollback brings them back."
+            );
+        }
         crate::store::jetstream::JetStreamBackend::deprovision(&config, id).await?;
         println!("team '{team}': stream removed, with every body it held");
         return Ok(());

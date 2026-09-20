@@ -455,6 +455,13 @@ pub async fn access(pool: &PgPool, auth: &AuthCtx, conversation: Uuid) -> BusRes
 }
 
 /// Resolve and require read access in one step.
+/// What a retry is compared against. The body is staged in this row only
+/// until its backend confirms it; the digest stays.
+fn body_digest(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(body.as_bytes()))
+}
+
 /// Refuse a content read to a seat that has not been accepted.
 fn require_accepted(a: &Access) -> BusResult<()> {
     if a.can_read_messages() {
@@ -1170,17 +1177,27 @@ pub async fn send(
 
     // Idempotency, under that lock: a retry that raced the original sees it
     // rather than allocating a second sequence.
-    let existing: Option<(Uuid, i64, String, chrono::DateTime<chrono::Utc>, String)> =
-        sqlx::query_as(
-            "SELECT id, seq, body, created_at, publication_state FROM conversation_messages
+    #[allow(clippy::type_complexity)]
+    let existing: Option<(
+        Uuid,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, seq, created_at, publication_state, body_sha256
+           FROM conversation_messages
           WHERE conversation_id = $1 AND request_id = $2",
-        )
-        .bind(id)
-        .bind(input.request_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    if let Some((mid, seq, stored_body, created_at, publication_state)) = existing {
-        if stored_body != body {
+    )
+    .bind(id)
+    .bind(input.request_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((mid, seq, created_at, publication_state, digest)) = existing {
+        // The digest, not the body. Once a publication releases the staging
+        // copy there is no body here to compare with, and a legitimate
+        // retry would be refused as a different message.
+        if digest.as_deref() != Some(body_digest(&body).as_str()) {
             return Err(BusError::conflict(
                 "this request_id already sent a different message. Use a fresh UUID for a \
                  new message; reusing one is how a retry is recognised.",
@@ -1228,8 +1245,8 @@ pub async fn send(
     let (message_id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO conversation_messages
             (conversation_id, seq, sender_agent, sender_session, body, reply_to, metadata,
-             request_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+             request_id, body_sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
     )
     .bind(id)
     .bind(seq)
@@ -1239,6 +1256,7 @@ pub async fn send(
     .bind(input.reply_to)
     .bind(&metadata)
     .bind(input.request_id)
+    .bind(body_digest(&body))
     .fetch_one(&mut *tx)
     .await?;
 
@@ -1403,7 +1421,7 @@ async fn resolve_body(
                 });
             };
             match backend
-                .fetch(&crate::store::backend::Locator(locator))
+                .fetch(&crate::store::backend::Locator(locator), message_id)
                 .await?
             {
                 Some(body) => Ok(BodyState::Present(body)),
@@ -1623,7 +1641,21 @@ pub async fn read(
             unavailable,
         });
     }
-    let next = messages.last().map(|m| m.seq).filter(|s| *s < a.last_seq);
+    // The cursor stops at the first message still awaiting publication. A
+    // caller following it must not step over a sequence that is about to
+    // fill and never come back for it.
+    let first_pending = messages
+        .iter()
+        .find(|m| m.publication == "pending_publication")
+        .map(|m| m.seq);
+    let next = messages
+        .last()
+        .map(|m| m.seq)
+        .map(|last| match first_pending {
+            Some(pending) => last.min(pending - 1),
+            None => last,
+        })
+        .filter(|s| *s < a.last_seq && *s > 0);
     Ok(ConversationRead {
         conversation_id: id.to_string(),
         next_after_seq: next,

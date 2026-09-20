@@ -56,10 +56,10 @@ impl MessagingBackend for AnyBackend {
         }
     }
 
-    async fn fetch(&self, locator: &Locator) -> BusResult<Option<String>> {
+    async fn fetch(&self, locator: &Locator, message_id: Uuid) -> BusResult<Option<String>> {
         match self {
-            Self::Postgres(b) => b.fetch(locator).await,
-            Self::JetStream(b) => b.fetch(locator).await,
+            Self::Postgres(b) => b.fetch(locator, message_id).await,
+            Self::JetStream(b) => b.fetch(locator, message_id).await,
         }
     }
 
