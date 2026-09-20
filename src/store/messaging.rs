@@ -413,6 +413,9 @@ pub async fn post_message(
     // Message + attachments commit together, so the NOTIFY that wakes
     // teammates only fires once everything is readable.
     let mut tx = pool.begin().await?;
+    // And a window that was resumed away cannot post as the session that
+    // replaced it: the check shares this transaction.
+    super::sessions::guard(&mut tx, auth).await?;
 
     let (id,): (i64,) = sqlx::query_as(
         r#"

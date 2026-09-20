@@ -360,13 +360,55 @@ out="$(printf '{"session_id":"sess-f"}' \
 [ -z "$out" ] && ok "no BUS_URL/BUS_TOKEN means the hook does nothing" \
     || bad "drain without a configured bus" "$out"
 
+# --- bus-call.sh: which mode it picks, and what it passes on ----------------
+# The real script this time, not the fake: the point is the routing.
+cp "$ROOT/bus-call.sh" "$WORK/bin/real-bus-call.sh"
+mkdir -p "$WORK/fakebin"
+cat > "$WORK/fakebin/ai-crew-sync" <<'FAKE'
+#!/bin/sh
+# Records the environment the hook path would carry and answers like the
+# console client with --json: the tool's structured content.
+{
+    printf 'host=%s ' "${BUS_HOST_SESSION:-}"
+    printf 'session=%s ' "${BUS_SESSION:-}"
+    printf 'args=%s
+' "$*"
+} >> "$CALLS"
+echo '{"agent":"joaquin","team":"acme","session":"s-abc123"}'
+FAKE
+chmod +x "$WORK/fakebin/ai-crew-sync"
+export CALLS="$WORK/calls.txt"
+
+# No token exported and the binary present: profiles path, conversation id
+# passed through, and the JSON-RPC envelope every caller parses.
+: > "$CALLS"
+out="$(env -u BUS_TOKEN -u BUS_URL PATH="$WORK/fakebin:$PATH"     BUS_HOST_SESSION=conv-7 sh "$WORK/bin/real-bus-call.sh" whoami 2>/dev/null)"
+case "$out" in
+    *'"structuredContent"'*'"joaquin"'*) ok "binary path wraps the reply for callers" ;;
+    *) bad "binary path reply" "$out" ;;
+esac
+case "$(cat "$CALLS")" in
+    *"host=conv-7"*"client --json call whoami"*) ok "the conversation id reaches the client" ;;
+    *) bad "conversation id not passed" "$(cat "$CALLS")" ;;
+esac
+
+# An exported BUS_TOKEN keeps the legacy curl path, even with the binary on
+# the PATH: an operator's explicit credential is never silently replaced.
+: > "$CALLS"
+out="$(PATH="$WORK/fakebin:$PATH" BUS_TOKEN=acs_legacy BUS_URL=http://127.0.0.1:1     BUS_TIMEOUT=1 sh "$WORK/bin/real-bus-call.sh" whoami 2>/dev/null || true)"
+[ ! -s "$CALLS" ] && ok "an exported token keeps the legacy curl path"     || bad "legacy path bypassed" "$(cat "$CALLS")"
+
+# Neither a token nor the binary: silent, like every other unconfigured case.
+out="$(env -u BUS_TOKEN -u BUS_URL PATH="$WORK/empty"     sh "$WORK/bin/real-bus-call.sh" whoami 2>/dev/null || true)"
+[ -z "$out" ] && ok "no binary and no token means no call"     || bad "unconfigured bus-call" "$out"
+
 # --- every tool the hooks call exists in the served schema ------------------
 # Cheap coupling check: the tool names the scripts use must appear in the
 # server's tool router. Catches a rename before a user's session breaks.
 SRC="$ROOT/../../src/tools"
 if [ -d "$SRC" ]; then
     missing=""
-    for tool in whoami team_digest heartbeat list_tasks read_messages; do
+    for tool in whoami team_digest heartbeat list_tasks read_messages list_sessions; do
         grep -rq "async fn $tool(" "$SRC" 2>/dev/null || missing="$missing $tool"
     done
     [ -z "$missing" ] && ok "tools the hooks and skill name exist server-side" \

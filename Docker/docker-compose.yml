@@ -1,12 +1,15 @@
-# Works with plain compose and with Docker Swarm:
+# The one compose file. Works with plain compose and with Docker Swarm:
 #
 #   make up        # = docker compose --project-directory . -f Docker/docker-compose.yml up -d
-#   make deploy    # = docker stack deploy -c Docker/docker-compose.yml crew
+#   make up-dev    # same, but builds the bus from this checkout (--build)
+#   make deploy    # = docker stack deploy -c Docker/docker-compose.yml crew, after a preflight
 #
-# Every variable has a default; override from the environment (or ./.env at
-# the repo root under plain compose — Swarm does not read .env, export them
-# or use `env $(cat .env) docker stack deploy ...`). Change POSTGRES_PASSWORD
-# for anything reachable from outside your machine.
+# Every variable has a default so a bare `make up` boots on a laptop; override
+# from the environment (or ./.env at the repo root under plain compose — Swarm
+# does not read .env, export them or use `env $(cat .env) docker stack deploy`).
+# Production safety is NOT enforced here: `make deploy-check` refuses the
+# example password, a moving `latest` tag and a missing dashboard secret
+# before the cluster is contacted.
 #
 # The compose project name comes from COMPOSE_PROJECT_NAME in ./.env (a
 # top-level `name:` here would break `docker stack deploy`, which rejects
@@ -16,6 +19,7 @@ services:
     image: ${POSTGRES_IMAGE:-postgres:18.4-alpine3.24}
     environment:
       POSTGRES_USER: bus
+      # Change it for anything reachable from outside your machine.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
       POSTGRES_DB: bus
     volumes:
@@ -32,17 +36,30 @@ services:
       restart_policy:
         condition: on-failure
         delay: 3s
+      resources:
+        limits:
+          memory: ${POSTGRES_MEMORY_LIMIT:-2g}
 
   bus:
-    # Published multi-arch image. To run from source instead:
-    #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
-    image: ghcr.io/joaquinbejar/ai-crew-sync:${BUS_VERSION:-latest}
-    # For a public deployment put a TLS proxy (Caddy, nginx, Traefik) in front
-    # and set BUS_ALLOWED_HOSTS to your real hostname.
+    # Published multi-arch image by default. `make up-dev` sets BUS_IMAGE and
+    # BUS_VERSION to a local tag and passes --build, so a checkout build never
+    # shadows the published tag. Production pins an immutable BUS_VERSION.
+    image: ${BUS_IMAGE:-ghcr.io/joaquinbejar/ai-crew-sync}:${BUS_VERSION:-latest}
+    build:
+      # Relative to the project directory (the repo root, which the Makefile
+      # pins with --project-directory), NOT to this file's location. Swarm
+      # ignores this block (it only deploys images).
+      context: .
+      dockerfile: Docker/Dockerfile
     environment:
       DATABASE_URL: postgres://bus:${POSTGRES_PASSWORD:-change-me}@db:5432/bus
       BUS_BIND: 0.0.0.0:8787
+      # Anti DNS-rebinding. "*" is fine behind a proxy that validates Host;
+      # set your real hostname when the bus is exposed directly.
       BUS_ALLOWED_HOSTS: ${BUS_ALLOWED_HOSTS:-*}
+      # Empty means "generate at startup": sessions end at restart and are not
+      # shared between replicas. Set the same value everywhere in production.
+      BUS_DASHBOARD_SECRET: ${BUS_DASHBOARD_SECRET:-}
       RUST_LOG: ${RUST_LOG:-ai_crew_sync=info}
     ports:
       - "${BUS_PORT:-8787}:8787"
@@ -52,6 +69,12 @@ services:
     depends_on:
       - db
     restart: on-failure
+    networks:
+      - default
+      # The reverse proxy's network. Only used when a Traefik (or any other
+      # proxy) lives there; harmless otherwise. It must exist before `up`
+      # (the Makefile creates it locally; in Swarm the proxy's stack owns it).
+      - edge
     deploy:
       # Stateless (no sessions, identity per request): scale replicas freely
       # behind the routing mesh. Concurrent startup migrations are safe —
@@ -62,6 +85,29 @@ services:
         delay: 3s
       update_config:
         order: start-first
+      resources:
+        limits:
+          memory: ${BUS_MEMORY_LIMIT:-512m}
+      # Traefik v3 (`--providers.swarm`) discovers the bus by these labels when
+      # TRAEFIK_ENABLE=true. The proxy owns TLS and the certificate; the bus
+      # keeps its plain published port for clients on the private network and
+      # is reached at https://${BUS_PUBLIC_HOST}/mcp from the internet.
+      labels:
+        traefik.enable: "${TRAEFIK_ENABLE:-false}"
+        traefik.http.routers.crew-bus.rule: "Host(`${BUS_PUBLIC_HOST:-localhost}`)"
+        traefik.http.routers.crew-bus.entrypoints: "${TRAEFIK_ENTRYPOINT:-websecure}"
+        traefik.http.routers.crew-bus.tls.certresolver: "${TRAEFIK_CERTRESOLVER:-le}"
+        traefik.http.routers.crew-bus.service: "crew-bus"
+        traefik.http.services.crew-bus.loadbalancer.server.port: "8787"
+        traefik.http.services.crew-bus.loadbalancer.passhostheader: "true"
+        # MCP sessions are long-lived streams: do not let the proxy cut them
+        traefik.http.services.crew-bus.loadbalancer.responseforwarding.flushinterval: "-1"
+
+networks:
+  default:
+  edge:
+    external: true
+    name: ${TRAEFIK_NETWORK:-edge}
 
 volumes:
   bus-data:

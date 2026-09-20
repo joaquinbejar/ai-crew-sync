@@ -14,12 +14,30 @@
 # unreachable, or when the bus is not configured at all.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-[ -n "${BUS_URL:-}" ] && [ -n "${BUS_TOKEN:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
+
+# Configured in one of two ways, and neither is assumed: the authenticated
+# path needs the binary and a binding (resolved below, from the payload), the
+# legacy path needs BUS_URL and BUS_TOKEN. With neither, the hook is silent —
+# a window whose bus is not set up must not block on a question.
+if [ -z "${BUS_TOKEN:-}" ] && ! command -v ai-crew-sync >/dev/null 2>&1; then
+    exit 0
+fi
+[ -n "${BUS_TOKEN:-}" ] && [ -z "${BUS_URL:-}" ] && exit 0
 
 # Claude Code delivers the hook payload on stdin; session_id keys the loop
 # guard so two sessions in different repositories do not share one.
 PAYLOAD="$(cat 2>/dev/null || true)"
+
+# Same conversation id as the proxy and the other hooks of this window: the
+# drain must look at this window's inbox, never a sibling's.
+HOST_SESSION="$(PAYLOAD="$PAYLOAD" python3 -c 'import json,os,sys
+try:
+    v = json.loads(os.environ.get("PAYLOAD") or "{}").get("session_id")
+except Exception:
+    v = None
+sys.stdout.write(str(v) if v else "")' 2>/dev/null || true)"
+[ -n "$HOST_SESSION" ] && export BUS_HOST_SESSION="$HOST_SESSION"
 
 # Scope "all" rather than "inbox": it carries this agent's own sent messages
 # too, which is the only way to tell a question that has already been answered
@@ -35,7 +53,15 @@ WHO="$("$DIR/bus-call.sh" whoami 2>/dev/null || true)"
 
 STATE_DIR="${TMPDIR:-/tmp}"
 export PAYLOAD FEED WHO STATE_DIR
-export BUS_SESSION="${BUS_SESSION:-}"
+# Which session this window is, as the server reports it: with the proxy the
+# label is derived from the conversation id, not exported in BUS_SESSION.
+MY_SESSION="$(WHO="$WHO" python3 -c 'import json,os,sys
+try:
+    sc = json.loads(os.environ.get("WHO") or "{}")["result"]["structuredContent"]
+    sys.stdout.write(str(sc.get("session") or ""))
+except Exception:
+    sys.stdout.write("")' 2>/dev/null || true)"
+export BUS_SESSION="${MY_SESSION:-${BUS_SESSION:-}}"
 
 python3 - <<'PY' 2>/dev/null || true
 import json, os, re

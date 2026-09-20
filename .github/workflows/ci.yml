@@ -93,15 +93,13 @@ jobs:
           # service container never came up.
           AI_CREW_SYNC_REQUIRE_DB: "1"
 
-  # The compose files must render from their defaults alone — a bare `make up`
+  # The compose file must render from its defaults alone — a bare `make up`
   # has to boot on a machine with no .env at all.
   compose:
-    name: compose files render
+    name: compose file renders
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Validate
         run: |
           docker compose --project-directory . -f Docker/docker-compose.yml config -q
-          docker compose --project-directory . -f Docker/docker-compose.yml \
-            -f Docker/docker-compose.dev.yml config -q

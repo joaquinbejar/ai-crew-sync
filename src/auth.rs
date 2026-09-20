@@ -11,6 +11,23 @@ use uuid::Uuid;
 
 pub const TOKEN_PREFIX: &str = "acs_";
 
+/// Prefix of a session credential: a window's proof of which window it is,
+/// derived from an agent token (see `migrations/0013`). Distinct from both
+/// other prefixes, and deliberately not a `acs_` extension — a session
+/// credential presented where an agent token is expected fails on the prefix
+/// before any lookup.
+pub const SESSION_TOKEN_PREFIX: &str = "acss_";
+
+/// Header carrying the connection epoch of an authenticated session. A
+/// request whose epoch is older than the session's current one belongs to a
+/// connection that has been replaced.
+pub const EPOCH_HEADER: &str = "x-crew-epoch";
+
+/// How long a session credential authenticates for, unless the caller asks
+/// for less. A window outlives a coffee break and not a weekend.
+pub const SESSION_TTL_SECS: i64 = 24 * 3600;
+pub const MAX_SESSION_TTL_SECS: i64 = 24 * 3600;
+
 /// Prefix of an administrative credential. Deliberately not an extension of
 /// [`TOKEN_PREFIX`]: `acsa_` does not start with `acs_`, so an administrative
 /// credential presented to `/mcp` fails the prefix check before any lookup,
@@ -43,7 +60,34 @@ pub struct AuthCtx {
     /// than from the token, so it is caller-controlled and must never be used
     /// to decide **which agent** is speaking — only to partition that agent's
     /// own presence, claims and locks.
+    ///
+    /// When [`Self::session_id`] is set the value was *proven* rather than
+    /// asserted: it came from the session credential, and a header that
+    /// disagreed was refused before this struct existed.
     pub session: String,
+    /// Set when the caller authenticated with a session credential
+    /// (`acss_…`): the row in `agent_sessions` it belongs to. `None` is a
+    /// plain agent token, where `session` is only a label.
+    pub session_id: Option<Uuid>,
+    /// Connection epoch of that session, for callers that fence stale
+    /// connections. `None` without a session credential.
+    pub session_epoch: Option<i64>,
+    /// The `api_tokens` row that authenticated this request, when it was an
+    /// agent token. Carried so that registering a session can hang it off
+    /// the exact credential used *without* the tool layer ever handling the
+    /// secret. `None` for a session credential (which cannot register) and
+    /// for the dashboard's team-only context.
+    pub token_id: Option<Uuid>,
+}
+
+impl AuthCtx {
+    /// True when the session label was proven by a credential rather than
+    /// asserted in a header. Anything that gates *access* on a session must
+    /// require this; anything that merely partitions one agent's own work
+    /// does not.
+    pub fn session_is_authenticated(&self) -> bool {
+        self.session_id.is_some()
+    }
 }
 
 /// Read the session label from the request headers.
@@ -105,6 +149,29 @@ pub fn normalize_session(raw: &str) -> Result<String, String> {
     Ok(label)
 }
 
+/// Read the connection epoch from the request headers, when one is sent.
+/// Absent means "do not fence me", which is what every existing client sends.
+fn epoch_from_headers(headers: &axum::http::HeaderMap) -> Result<Option<i64>, AuthError> {
+    let Some(value) = headers.get(EPOCH_HEADER) else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| AuthError::BadSession(format!("{EPOCH_HEADER} must be ASCII")))?;
+    let epoch: i64 = raw
+        .parse()
+        .map_err(|_| AuthError::BadSession(format!("{EPOCH_HEADER} must be a positive integer")))?;
+    if epoch <= 0 {
+        return Err(AuthError::BadSession(format!(
+            "{EPOCH_HEADER} must be a positive integer"
+        )));
+    }
+    Ok(Some(epoch))
+}
+
 /// Read the session label from the request headers.
 fn session_from_headers(headers: &axum::http::HeaderMap) -> Result<String, AuthError> {
     let Some(value) = headers.get(SESSION_HEADER) else {
@@ -121,6 +188,13 @@ pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     format!("{TOKEN_PREFIX}{}", hex::encode(bytes))
+}
+
+/// Generate a fresh session credential.
+pub fn generate_session_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    format!("{SESSION_TOKEN_PREFIX}{}", hex::encode(bytes))
 }
 
 /// Generate a fresh administrative credential. Same entropy and hashing as
@@ -151,6 +225,9 @@ struct AuthRow {
 }
 
 pub async fn resolve_token(pool: &PgPool, raw: &str) -> Result<AuthCtx, AuthError> {
+    if raw.starts_with(SESSION_TOKEN_PREFIX) {
+        return resolve_session_token(pool, raw).await;
+    }
     if !raw.starts_with(TOKEN_PREFIX) {
         return Err(AuthError::Invalid);
     }
@@ -213,6 +290,115 @@ pub async fn resolve_token(pool: &PgPool, raw: &str) -> Result<AuthCtx, AuthErro
         // Filled in by the middleware from the request headers; the token
         // itself says nothing about which session is using it.
         session: String::new(),
+        session_id: None,
+        session_epoch: None,
+        token_id: Some(row.token_id),
+    })
+}
+
+/// Resolve a session credential. Everything it is comes from the parent
+/// token: agent, team, and whether it may authenticate at all. One query, so
+/// a revoked parent or a disabled agent cannot be raced past.
+async fn resolve_session_token(pool: &PgPool, raw: &str) -> Result<AuthCtx, AuthError> {
+    let row: Option<(
+        Uuid,
+        String,
+        i64,
+        Uuid,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Uuid,
+        String,
+        bool,
+        bool,
+        bool,
+    )> = sqlx::query_as(
+        r#"
+        SELECT s.id,
+               s.label,
+               s.epoch,
+               a.id,
+               a.name,
+               a.disabled_at,
+               tm.id,
+               tm.slug,
+               (s.revoked_at IS NOT NULL) AS session_revoked,
+               (s.expires_at <= now())    AS session_expired,
+               (t.revoked_at IS NOT NULL) AS parent_revoked
+        FROM agent_sessions s
+        JOIN api_tokens t ON t.id = s.parent_token
+        JOIN agents a     ON a.id = s.agent_id
+        JOIN teams tm     ON tm.id = a.team_id
+        WHERE s.token_hash = $1
+        "#,
+    )
+    .bind(hash_token(raw))
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "session lookup failed");
+        AuthError::Internal
+    })?;
+
+    let Some((
+        session_id,
+        label,
+        epoch,
+        agent_id,
+        agent_name,
+        agent_disabled,
+        team_id,
+        team_slug,
+        session_revoked,
+        session_expired,
+        parent_revoked,
+    )) = row
+    else {
+        return Err(AuthError::Invalid);
+    };
+    if agent_disabled.is_some() {
+        return Err(AuthError::Disabled);
+    }
+    // A session is not a credential of its own: it lives exactly as long as
+    // the token it was derived from.
+    if parent_revoked || session_revoked {
+        return Err(AuthError::Invalid);
+    }
+    if session_expired {
+        return Err(AuthError::SessionExpired);
+    }
+
+    // Usage bookkeeping must never queue behind a write in flight. A guarded
+    // mutation holds a share lock on this row for its whole transaction, so a
+    // plain UPDATE here would make every concurrent request of the same
+    // window wait for it. SKIP LOCKED steps aside instead, and the one-minute
+    // floor means a busy window writes this once a minute rather than once a
+    // call. Best-effort either way: it is a timestamp, not the request.
+    let _ = sqlx::query(
+        "UPDATE agent_sessions SET last_used_at = now()
+          WHERE id IN (
+              SELECT id FROM agent_sessions
+               WHERE id = $1
+                 AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')
+               FOR UPDATE SKIP LOCKED
+          )",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await;
+
+    Ok(AuthCtx {
+        agent_id,
+        agent_name,
+        team_id,
+        team_slug,
+        // Proven, not asserted: the middleware refuses a header that
+        // disagrees rather than letting it win.
+        session: label,
+        session_id: Some(session_id),
+        session_epoch: Some(epoch),
+        // A session credential is not an agent token: it may not register.
+        token_id: None,
     })
 }
 
@@ -227,6 +413,19 @@ pub enum AuthError {
     /// The `X-Crew-Session` header is present but unusable; carries what is
     /// wrong with it.
     BadSession(String),
+    /// A session credential whose 24-hour lifetime ran out.
+    SessionExpired,
+    /// The header says one session, the credential proves another.
+    SessionMismatch {
+        proven: String,
+        claimed: String,
+    },
+    /// The request's epoch is older than the session's; this connection was
+    /// replaced. Carries the current epoch.
+    StaleEpoch {
+        current: i64,
+        sent: i64,
+    },
 }
 
 impl IntoResponse for AuthError {
@@ -256,6 +455,29 @@ impl IntoResponse for AuthError {
                     "rate limit exceeded for this token; retry in {secs}s. \
                      If you are polling, use wait_for_updates (it blocks until \
                      something happens) instead of calling in a loop."
+                ),
+            ),
+            AuthError::SessionExpired => (
+                StatusCode::UNAUTHORIZED,
+                "this session credential has expired. Register a new session with \
+                 register_session using your agent token; your session label, and \
+                 everything filed under it, is unchanged."
+                    .to_owned(),
+            ),
+            AuthError::SessionMismatch { proven, claimed } => (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "the {SESSION_HEADER} header says '{claimed}' but this credential \
+                     authenticates session '{proven}'. A session credential proves which \
+                     window it is; drop the header, or send the one you hold."
+                ),
+            ),
+            AuthError::StaleEpoch { current, sent } => (
+                StatusCode::CONFLICT,
+                format!(
+                    "this connection is stale: it carries epoch {sent} and the session is \
+                     at {current}, so another process resumed this window after you. Stop \
+                     writing as it — resume the session to take over, or exit."
                 ),
             ),
             AuthError::BadSession(why) => (
@@ -324,9 +546,29 @@ pub async fn require_bearer(
     // Validated before the token lookup: a malformed header is the caller's
     // mistake either way, and rejecting it costs no query.
     let session = session_from_headers(req.headers())?;
+    let epoch = epoch_from_headers(req.headers())?;
 
     let mut ctx = resolve_token(&state.pool, &raw).await?;
-    ctx.session = session;
+    match ctx.session_id {
+        // An agent token: the header *is* the session, as it always was.
+        None => ctx.session = session,
+        // A session credential: the label is proven. A header that agrees is
+        // harmless and one that disagrees is refused, so a caller can never
+        // widen a proven session into someone else's by sending a label.
+        Some(_) => {
+            if !session.is_empty() && session != ctx.session {
+                return Err(AuthError::SessionMismatch {
+                    proven: ctx.session,
+                    claimed: session,
+                });
+            }
+            if let (Some(current), Some(sent)) = (ctx.session_epoch, epoch)
+                && sent < current
+            {
+                return Err(AuthError::StaleEpoch { current, sent });
+            }
+        }
+    }
     tracing::debug!(
         agent = %ctx.agent_name,
         team = %ctx.team_slug,

@@ -8,7 +8,9 @@
 //! - [`admin`] is the operator CLI (teams, agents, tokens),
 //! - [`admin_api`] is the remote administration surface at `/admin/*`,
 //! - [`admin_cli`] drives it from the operator's machine (`admin …`),
-//! - [`context`] resolves which bus, token and project a client should use.
+//! - [`context`] resolves which bus, token and project a client should use,
+//! - [`proxy`] is the per-conversation stdio MCP server (`mcp proxy`),
+//! - [`hook`] is what lifecycle hooks run (`context hook`).
 
 // Row tuples for `sqlx::query_as` are spelled out next to the SELECT that
 // produces them; naming each one would only add indirection.
@@ -23,7 +25,9 @@ pub mod context;
 pub mod dashboard;
 pub mod error;
 pub mod events;
+pub mod hook;
 pub mod model;
+pub mod proxy;
 pub mod ratelimit;
 pub mod serve;
 pub mod store;

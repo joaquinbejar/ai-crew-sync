@@ -57,6 +57,7 @@ Each agent — yours, each teammate's — connects with its own token and can:
 | **Attachments**: diffs, logs, small files (≤256 KiB) on messages and tasks | `attach_file`, `get_attachment` (+ `attachments` in `post_message`) |
 | **Generic locks** with TTL over resources ("deploy:staging") | `acquire_lock`, `release_lock`, `list_locks` |
 | Presence (who is on which repo/branch doing what), with each teammate's open sessions under their name; session discovery by project and role | `heartbeat`, `list_agents`, `list_sessions` |
+| Authenticated windows: a credential that proves which window is calling, derived from your agent token | `register_session`, `renew_session`, `revoke_session` |
 | Shared team memory (notes with history) | `set_note`, `get_note`, `list_notes`, `search_notes`, `delete_note` |
 | **Activity digest** of the last N hours | `team_digest` |
 | **Sessions**: one token, one working context per repository | `X-Crew-Session` header (see below) |
@@ -114,7 +115,7 @@ inside the distribution it targets before a release publishes it.
 ## Quick start (docker-compose)
 
 ```bash
-make up      # = docker compose -f Docker/docker-compose.yml up -d (pulls GHCR image)
+make up      # = docker compose -f Docker/docker-compose.yml up -d --no-build (pulls GHCR image)
 ```
 
 Every variable has a sane default; override via the environment or
@@ -143,8 +144,9 @@ The server migrates the database on startup and exposes:
 
 ### Deploying to production
 
-The base compose file has a working default for everything so `make up` boots
-on a laptop. Production uses an overlay that has **no** defaults:
+There is a single compose file, and it has a working default for everything
+so `make up` boots on a laptop. What keeps production safe is the preflight
+that `make deploy` runs before touching the cluster:
 
 ```bash
 export POSTGRES_PASSWORD=…        # not the example value
@@ -154,10 +156,15 @@ export BUS_DASHBOARD_SECRET=…     # shared, so sessions work across replicas
 make deploy                       # preflight, then docker stack deploy
 ```
 
-`make deploy` refuses before contacting the cluster if any of those is
-missing, still the example password, or a moving tag — and compose itself
-will not even render the overlay without them. `make deploy-check` runs the
-preflight alone.
+`make deploy` refuses if any of those is missing, still the example password,
+or a moving tag. `make deploy-check` runs the preflight alone.
+
+Behind a Traefik v3 proxy (`--providers.swarm`) that already terminates TLS,
+set `TRAEFIK_ENABLE=true` and `BUS_PUBLIC_HOST=crew.example.com` (plus
+`TRAEFIK_NETWORK`/`TRAEFIK_ENTRYPOINT`/`TRAEFIK_CERTRESOLVER` if they differ
+from `edge`/`websecure`/`le`): the bus carries the router labels and joins the
+proxy's network, which the proxy's stack must have created as an attachable
+overlay.
 
 ## Onboard the team
 
@@ -373,6 +380,116 @@ repository cannot send your token anywhere. Two windows in the same repository
 select profiles independently (`--profile`), sharing nothing mutable. Writes to
 the profile store are serialised through a lock and land atomically with mode
 `0600`.
+
+### Authenticated sessions: proving which window you are
+
+`X-Crew-Session` is a label the caller chooses. It is enough to keep one
+person's windows from overwriting each other's presence and claims, and it is
+not proof of anything: whoever holds the agent token can send any label.
+
+`register_session` turns a window into something it can prove. Present your
+agent token once per conversation, and the bus returns a credential derived
+from it:
+
+```
+register_session {"session": "conv-7f2a"}
+→ {"session_token": "acss_…", "session_id": "…", "session": "conv-7f2a",
+   "address": "joaquin/conv-7f2a", "epoch": 1,
+   "expires_at": "…", "expires_in_seconds": 86400}
+```
+
+Send that as the bearer token from then on. It authenticates as your agent, in
+that one session, and:
+
+- **derives everything from the parent.** Agent and team come from the token
+  that registered it, so a client cannot assert either;
+- **mints nothing.** Not an agent token, not an administrative credential, not
+  another session;
+- **expires on its own** (24 hours by default, `ttl_seconds` for less) and
+  **dies with its parent**: revoke the token or disable the agent and every
+  session under it stops authenticating, with no sweep to wait for;
+- **refuses a contradicting header.** A request whose `X-Crew-Session` names a
+  different window is rejected, so a proven session can never be widened into
+  somebody else's;
+- **fences what it replaces.** Registering the same label again is a *resume*:
+  new secret, `epoch` bumped, identity and history unchanged. Send the epoch
+  as `X-Crew-Epoch` and a process that was resumed away is told so
+  (`409`) instead of writing as the window that replaced it.
+
+`renew_session` extends the credential you already hold without touching its
+secret or epoch. `revoke_session` closes it, or another window of your own
+agent by label. `whoami` reports `session_identity` when the label was proven
+and `null` when it is only a header.
+
+Nothing here is required: an agent token with a session header keeps working
+for every tool and for a bare `curl`, exactly as before.
+
+### One session per conversation: the stdio proxy
+
+Sessions separate windows, but a header written once in a client config is
+the same header in every window of that client. `ai-crew-sync mcp proxy` is a
+local MCP server the client starts **once per conversation** — the norm for
+stdio servers — so the process itself is the unit of isolation: it mints the
+session, sends it on every forwarded call, and keeps that window's project
+and role. It works with any MCP client; what a particular host offers is used
+as an enrichment, never required.
+
+```json
+{
+  "mcpServers": {
+    "ai-crew-sync": {
+      "command": "ai-crew-sync",
+      "args": ["mcp", "proxy", "--role", "implementation"]
+    }
+  }
+}
+```
+
+No token and no URL in the client config: credentials come from your local
+profile and the project's `.acs.toml` (see above). Every remote tool appears
+as usual, plus two that never reach the bus:
+
+- `session_status` — verified agent and team, session id, **address**
+  (`agent/session`), project, role, channel. Never credentials.
+- `configure_session({role?, project?, channel?, profile?})` — this window
+  only. Role and project are metadata: the session id, cursors, claims and
+  locks are untouched. `profile` switches to another locally approved
+  credential **of the same team**, verified with `whoami` before anything
+  changes; a failed verification leaves the old context intact, in-flight
+  calls to the old identity are cancelled rather than replayed, and what it
+  still holds (claims, locks) is reported, never transferred. A different
+  team needs a new conversation, because switching credentials cannot erase
+  what this conversation has already seen.
+
+The proxy does this for you: it registers the session on connect, forwards
+every call with the credential and the epoch, renews it, and clears the secret
+from its private state when the window closes. A bus too old to issue
+credentials simply keeps the label-only connection.
+
+**Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
+(any host that can set a per-window variable), `CLAUDE_CODE_SESSION_ID`
+(Claude Code sets it on MCP server processes), the `_meta.threadId` Codex
+attaches to every call, otherwise the process itself. With a conversation id
+the session label is **stable**, so a resumed conversation reconnects to the
+same session and a fork gets a new one; without one, the session lives as
+long as the process. If two conversations ever share one process, the proxy
+refuses the second rather than mixing them.
+
+Start-of-session context is delivered through the `initialize` result's
+`instructions` — every MCP client passes those to the model, so no hooks are
+needed. Where a host *does* have lifecycle hooks, they run
+`ai-crew-sync context hook --binding <conversation id> --event <event>`: the
+helper reads the private record the proxy wrote (0700 directory, 0600 file),
+acts as **that** window with its own credential, and prints only what the host
+expects. The credential never reaches argv, stdout or a log, a hook never
+registers (so it cannot fence its own proxy), and a conversation with no
+binding produces no output at all rather than acting as a shared identity.
+This authenticated hook mode is the one place that needs the `ai-crew-sync`
+binary on the PATH; the legacy mode still needs only `curl` and `python3`. Presence is the proxy's own: a heartbeat on connect with the repo and
+branch of the project directory, a keep-alive every five minutes, `idle` on
+exit. Nothing is pushed into an idle turn: incoming messages are read with
+`read_messages` or awaited with `wait_for_updates`, as with a direct
+connection.
 
 ### Sessions: one person, several repositories
 
@@ -811,7 +928,7 @@ The dispatcher runs inside `serve`; there is nothing else to deploy.
 ## Development
 
 ```bash
-make check    # pre-push gate: rustfmt, clippy -D warnings, compose files render
+make check    # pre-push gate: rustfmt, clippy -D warnings, compose file renders
 make test     # E2E suite against a throwaway Postgres 18 (needs docker)
 make up-dev   # local stack built from this checkout
 make help     # everything else
@@ -867,7 +984,7 @@ plugin/          Claude Code plugin (MCP + hooks + commands + skill)
   scripts/       bus-call.sh, heartbeat.sh, session-start.sh (curl + python3)
   commands/      /ai-crew-sync:standup|catchup|announce|ask
   skills/        coordination conventions
-Docker/          Dockerfile + compose (published image, Swarm-ready) + dev override
+Docker/          Dockerfile + the one compose file (published image, local build, Swarm-ready)
 Makefile         check / test / up / up-dev / deploy — `make help` lists all
 .claude-plugin/marketplace.json   this repo doubles as a marketplace
 ```

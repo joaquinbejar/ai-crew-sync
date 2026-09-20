@@ -26,6 +26,10 @@ rmcp = { version = "3.4", features = [
     "client",
     "transport-streamable-http-client-reqwest",
     "reqwest",
+    # stdio server side, for `ai-crew-sync mcp proxy`; child-process client
+    # side so the integration tests can drive the real proxy binary.
+    "transport-io",
+    "transport-child-process",
 ] }
 schemars = "1.2"
 

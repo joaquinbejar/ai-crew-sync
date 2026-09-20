@@ -41,6 +41,12 @@ pub struct WhoAmI {
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub role: Option<String>,
+    /// Set when this connection authenticated with a session credential:
+    /// the session label above is then *proven*, not merely asserted in a
+    /// header. `null` means a plain agent token with a header label, which
+    /// is still how every existing client connects.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_identity: Option<SessionIdentity>,
     /// Channel this session posts to when `post_message` is called with
     /// neither `channel` nor `to` — the one named after your session, if the
     /// team has one. `null` means there is none, so you must always say where
@@ -93,6 +99,37 @@ pub struct AgentInfo {
     /// at once, and each one claims tasks and holds locks independently.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub sessions: Vec<AgentSession>,
+}
+
+/// A session credential as the caller receives it. `session_token` is the
+/// secret and appears exactly once, on registration.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SessionCredential {
+    /// The credential. Store it in a private file (0600) and send it as the
+    /// bearer token from now on; it is not shown again. Absent on a renewal,
+    /// which extends the credential you already hold.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_token: Option<String>,
+    pub session_id: String,
+    /// The label this credential authenticates as.
+    pub session: String,
+    /// What a teammate puts in `to` to reach exactly this window.
+    pub address: String,
+    /// Connection epoch. Send it as `X-Crew-Epoch` to be fenced off cleanly
+    /// if another process resumes this window after you.
+    pub epoch: i64,
+    pub expires_at: String,
+    pub expires_in_seconds: i64,
+}
+
+/// What a session credential proves, reported by `whoami`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SessionIdentity {
+    pub session_id: String,
+    pub epoch: i64,
+    pub registered_at: String,
+    pub expires_at: String,
+    pub expires_in_seconds: i64,
 }
 
 /// One working context of an agent: what that session is doing right now.

@@ -48,6 +48,12 @@ pub struct ClientArgs {
     #[arg(long, env = "BUS_PROJECT_DIR")]
     pub project_dir: Option<std::path::PathBuf>,
 
+    /// Id of the host conversation this call belongs to. It derives the same
+    /// bus session the proxy of that conversation uses, so a lifecycle hook
+    /// reads and writes that window's context and nobody else's.
+    #[arg(long, env = "BUS_HOST_SESSION")]
+    pub host_session: Option<String>,
+
     /// Which working context this is — usually the repository name. Separates
     /// your presence, task claims and locks from your other sessions. Omit it
     /// to share one context with them.
@@ -325,6 +331,7 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
         explicit_session: args.session.clone(),
         profile: args.profile.clone(),
         project_dir: args.project_dir.clone(),
+        host_session: args.host_session.clone(),
     })?;
     let mut config = StreamableHttpClientTransportConfig::with_uri(resolved.mcp_url.clone());
     config.auth_header = Some(resolved.token.clone());

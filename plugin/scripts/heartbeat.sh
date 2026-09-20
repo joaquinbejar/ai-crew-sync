@@ -10,6 +10,9 @@
 # the MCP heartbeat tool survives.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
+# Callers that have the hook payload export BUS_HOST_SESSION first; when a
+# hook has none (the Stop keep-alive is invoked without stdin), the resolver
+# falls back to BUS_SESSION exactly as before.
 STATUS="${1:-active}"
 # Clamped before it reaches a payload. The python path would encode a
 # surprising value safely, but the fallback below interpolates it straight
@@ -19,6 +22,40 @@ case "$STATUS" in
     *) STATUS=active ;;
 esac
 RESET="${2:-}"
+
+# `--from-payload` in the second slot: the hook was given the host payload on
+# stdin, so read the conversation id from it exactly as the other hooks do.
+# (Kept distinct from `reset`, which is the legacy second argument.)
+if [ "$RESET" = "--from-payload" ]; then
+    RESET=""
+    if [ -z "${BUS_HOST_SESSION:-}" ] && command -v python3 >/dev/null 2>&1; then
+        PAYLOAD="$(cat 2>/dev/null || true)"
+        HOST_SESSION="$(PAYLOAD="$PAYLOAD" python3 -c 'import json,os,sys
+try:
+    v = json.loads(os.environ.get("PAYLOAD") or "{}").get("session_id")
+except Exception:
+    v = None
+sys.stdout.write(str(v) if v else "")' 2>/dev/null || true)"
+        [ -n "$HOST_SESSION" ] && export BUS_HOST_SESSION="$HOST_SESSION"
+    fi
+fi
+
+# Authenticated mode: the helper publishes presence as the bound window, with
+# repo and branch read from this checkout. Silent when there is no binding.
+if [ -n "${BUS_HOST_SESSION:-}" ] && command -v ai-crew-sync >/dev/null 2>&1; then
+    case "$STATUS" in
+        idle) EVENT=session_end ;;
+        *)    EVENT=heartbeat ;;
+    esac
+    case "$(ai-crew-sync context hook --binding "$BUS_HOST_SESSION" --event status 2>/dev/null)" in
+        *'"authenticated"'*)
+            ai-crew-sync context hook --binding "$BUS_HOST_SESSION" --event "$EVENT" \
+                >/dev/null 2>&1 || true
+            exit 0
+            ;;
+    esac
+fi
+
 TTL=900
 [ "$STATUS" = "idle" ] && TTL=120
 

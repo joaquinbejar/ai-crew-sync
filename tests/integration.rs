@@ -453,6 +453,9 @@ async fn tools_are_advertised_with_schemas() {
         "heartbeat",
         "list_agents",
         "list_sessions",
+        "register_session",
+        "renew_session",
+        "revoke_session",
         "set_note",
         "get_note",
         "list_notes",
@@ -5282,4 +5285,1032 @@ async fn sessions_are_discoverable_by_project_and_role_and_addressed_exactly() {
         let _ = c.cancel().await;
     }
     h.shutdown().await;
+}
+
+// -------------------------------------------------------------- stdio proxy --
+
+/// A local configuration directory with profiles for the given agents, each
+/// with a tokens file holding its token under `_base`.
+fn proxy_config_dir(base: &str, profiles: &[(&str, &str, &str, &str)]) -> std::path::PathBuf {
+    use ai_crew_sync::context::{Profile, Profiles};
+    let dir = std::env::temp_dir().join(format!("acs-proxy-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut store = Profiles::default();
+    for (name, team, agent, token) in profiles {
+        let tokens = format!("tokens-{name}");
+        std::fs::write(dir.join(&tokens), format!("_base={token}\n")).unwrap();
+        store.profiles.insert(
+            (*name).to_owned(),
+            Profile {
+                url: base.to_owned(),
+                team: (*team).to_owned(),
+                agent: (*agent).to_owned(),
+                tokens,
+                key: None,
+            },
+        );
+    }
+    ai_crew_sync::context::save_profiles(&dir, &store).unwrap();
+    dir
+}
+
+/// Start the real proxy binary over stdio, with a scrubbed environment so
+/// nothing from the developer's shell (a BUS_TOKEN, a Claude session id)
+/// leaks into the test.
+async fn spawn_proxy(
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Client {
+    use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+    let bin = env!("CARGO_BIN_EXE_ai-crew-sync");
+    let transport = TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("BUS_CONFIG_DIR", config_dir)
+            .env("RUST_LOG", "warn")
+            .current_dir(project_dir)
+            .args(["mcp", "proxy", "--project-dir"])
+            .arg(project_dir)
+            .args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }))
+    .expect("spawn proxy");
+    ClientConfig::default()
+        .serve(transport)
+        .await
+        .expect("proxy initialize")
+}
+
+#[tokio::test]
+async fn proxy_gives_each_conversation_its_own_session_and_forwards_as_the_profile() {
+    let h = require_db!("t_proxy_basic");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".acs.toml"),
+        "profile = \"acme\"\nproject = \"market-data\"\n",
+    )
+    .unwrap();
+
+    // Two windows, same repository, same token, no environment at all.
+    let a = spawn_proxy(&dir, &repo, &["--role", "implementation"], &[]).await;
+    let b = spawn_proxy(&dir, &repo, &["--role", "review"], &[]).await;
+
+    let sa = call(&a, "session_status", json!({})).await;
+    let sb = call(&b, "session_status", json!({})).await;
+    assert_eq!(sa["connected"], true, "{sa}");
+    assert_eq!(sa["agent"], "joaquin");
+    assert_eq!(sa["team"], "acme");
+    assert_eq!(sa["project"], "market-data", "from .acs.toml");
+    assert_eq!(sa["role"], "implementation");
+    assert_eq!(sb["role"], "review");
+    assert_eq!(sa["binding"], "instance");
+    assert_ne!(sa["session"], sb["session"], "one session per process");
+    assert!(sa["session"].as_str().unwrap().starts_with("s-"));
+    assert_eq!(
+        sa["address"],
+        format!("joaquin/{}", sa["session"].as_str().unwrap())
+    );
+    assert!(sa.get("token").is_none() && sa.get("credentials").is_none());
+
+    // Forwarded calls carry the session: whoami through each proxy is the
+    // same agent in a different session.
+    let wa = call(&a, "whoami", json!({})).await;
+    let wb = call(&b, "whoami", json!({})).await;
+    assert_eq!(wa["agent"], "joaquin");
+    assert_eq!(wa["session"], sa["session"]);
+    assert_eq!(wb["session"], sb["session"]);
+    assert_eq!(
+        wa["role"], "implementation",
+        "the proxy's heartbeat published it"
+    );
+
+    // The local tools sit beside the remote ones here, and nowhere on the
+    // bus itself.
+    let names: Vec<String> = a
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for expected in [
+        "configure_session",
+        "session_status",
+        "whoami",
+        "post_message",
+        "list_sessions",
+    ] {
+        assert!(names.contains(&expected.to_owned()), "{names:?}");
+    }
+    let direct = connect(&h.base, &token).await;
+    let remote_names: Vec<String> = direct
+        .list_all_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        !remote_names
+            .iter()
+            .any(|n| n == "configure_session" || n == "session_status")
+    );
+
+    // Discovery sees both windows with their roles and exact addresses.
+    let found = call(
+        &direct,
+        "list_sessions",
+        json!({"project": "market-data", "online_only": true}),
+    )
+    .await;
+    let addresses: Vec<&str> = found["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["address"].as_str().unwrap())
+        .collect();
+    assert!(
+        addresses.contains(&sa["address"].as_str().unwrap()),
+        "{addresses:?}"
+    );
+    assert!(
+        addresses.contains(&sb["address"].as_str().unwrap()),
+        "{addresses:?}"
+    );
+
+    // A DM to window B is read by B only; A's cursor is untouched.
+    call(
+        &direct,
+        "post_message",
+        json!({"to": sb["address"], "body": "for the reviewer"}),
+    )
+    .await;
+    let inbox_a = call(&a, "read_messages", json!({"scope": "inbox"})).await;
+    assert!(inbox_a["messages"].as_array().unwrap().is_empty());
+    let inbox_b = call(&b, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(inbox_b["messages"][0]["body"], "for the reviewer");
+
+    // A role change keeps the session and reaches teammates on the next
+    // discovery; it touches this window only.
+    let changed = call(&b, "configure_session", json!({"role": "design"})).await;
+    assert_eq!(changed["status"]["session"], sb["session"]);
+    assert_eq!(changed["status"]["role"], "design");
+    assert!(changed["previous"].is_null(), "no identity change");
+    let design = call(&direct, "list_sessions", json!({"role": "design"})).await;
+    assert_eq!(design["count"], 1);
+    assert_eq!(design["sessions"][0]["address"], sb["address"]);
+    assert_eq!(
+        call(&a, "session_status", json!({})).await["role"],
+        "implementation"
+    );
+
+    for c in [a, b, direct] {
+        let _ = c.cancel().await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn proxy_binds_a_conversation_id_to_a_stable_session() {
+    use ai_crew_sync::proxy::session_for;
+
+    let h = require_db!("t_proxy_bind");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+
+    // The same conversation id, twice (a restart, a resume): one session.
+    let first = spawn_proxy(&dir, &repo, &["--host-session", "conv-1"], &[]).await;
+    let s1 = call(&first, "session_status", json!({})).await;
+    let _ = first.cancel().await;
+    let again = spawn_proxy(&dir, &repo, &["--host-session", "conv-1"], &[]).await;
+    let s1b = call(&again, "session_status", json!({})).await;
+    assert_eq!(s1["session"], s1b["session"], "reconnect keeps the session");
+    assert_eq!(s1["binding"], "explicit");
+    assert_eq!(s1["session"], session_for("conv-1"));
+    // A forked conversation has another id and another session.
+    let fork = spawn_proxy(&dir, &repo, &[], &[("BUS_HOST_SESSION", "conv-2")]).await;
+    let s2 = call(&fork, "session_status", json!({})).await;
+    assert_ne!(s2["session"], s1["session"]);
+    assert_eq!(s2["session"], session_for("conv-2"));
+    // Claude Code's variable binds the same way.
+    let claude = spawn_proxy(&dir, &repo, &[], &[("CLAUDE_CODE_SESSION_ID", "conv-1")]).await;
+    let s3 = call(&claude, "session_status", json!({})).await;
+    assert_eq!(s3["binding"], "claude-code");
+    assert_eq!(
+        s3["session"], s1["session"],
+        "same conversation id, same session"
+    );
+    // Identity is independent of the binding: still the profile's agent.
+    assert_eq!(call(&claude, "whoami", json!({})).await["agent"], "joaquin");
+    for c in [again, fork, claude] {
+        let _ = c.cancel().await;
+    }
+
+    // A host that sends the conversation id in request metadata (Codex):
+    // the first id binds, a second one on the same process is refused.
+    let meta = spawn_proxy(&dir, &repo, &[], &[]).await;
+    let before = call(&meta, "session_status", json!({})).await;
+    assert_eq!(before["binding"], "instance");
+    let with_thread = |thread: &str| {
+        let mut params = CallToolRequestParams::new("whoami");
+        let mut m = rmcp::model::JsonObject::new();
+        m.insert("threadId".into(), json!(thread));
+        params.meta = Some(rmcp::model::RequestMetaObject::from(m));
+        params
+    };
+    let r = meta.call_tool(with_thread("thread-A")).await.unwrap();
+    let who = r.structured_content.unwrap();
+    assert_eq!(who["session"], session_for("thread-A"));
+    let after = call(&meta, "session_status", json!({})).await;
+    assert_eq!(after["binding"], "request-meta");
+    assert_eq!(after["session"], session_for("thread-A"));
+    let err = meta
+        .call_tool(with_thread("thread-B"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("another conversation"), "{err}");
+    assert!(
+        err.contains("one `ai-crew-sync mcp proxy` per conversation"),
+        "{err}"
+    );
+    // The bound conversation keeps working.
+    let r = meta.call_tool(with_thread("thread-A")).await.unwrap();
+    assert_eq!(r.is_error, Some(false));
+    let _ = meta.cancel().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn proxy_switches_profiles_only_after_verification_and_never_across_teams() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_proxy_switch");
+    let joaquin = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = seed_agent(&h.pool, "acme", "marta").await;
+    let eve = seed_agent(&h.pool, "other", "eve").await;
+    let dir = proxy_config_dir(
+        &h.base,
+        &[
+            ("me", "acme", "joaquin", &joaquin),
+            ("marta", "acme", "marta", &marta),
+            ("other", "other", "eve", &eve),
+            // Claims to be marta, holds eve's token: verification must catch it.
+            ("liar", "acme", "marta", &eve),
+        ],
+    );
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".acs.toml"),
+        "profile = \"me\"\nproject = \"api\"\n",
+    )
+    .unwrap();
+
+    let p = spawn_proxy(&dir, &repo, &["--role", "implementation"], &[]).await;
+    let start = call(&p, "session_status", json!({})).await;
+    assert_eq!(start["agent"], "joaquin");
+    let session = start["session"].as_str().unwrap().to_owned();
+
+    // Hold something as joaquin so the switch has something to report.
+    call(
+        &p,
+        "create_task",
+        json!({"key": "api#1", "title": "wire it"}),
+    )
+    .await;
+    call(&p, "claim_task", json!({"key": "api#1"})).await;
+    call(&p, "acquire_lock", json!({"name": "api:deploy"})).await;
+
+    // A profile that fails verification changes nothing.
+    let r = p
+        .call_tool(
+            CallToolRequestParams::new("configure_session")
+                .with_arguments(serde_json::from_value(json!({"profile": "liar"})).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true), "{r:?}");
+    let text = format!("{:?}", r.content);
+    assert!(text.contains("expects marta@acme"), "{text}");
+    assert_eq!(
+        call(&p, "whoami", json!({})).await["agent"],
+        "joaquin",
+        "still joaquin"
+    );
+
+    // Another team: refused, with the reason.
+    let r = p
+        .call_tool(
+            CallToolRequestParams::new("configure_session")
+                .with_arguments(serde_json::from_value(json!({"profile": "other"})).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true));
+    let text = format!("{:?}", r.content);
+    assert!(text.contains("new conversation"), "{text}");
+    assert!(text.contains("team 'acme'"), "{text}");
+    assert_eq!(call(&p, "whoami", json!({})).await["agent"], "joaquin");
+
+    // A same-team switch while a long poll is in flight: the poll is
+    // cancelled, not replayed; the new identity answers afterwards; the old
+    // one's claim and lock are reported, not transferred; role and session
+    // stay.
+    let waiter = {
+        let p2 = p.clone();
+        tokio::spawn(async move {
+            p2.call_tool(
+                CallToolRequestParams::new("wait_for_updates").with_arguments(
+                    serde_json::from_value(json!({"timeout_seconds": 20})).unwrap(),
+                ),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let switched = call(&p, "configure_session", json!({"profile": "marta"})).await;
+    let wait_outcome = tokio::time::timeout(std::time::Duration::from_secs(8), waiter)
+        .await
+        .expect("the in-flight poll must end at the switch, not at its own timeout")
+        .unwrap();
+    let err = wait_outcome
+        .expect_err("cancelled by the context switch")
+        .to_string();
+    assert!(err.contains("switched credentials"), "{err}");
+    assert_eq!(switched["status"]["agent"], "marta");
+    assert_eq!(switched["status"]["team"], "acme");
+    assert_eq!(
+        switched["status"]["session"], session,
+        "session survives the switch"
+    );
+    assert_eq!(switched["status"]["role"], "implementation");
+    assert_eq!(switched["previous"]["agent"], "joaquin");
+    assert_eq!(switched["previous"]["open_claims"], json!(["api#1"]));
+    assert_eq!(switched["previous"]["held_locks"], json!(["api:deploy"]));
+
+    // The window's own channel is applied to a message that names none, so
+    // the default the instructions advertise is the one the bus sees.
+    call(&p, "create_channel", json!({"name": "api"})).await;
+    let posted = call(&p, "post_message", json!({"body": "from the window"})).await;
+    assert_eq!(posted["message"]["channel"], "api");
+    // An explicit channel and a direct message are untouched.
+    call(&p, "create_channel", json!({"name": "other"})).await;
+    let elsewhere = call(
+        &p,
+        "post_message",
+        json!({"channel": "other", "body": "explicit"}),
+    )
+    .await;
+    assert_eq!(elsewhere["message"]["channel"], "other");
+    let dm = call(
+        &p,
+        "post_message",
+        json!({"to": "joaquin", "body": "direct"}),
+    )
+    .await;
+    assert!(dm["message"]["channel"].is_null(), "{dm}");
+
+    // A label the bus would reject is refused here too, and changes nothing.
+    let before_role = call(&p, "session_status", json!({})).await["role"].clone();
+    let r = p
+        .call_tool(
+            CallToolRequestParams::new("configure_session")
+                .with_arguments(serde_json::from_value(json!({"role": "code review!"})).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true), "{r:?}");
+    assert_eq!(
+        call(&p, "session_status", json!({})).await["role"],
+        before_role
+    );
+    assert_eq!(call(&p, "whoami", json!({})).await["agent"], "marta");
+    // Ownership stayed with joaquin: marta holds neither the lease nor the
+    // lock, so she can renew and release nothing of his.
+    let err = call_expect_error(&p, "renew_task_lease", json!({"key": "api#1"})).await;
+    assert!(err.contains("joaquin"), "{err}");
+    let err = call_expect_error(&p, "release_lock", json!({"name": "api:deploy"})).await;
+    assert!(err.contains("joaquin"), "{err}");
+
+    // A revoked token surfaces as an error on the next forwarded call, and a
+    // working profile recovers the window.
+    let (marta_id,): (Uuid,) = sqlx::query_as(
+        "SELECT t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id WHERE a.name = 'marta'",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    store::revoke_token(&h.pool, Actor::Cli, None, marta_id)
+        .await
+        .unwrap();
+    let err = p
+        .call_tool(CallToolRequestParams::new("whoami"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("revoked or rotated"), "{err}");
+    assert!(err.contains("configure_session"), "{err}");
+    assert!(err.contains("profile 'marta'"), "{err}");
+    let hurt = call(&p, "session_status", json!({})).await;
+    assert!(
+        hurt["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rejected"),
+        "the window reports its own broken credential: {hurt}"
+    );
+    let back = call(&p, "configure_session", json!({"profile": "me"})).await;
+    assert_eq!(back["status"]["agent"], "joaquin");
+    assert_eq!(call(&p, "whoami", json!({})).await["session"], session);
+
+    let _ = p.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+// ------------------------------------------------- host integration (#86) --
+
+/// Run a plugin hook script the way a host would: payload on stdin, the
+/// repository as cwd, and only the environment a hook actually gets. No
+/// BUS_TOKEN, no BUS_SESSION — everything is resolved from the profiles and
+/// the conversation id in the payload.
+async fn run_hook(
+    script: &str,
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    payload: &str,
+    extra_args: &[&str],
+) -> String {
+    // The hook talks HTTP to the harness, which runs on this runtime: waiting
+    // for the child on this thread deadlocks both. Off to a blocking thread,
+    // with a bound so a wedged hook fails the test instead of hanging CI.
+    let (script, config_dir, project_dir, payload) = (
+        script.to_owned(),
+        config_dir.to_path_buf(),
+        project_dir.to_path_buf(),
+        payload.to_owned(),
+    );
+    let extra: Vec<String> = extra_args.iter().map(|a| (*a).to_owned()).collect();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            run_hook_blocking(&script, &config_dir, &project_dir, &payload, &extra)
+        }),
+    )
+    .await
+    .expect("the hook did not finish within 30s")
+    .expect("the hook task panicked")
+}
+
+fn run_hook_blocking(
+    script: &str,
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    payload: &str,
+    extra_args: &[String],
+) -> String {
+    use std::io::Write;
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("plugin/scripts")
+        .join(script);
+    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_ai-crew-sync"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = std::process::Command::new("sh")
+        .arg(&script)
+        .args(extra_args.iter().map(String::as_str))
+        .current_dir(project_dir)
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("TMPDIR", config_dir)
+        .env("BUS_CONFIG_DIR", config_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("hook finished");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The workflow the whole stack exists for: five conversations in one
+/// repository, on one token, with no per-window export and no new token —
+/// implementation, design, a Claude review and two Codex reviews. They find
+/// each other, send targeted corrections, and each window's hooks act on its
+/// own session only.
+#[tokio::test]
+async fn five_conversations_share_a_repo_and_stay_separate() {
+    let h = require_db!("t_host_integration");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".acs.toml"),
+        "profile = \"acme\"\nproject = \"market-data\"\nchannel = \"market-data\"\n",
+    )
+    .unwrap();
+
+    // Five windows. Two hosts that expose a conversation id (Claude Code's
+    // variable and an explicit flag), and three that expose none.
+    let windows = [
+        ("impl", "implementation", Some("conv-impl")),
+        ("design", "design", Some("conv-design")),
+        ("claude-review", "review", None),
+        ("codex-review-1", "review", None),
+        ("codex-review-2", "review", None),
+    ];
+    let mut clients = Vec::new();
+    let mut ids = Vec::new();
+    for (name, role, conv) in windows {
+        let env: Vec<(&str, &str)> = match conv {
+            Some(c) if name == "impl" => vec![("CLAUDE_CODE_SESSION_ID", c)],
+            Some(c) => vec![("BUS_HOST_SESSION", c)],
+            None => vec![],
+        };
+        let c = spawn_proxy(&dir, &repo, &["--role", role], &env).await;
+        let st = call(&c, "session_status", json!({})).await;
+        assert_eq!(st["connected"], true, "{name}: {st}");
+        assert_eq!(st["agent"], "joaquin");
+        ids.push((
+            name,
+            st["session"].as_str().unwrap().to_owned(),
+            st["address"].as_str().unwrap().to_owned(),
+        ));
+        clients.push(c);
+    }
+    let sessions: std::collections::HashSet<&str> =
+        ids.iter().map(|(_, s, _)| s.as_str()).collect();
+    assert_eq!(
+        sessions.len(),
+        5,
+        "five conversations, five sessions: {ids:?}"
+    );
+
+    // Design discovers the implementation window and sends a correction; the
+    // two same-role Codex reviewers stay distinct.
+    let design = &clients[1];
+    let found = call(
+        design,
+        "list_sessions",
+        json!({"project": "market-data", "role": "implementation", "online_only": true}),
+    )
+    .await;
+    assert_eq!(found["count"], 1);
+    let impl_addr = found["sessions"][0]["address"].as_str().unwrap().to_owned();
+    assert_eq!(impl_addr, ids[0].2);
+    call(
+        design,
+        "post_message",
+        json!({"to": impl_addr, "body": "the empty state needs a spinner"}),
+    )
+    .await;
+    let reviewers = call(
+        design,
+        "list_sessions",
+        json!({"project": "market-data", "role": "review", "online_only": true}),
+    )
+    .await;
+    assert_eq!(
+        reviewers["count"], 3,
+        "three reviewers share a role, three addresses"
+    );
+
+    // The implementation window reads it, replies to the exact sender, and
+    // no other window's inbox moved.
+    let implementation = &clients[0];
+    let inbox = call(implementation, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+    let msg = &inbox["messages"][0];
+    assert_eq!(msg["body"], "the empty state needs a spinner");
+    let from = format!(
+        "{}/{}",
+        msg["from"].as_str().unwrap(),
+        msg["from_session"].as_str().unwrap()
+    );
+    assert_eq!(from, ids[1].2);
+    call(
+        implementation,
+        "post_message",
+        json!({"to": from, "body": "added", "reply_to": msg["id"]}),
+    )
+    .await;
+    let reply = call(design, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(reply["messages"][0]["body"], "added");
+    for c in clients.iter().skip(2) {
+        let quiet = call(c, "read_messages", json!({"scope": "inbox"})).await;
+        assert!(
+            quiet["messages"].as_array().unwrap().is_empty(),
+            "a reviewer saw another window's direct message"
+        );
+    }
+
+    // A hook of the implementation conversation acts on THAT window: the
+    // same conversation id resolves to the same session, so a heartbeat from
+    // the hook updates this window's presence and nobody else's.
+    run_hook("heartbeat.sh", &dir, &repo, "", &["busy"]).await;
+    let after = call(
+        design,
+        "list_sessions",
+        json!({"project": "market-data", "online_only": true}),
+    )
+    .await;
+    assert_eq!(after["count"], 5, "the hook did not create a sixth session");
+
+    // SessionStart for the design conversation injects its own identity,
+    // and only after the bus confirmed it.
+    let out = run_hook(
+        "session-start.sh",
+        &dir,
+        &repo,
+        &json!({"session_id": "conv-design", "cwd": repo.display().to_string()}).to_string(),
+        &[],
+    )
+    .await;
+    let injected: Value = serde_json::from_str(out.trim()).expect("hook emitted JSON");
+    let context = injected["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(context.contains("agent 'joaquin'"), "{context}");
+    assert!(
+        context.contains(&ids[1].1),
+        "the design window's own session: {context}"
+    );
+    assert!(context.contains("role 'design'"), "{context}");
+    for (name, session, _) in ids.iter().skip(2) {
+        assert!(
+            !context.contains(session.as_str()),
+            "{name}'s session leaked: {context}"
+        );
+    }
+
+    // A conversation with no bus configured injects nothing at all.
+    let empty_cfg = dir.join("no-profiles");
+    std::fs::create_dir_all(&empty_cfg).unwrap();
+    let out = run_hook(
+        "session-start.sh",
+        &empty_cfg,
+        &repo,
+        &json!({"session_id": "conv-nowhere"}).to_string(),
+        &[],
+    )
+    .await;
+    assert!(out.trim().is_empty(), "unconfigured session start: {out}");
+
+    // Ending one window leaves the others alone: no idled presence, no
+    // drained inbox, no released claim.
+    call(
+        implementation,
+        "create_task",
+        json!({"key": "md#1", "title": "spinner"}),
+    )
+    .await;
+    call(implementation, "claim_task", json!({"key": "md#1"})).await;
+    let closing = clients.remove(4);
+    let _ = closing.cancel().await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let implementation = &clients[0];
+    let mine = call(implementation, "list_tasks", json!({"mine_only": true})).await;
+    assert_eq!(mine["tasks"][0]["status"], "claimed");
+    assert_eq!(mine["tasks"][0]["claimed_session"], ids[0].1);
+    let still = call(
+        implementation,
+        "list_sessions",
+        json!({"project": "market-data", "role": "implementation", "online_only": true}),
+    )
+    .await;
+    assert_eq!(still["count"], 1, "the surviving window is still online");
+    assert_eq!(
+        call(implementation, "whoami", json!({})).await["session"],
+        ids[0].1
+    );
+
+    for c in clients {
+        let _ = c.cancel().await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+// ------------------------------------------------- authenticated sessions --
+
+/// A session credential proves which window is calling: it is derived from an
+/// agent token, cannot mint anything, dies with its parent, expires on its
+/// own, and a resume fences the connection it replaced.
+#[tokio::test]
+async fn session_credentials_prove_a_window_and_die_with_their_parent() {
+    let h = require_db!("t_sessions_auth");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let other = seed_agent(&h.pool, "acme", "marta").await;
+
+    // Registration takes the agent token and derives everything from it.
+    let agent = connect_with_session(&h.base, &token, "conv-a").await;
+    let cred = call(
+        &agent,
+        "register_session",
+        json!({"session": "conv-a", "ttl_seconds": 3600}),
+    )
+    .await;
+    let session_token = cred["session_token"].as_str().unwrap().to_owned();
+    assert!(session_token.starts_with("acss_"), "{cred}");
+    assert_eq!(cred["session"], "conv-a");
+    assert_eq!(cred["address"], "joaquin/conv-a");
+    assert_eq!(cred["epoch"], 1);
+    assert!(cred["expires_in_seconds"].as_i64().unwrap() <= 3600);
+
+    // It authenticates as that agent in that session, and says so.
+    let window = connect(&h.base, &session_token).await;
+    let me = call(&window, "whoami", json!({})).await;
+    assert_eq!(me["agent"], "joaquin");
+    assert_eq!(me["team"], "acme");
+    assert_eq!(me["session"], "conv-a", "the label is proven, not sent");
+    assert_eq!(me["session_identity"]["epoch"], 1);
+    assert_eq!(me["session_identity"]["session_id"], cred["session_id"]);
+    // A plain agent token has no proven identity.
+    assert!(call(&agent, "whoami", json!({})).await["session_identity"].is_null());
+
+    // It cannot mint: not another session, not anything else.
+    let err = call_expect_error(&window, "register_session", json!({"session": "conv-b"})).await;
+    assert!(err.contains("cannot register another session"), "{err}");
+
+    // A header that disagrees with the proof is refused outright, so a
+    // session credential can never be widened into another window.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/mcp", h.base))
+        .header("Authorization", format!("Bearer {session_token}"))
+        .header("X-Crew-Session", "someone-elses-window")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("authenticates session 'conv-a'"),
+        "{body}"
+    );
+    // The same header, agreeing, is simply redundant.
+    assert_eq!(
+        mcp_status_with_session(&h.base, &session_token, "conv-a").await,
+        200
+    );
+
+    // Renewal extends without disturbing the connection: same secret, same
+    // epoch, later expiry.
+    let renewed = call(&window, "renew_session", json!({"ttl_seconds": 7200})).await;
+    assert!(
+        renewed["session_token"].is_null(),
+        "renewal returns no secret"
+    );
+    assert_eq!(renewed["epoch"], 1);
+    assert!(renewed["expires_in_seconds"].as_i64().unwrap() > 3600);
+    assert_eq!(call(&window, "whoami", json!({})).await["agent"], "joaquin");
+
+    // The agent token cannot take a live window: holding it is not proof of
+    // being that conversation.
+    let err = call_expect_error(&agent, "register_session", json!({"session": "conv-a"})).await;
+    assert!(err.contains("already registered and still live"), "{err}");
+    assert!(err.contains("resume_session"), "{err}");
+    assert_eq!(
+        call(&window, "whoami", json!({})).await["session_identity"]["epoch"],
+        1,
+        "the refused registration changed nothing"
+    );
+
+    // A resume rotates the secret and bumps the epoch; the old credential is
+    // dead and the old connection is fenced by its stale epoch. The proof is
+    // the session's own credential.
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2);
+    let resumed_token = resumed["session_token"].as_str().unwrap().to_owned();
+    let window_again = connect(&h.base, &resumed_token).await;
+    assert_ne!(resumed_token, session_token);
+    assert_eq!(
+        mcp_status(&h.base, &session_token).await,
+        401,
+        "old secret is dead"
+    );
+    assert_eq!(
+        mcp_status_with_epoch(&h.base, &resumed_token, 1).await,
+        409,
+        "a connection carrying the old epoch is stale"
+    );
+    assert_eq!(mcp_status_with_epoch(&h.base, &resumed_token, 2).await, 200);
+    let _ = window.cancel().await;
+
+    // Fencing is not only a pre-dispatch check. The middleware's check runs
+    // before the handler, so a request that passed it and then waited on a
+    // row lock would otherwise commit into the session that replaced it. The
+    // guard re-checks inside the writing transaction, which is where it has
+    // to be: here it is exercised directly, with the epoch moved after the
+    // transaction opened.
+    use ai_crew_sync::store::sessions;
+    let stale_ctx = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'joaquin'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "joaquin".into(),
+        team_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM teams WHERE slug = 'acme'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        team_slug: "acme".into(),
+        session: "conv-a".into(),
+        session_id: Some(
+            resumed["session_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        ),
+        // The epoch this connection was admitted with.
+        session_epoch: Some(2),
+        token_id: None,
+    };
+    // Same epoch: the write may proceed.
+    let mut tx = h.pool.begin().await.unwrap();
+    sessions::guard(&mut tx, &stale_ctx)
+        .await
+        .expect("current epoch passes");
+    tx.rollback().await.unwrap();
+
+    // Now the window is resumed by its owner, and the connection admitted at
+    // epoch 2 is refused *inside* the transaction rather than committing.
+    let bumped = call(&window_again, "resume_session", json!({})).await;
+    assert_eq!(bumped["epoch"], 3);
+    // The resume rotated the secret again, so later connections use this one.
+    let resumed_token = bumped["session_token"].as_str().unwrap().to_owned();
+    let _ = window_again.cancel().await;
+    let mut tx = h.pool.begin().await.unwrap();
+    let err = sessions::guard(&mut tx, &stale_ctx)
+        .await
+        .expect_err("a replaced connection must not write");
+    let err = err.to_string();
+    assert!(err.contains("stale"), "{err}");
+    assert!(err.contains("Nothing was written"), "{err}");
+    tx.rollback().await.unwrap();
+
+    // And a revoked session is refused the same way, not only at the door.
+    sqlx::query("UPDATE agent_sessions SET revoked_at = now() WHERE label = 'conv-a'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let mut tx = h.pool.begin().await.unwrap();
+    let current = ai_crew_sync::auth::AuthCtx {
+        session_epoch: Some(3),
+        ..stale_ctx.clone()
+    };
+    let err = sessions::guard(&mut tx, &current)
+        .await
+        .expect_err("a revoked session must not write")
+        .to_string();
+    assert!(err.contains("no longer valid"), "{err}");
+    tx.rollback().await.unwrap();
+    sqlx::query("UPDATE agent_sessions SET revoked_at = NULL WHERE label = 'conv-a'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    // Two agents, two sessions of the same label: separate rows, separate
+    // addresses, no collision.
+    let marta = connect(&h.base, &other).await;
+    let hers = call(&marta, "register_session", json!({"session": "conv-a"})).await;
+    assert_eq!(hers["address"], "marta/conv-a");
+    assert_ne!(hers["session_id"], resumed["session_id"]);
+
+    // Revocation: a window can close another window of its own agent, and
+    // never one of somebody else's.
+    let live = connect(&h.base, &resumed_token).await;
+    call(&agent, "register_session", json!({"session": "conv-c"})).await;
+    let gone = call(&live, "revoke_session", json!({"session": "conv-c"})).await;
+    assert_eq!(gone["revoked_session"], "conv-c");
+    let err = call_expect_error(
+        &live,
+        "revoke_session",
+        json!({"session": "conv-a-of-marta"}),
+    )
+    .await;
+    assert!(err.contains("no session"), "{err}");
+    assert_eq!(
+        call(&marta, "whoami", json!({})).await["agent"],
+        "marta",
+        "marta's own session is untouched"
+    );
+
+    // The parent's revocation is the session's revocation: no sweep needed.
+    let (parent_id,): (Uuid,) = sqlx::query_as(
+        "SELECT t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id WHERE a.name = 'joaquin'",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    ai_crew_sync::store::admin::revoke_token(
+        &h.pool,
+        ai_crew_sync::store::admin::Actor::Cli,
+        None,
+        parent_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mcp_status(&h.base, &resumed_token).await,
+        401,
+        "parent revoked"
+    );
+    assert_eq!(mcp_status(&h.base, &token).await, 401);
+    assert_eq!(
+        mcp_status(&h.base, &other).await,
+        200,
+        "another agent is unaffected"
+    );
+
+    // An expired credential says what to do rather than just failing.
+    let fresh = call(&marta, "register_session", json!({"session": "conv-old"})).await;
+    let fresh_token = fresh["session_token"].as_str().unwrap().to_owned();
+    sqlx::query("UPDATE agent_sessions SET expires_at = now() - interval '1 minute' WHERE label = 'conv-old'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/mcp", h.base))
+        .header("Authorization", format!("Bearer {fresh_token}"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("register_session"),
+        "{body}"
+    );
+
+    for c in [agent, live, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// `tools/list` with a bearer and a session header, for status checks.
+async fn mcp_status_with_session(base: &str, token: &str, session: &str) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Crew-Session", session)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// `tools/list` with a bearer and an explicit connection epoch.
+async fn mcp_status_with_epoch(base: &str, token: &str, epoch: i64) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Crew-Epoch", epoch.to_string())
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
 }

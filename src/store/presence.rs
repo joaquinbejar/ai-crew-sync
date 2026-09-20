@@ -122,6 +122,12 @@ pub async fn heartbeat(
         None => None,
     };
 
+    // The epoch is re-checked inside this transaction, so a request that was
+    // already queued when its window was resumed cannot commit into the
+    // session that replaced it.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
+
     // Upsert on (agent_id, session), and report back the row just written.
     // Reading it from list_agents instead would pick whichever session came
     // first alphabetically once an agent has more than one.
@@ -201,8 +207,9 @@ pub async fn heartbeat(
     .bind(ttl as f64)
     .bind(project.as_deref())
     .bind(role.as_deref())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     // Sweep this agent's long-dead rows. Nothing else ever deleted a presence
     // row: before sessions that was bounded at one per agent, but a row per

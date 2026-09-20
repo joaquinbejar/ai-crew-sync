@@ -20,7 +20,7 @@ use sqlx::PgPool;
 use crate::{
     auth::AuthCtx,
     events::EventHub,
-    model::{DigestResult, WhoAmI},
+    model::{DigestResult, SessionCredential, WhoAmI},
     store,
 };
 
@@ -89,7 +89,8 @@ impl Bus {
             + Self::notes_router()
             + Self::locks_router()
             + Self::events_router()
-            + Self::attachments_router();
+            + Self::attachments_router()
+            + Self::sessions_router();
         Self {
             db,
             hub,
@@ -153,6 +154,33 @@ impl Bus {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct RegisterSessionArgs {
+    /// Label for this window — the id your host gives the conversation is
+    /// the right choice, because it is stable across a reconnect and new
+    /// after a fork. It becomes the `agent/session` address teammates use.
+    pub session: String,
+    /// How long the credential authenticates for, in seconds (60 to 86400).
+    /// Defaults to 24 hours.
+    #[serde(default)]
+    pub ttl_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RenewSessionArgs {
+    /// New lifetime in seconds (60 to 86400). Defaults to 24 hours.
+    #[serde(default)]
+    pub ttl_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RevokeSessionArgs {
+    /// Which session of yours to revoke. Omit to revoke the one making the
+    /// call. You can only ever revoke your own agent's sessions.
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DigestArgs {
     /// Window to summarise, in hours (1-336). Defaults to 24.
     #[serde(default)]
@@ -162,6 +190,100 @@ pub struct DigestArgs {
     /// digest already covers the whole team.
     #[serde(default)]
     pub all_channels: bool,
+}
+
+#[tool_router(router = sessions_router, vis = "pub")]
+impl Bus {
+    #[tool(
+        description = "Register this window as an authenticated session and receive a \
+                       credential that PROVES which window it is. Call it once per \
+                       conversation with your agent token, then send the returned \
+                       session_token as the bearer token instead. The label you pass \
+                       becomes your `agent/session` address. A label whose session is \
+                       still live is REFUSED: holding the agent token does not make you \
+                       that window. Reconnecting the same window is resume_session, with \
+                       its own credential; taking back a window that is gone is \
+                       revoke_session first. A session credential cannot register another."
+    )]
+    async fn register_session(
+        &self,
+        ctx: RequestContext<rmcp::RoleServer>,
+        Parameters(args): Parameters<RegisterSessionArgs>,
+    ) -> Result<Json<SessionCredential>, ErrorData> {
+        let auth = auth_of(&ctx)?;
+        // The credential that authenticated this request, by id: the tool
+        // layer never sees the secret it hangs the new session off.
+        let parent = auth.token_id.ok_or_else(|| {
+            ErrorData::invalid_request(
+                "register_session must be called with an agent token. This call used a \
+                 session credential, which cannot register another session — use the agent \
+                 token this window's credential was derived from.",
+                None,
+            )
+        })?;
+        let issued =
+            store::sessions::register(&self.db, &auth, parent, &args.session, args.ttl_seconds)
+                .await?;
+        Ok(Json(store::sessions::credential_of(
+            issued,
+            &auth.agent_name,
+        )))
+    }
+
+    #[tool(
+        description = "Resume the window whose credential made this call: rotate the \
+                       secret and raise the epoch, so the connection being replaced is \
+                       refused at its next request. Identity, address, cursors, claims and \
+                       history are unchanged. Only the holder of the session credential can \
+                       do this — an agent token cannot take over a live window; it can \
+                       revoke_session one that is gone and register a new one."
+    )]
+    async fn resume_session(
+        &self,
+        ctx: RequestContext<rmcp::RoleServer>,
+        Parameters(args): Parameters<RenewSessionArgs>,
+    ) -> Result<Json<SessionCredential>, ErrorData> {
+        let auth = auth_of(&ctx)?;
+        let issued = store::sessions::resume(&self.db, &auth, args.ttl_seconds).await?;
+        Ok(Json(store::sessions::credential_of(
+            issued,
+            &auth.agent_name,
+        )))
+    }
+
+    #[tool(
+        description = "Extend the session credential that made this call, keeping its \
+                       secret and its epoch so the connection is not disturbed. Call it \
+                       well before expires_in_seconds runs out."
+    )]
+    async fn renew_session(
+        &self,
+        ctx: RequestContext<rmcp::RoleServer>,
+        Parameters(args): Parameters<RenewSessionArgs>,
+    ) -> Result<Json<SessionCredential>, ErrorData> {
+        let auth = auth_of(&ctx)?;
+        let issued = store::sessions::renew(&self.db, &auth, args.ttl_seconds).await?;
+        Ok(Json(store::sessions::credential_of(
+            issued,
+            &auth.agent_name,
+        )))
+    }
+
+    #[tool(
+        description = "Revoke a session credential of yours: the one making the call, or \
+                       another of your agent's windows by label (a crashed one, say). The \
+                       credential stops authenticating at once; messages, claims and \
+                       history filed under that session are untouched."
+    )]
+    async fn revoke_session(
+        &self,
+        ctx: RequestContext<rmcp::RoleServer>,
+        Parameters(args): Parameters<RevokeSessionArgs>,
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let auth = auth_of(&ctx)?;
+        let label = store::sessions::revoke(&self.db, &auth, args.session.as_deref()).await?;
+        Ok(Json(serde_json::json!({ "revoked_session": label })))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]

@@ -4,12 +4,65 @@
 # Always exits 0; produces no output when the bus is unreachable.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-[ -n "${BUS_URL:-}" ] && [ -n "${BUS_TOKEN:-}" ] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+
+# Claude Code delivers the hook payload on stdin. Its session_id is this
+# conversation's id, and exporting it as BUS_HOST_SESSION is what makes every
+# hook of this window act on the same bus session as its `mcp proxy` — no
+# shared per-repository file, no "current session" value to race on.
+PAYLOAD="$(cat 2>/dev/null || true)"
+HOST_SESSION="$(PAYLOAD="$PAYLOAD" python3 -c 'import json,os,sys
+try:
+    v = json.loads(os.environ.get("PAYLOAD") or "{}").get("session_id")
+except Exception:
+    v = None
+sys.stdout.write(str(v) if v else "")' 2>/dev/null || true)"
+[ -n "$HOST_SESSION" ] && export BUS_HOST_SESSION="$HOST_SESSION"
+
+# Configured either way: local binary with profiles, or the legacy
+# BUS_URL/BUS_TOKEN pair. Neither present means this repository has no bus.
+if [ -z "${BUS_TOKEN:-}" ] && ! command -v ai-crew-sync >/dev/null 2>&1; then
+    exit 0
+fi
+[ -n "${BUS_TOKEN:-}" ] && [ -z "${BUS_URL:-}" ] && exit 0
+
+# Authenticated mode: this conversation's proxy registered a session, so the
+# helper acts as THAT window with its own credential. It prints the host's
+# JSON or nothing at all; it never falls back to another identity, and the
+# credential never passes through this script.
+if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
+    STATE="$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)"
+    case "$STATE" in
+        *'"authenticated"'*)
+            ai-crew-sync context hook --binding "$HOST_SESSION" --event session_start \
+                --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true
+            exit 0
+            ;;
+        *'"no-credential"'*)
+            # This window WAS authenticated and its state is now unusable.
+            # Falling through would inject a digest read with the parent token
+            # under a guessed label, which is the unproven identity this whole
+            # path exists to avoid. Say so instead, and stay quiet on the bus.
+            printf '%s' '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"[ai-crew-sync] This conversation is bound to a bus session whose credential is gone (the window was closed, or its state file was removed). No bus context was loaded and nothing was published. Restart the conversation, or run `ai-crew-sync context hook --binding <session id> --event status` to see the binding."}}'
+            exit 0
+            ;;
+    esac
+    # "missing" falls through: this conversation never had a proxy, so the
+    # legacy path below is the intended configuration, not a broken one.
+fi
+
+# Identity first: nothing is injected into the conversation until the bus has
+# confirmed who this window is. A digest from a credential that turns out to
+# belong to another agent — or to nobody — is worse than no digest.
+WHO="$("$DIR/bus-call.sh" whoami 2>/dev/null || true)"
+case "$WHO" in
+    *'"agent"'*) ;;
+    *) exit 0 ;;
+esac
 
 # reset: a new session has not done anything yet, so the previous run's
 # activity line must not stand as this one's.
 "$DIR/heartbeat.sh" active reset >/dev/null 2>&1 || true
-command -v python3 >/dev/null 2>&1 || exit 0
 
 # team_digest takes 1-336; anything else (empty, non-numeric, out of range)
 # would build invalid JSON, so fall back to the default rather than send it.
@@ -25,7 +78,6 @@ esac
 SUGGESTED="$(git config --get remote.origin.url 2>/dev/null \
   | sed -e 's#\.git$##' -e 's#.*[:/][^/]*/##')"
 
-WHO="$("$DIR/bus-call.sh" whoami 2>/dev/null || true)"
 DIG="$("$DIR/bus-call.sh" team_digest "{\"hours\":$HOURS}" 2>/dev/null || true)"
 export WHO DIG BUS_DIGEST_HOURS="$HOURS" SUGGESTED BUS_SESSION="${BUS_SESSION:-}"
 
@@ -60,6 +112,19 @@ if who:
             "separate from your other sessions, and teammates can address this "
             f"window directly as '{who.get('agent')}/{session}'."
         )
+        role = who.get("role")
+        project = who.get("project")
+        if role or project:
+            lines.append(
+                f"- This window is labelled project '{project or '-'}', role "
+                f"'{role or '-'}'. Teammates find it with list_sessions."
+            )
+        else:
+            lines.append(
+                "- This window has no project/role label yet: set one so teammates can "
+                "find it with list_sessions (configure_session when connected through "
+                "`ai-crew-sync mcp proxy`, or heartbeat with project and role)."
+            )
     else:
         suggested = (os.environ.get("SUGGESTED") or "").strip()
         hint = f" e.g. export BUS_SESSION={suggested}" if suggested else ""

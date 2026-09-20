@@ -299,6 +299,56 @@ pub async fn admin_credential_revoke(pool: &PgPool, id: Uuid) -> anyhow::Result<
     Ok(())
 }
 
+/// Print the client configuration for the per-conversation stdio proxy.
+///
+/// `format` is `json` (the `.mcp.json` shape most MCP clients use) or `toml`
+/// (Codex's `~/.codex/config.toml`). Neither carries a credential: the proxy
+/// resolves one from the local profiles.
+pub fn print_proxy_config(
+    format: &str,
+    role: Option<&str>,
+    project: Option<&str>,
+    profile: Option<&str>,
+) {
+    let mut args: Vec<String> = vec!["mcp".into(), "proxy".into()];
+    for (flag, value) in [
+        ("--role", role),
+        ("--project", project),
+        ("--profile", profile),
+    ] {
+        if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            args.push(flag.into());
+            args.push(v.into());
+        }
+    }
+    let exe = "ai-crew-sync";
+    match format {
+        "toml" => {
+            println!("# ~/.codex/config.toml (or <repo>/.codex/config.toml in a trusted project)");
+            println!("[mcp_servers.ai-crew-sync]");
+            println!("command = \"{exe}\"");
+            println!(
+                "args = [{}]",
+                args.iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!();
+            println!("# No token here: credentials come from your local profiles");
+            println!("# (`ai-crew-sync context profile add`), never from this file.");
+        }
+        _ => {
+            let cfg = serde_json::json!({
+                "mcpServers": {
+                    "ai-crew-sync": { "command": exe, "args": args }
+                }
+            });
+            println!("{}", serde_json::to_string_pretty(&cfg).unwrap_or_default());
+        }
+    }
+}
+
 /// Print the exact `.mcp.json` block a teammate drops into their repo.
 pub fn print_mcp_config(url: &str, token: &str, session: Option<&str>) {
     let mut headers = serde_json::Map::new();

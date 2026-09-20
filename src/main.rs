@@ -1,4 +1,4 @@
-use ai_crew_sync::{MIGRATOR, admin, admin_cli, client, context, serve, webhooks};
+use ai_crew_sync::{MIGRATOR, admin, admin_cli, client, context, hook, proxy, serve, webhooks};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
@@ -45,10 +45,34 @@ enum Command {
     /// defaults (.acs.toml), so clients need no BUS_TOKEN export.
     #[command(subcommand)]
     Context(ContextCmd),
+    /// Local MCP transports.
+    #[command(subcommand)]
+    Mcp(McpCmd),
     /// Talk to a running bus from the console, as an agent. Everything the MCP
     /// tools can do: send/read messages, claim tasks, notes, presence.
     Client(client::ClientArgs),
-    /// Print a ready-to-paste .mcp.json snippet.
+    /// Print the client configuration for the per-conversation stdio proxy
+    /// (`mcp proxy`). Carries no credential: the proxy resolves one from the
+    /// local profiles.
+    ProxyConfig {
+        /// Output shape: "json" for the .mcp.json most MCP clients use,
+        /// "toml" for Codex's config.toml.
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Role this client's windows start with.
+        #[arg(long)]
+        role: Option<String>,
+        /// Project label, when it should not come from .acs.toml.
+        #[arg(long)]
+        project: Option<String>,
+        /// Profile to connect with, when it should not come from .acs.toml
+        /// or the user default.
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Print a ready-to-paste .mcp.json snippet for a DIRECT connection
+    /// (token in the config). Prefer `proxy-config` for a per-conversation
+    /// session.
     McpConfig {
         /// Public URL of the /mcp endpoint.
         #[arg(long, default_value = "http://localhost:8787/mcp")]
@@ -242,6 +266,27 @@ enum AdminCmd {
     Token(AdminTokenCmd),
 }
 
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Serve MCP over stdio for ONE conversation, forwarding every tool to
+    /// the bus as one agent in one session. Start it from your MCP client's
+    /// config (command: ai-crew-sync, args: [mcp, proxy]); credentials come
+    /// from local profiles, never from the client config.
+    Proxy {
+        #[command(flatten)]
+        select: ContextSelect,
+        /// Initial project label (defaults to the project's .acs.toml).
+        #[arg(long)]
+        project: Option<String>,
+        /// Initial role label: implementation, design, review, …
+        #[arg(long)]
+        role: Option<String>,
+        /// Initial default channel (defaults to the project's .acs.toml).
+        #[arg(long)]
+        channel: Option<String>,
+    },
+}
+
 /// Selection flags shared by the `context` commands: the same inputs the
 /// console client and the proxy resolve with.
 #[derive(Args, Clone)]
@@ -262,6 +307,13 @@ struct ContextSelect {
     /// Session label (BUS_SESSION).
     #[arg(long, env = "BUS_SESSION")]
     session: Option<String>,
+    /// Id of the host conversation (BUS_HOST_SESSION). Every process of one
+    /// conversation — the `mcp proxy` and its lifecycle hooks — derives the
+    /// same bus session from it, so a hook acts on its own window and no
+    /// sibling's. A resumed conversation keeps its session; a fork gets a
+    /// new one.
+    #[arg(long, env = "BUS_HOST_SESSION")]
+    host_session: Option<String>,
 }
 
 impl ContextSelect {
@@ -273,6 +325,7 @@ impl ContextSelect {
             explicit_session: self.session.clone(),
             profile: self.profile.clone(),
             project_dir: self.project_dir.clone(),
+            host_session: self.host_session.clone(),
         })
     }
 }
@@ -317,6 +370,26 @@ enum ContextCmd {
     /// Manage local profiles (~/.config/ai-crew-sync/profiles.toml).
     #[command(subcommand)]
     Profile(ContextProfileCmd),
+    /// Run one lifecycle hook as the window bound to a host conversation.
+    /// This is what authenticated hooks call: it reads the private binding
+    /// its `mcp proxy` wrote and never prints a credential. A conversation
+    /// with no binding produces no output at all, rather than acting as
+    /// another window.
+    Hook {
+        /// Id of the host conversation, from the hook payload's session_id.
+        #[arg(long)]
+        binding: String,
+        /// session_start | heartbeat | stop | session_end | status
+        #[arg(long)]
+        event: String,
+        /// Working directory the presence line describes; the current
+        /// directory by default.
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        /// Hours of team activity to summarise on session_start.
+        #[arg(long, env = "BUS_DIGEST_HOURS", default_value_t = 8)]
+        digest_hours: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -470,14 +543,20 @@ fn split_csv(s: &str) -> Vec<String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ai_crew_sync=info,tower_http=info,warn".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // The stdio proxy owns stdout for MCP framing; its logs go to stderr.
+    // Everything else keeps logging to stdout as before.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "ai_crew_sync=info,tower_http=info,warn".into());
+    if matches!(cli.command, Command::Mcp(_)) {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     // Commands that talk to the bus over HTTP (or to nothing at all) do not
     // need a database connection.
@@ -490,9 +569,45 @@ async fn main() -> anyhow::Result<()> {
             admin::print_mcp_config(&url, &token, session.as_deref());
             return Ok(());
         }
+        Command::ProxyConfig {
+            format,
+            role,
+            project,
+            profile,
+        } => {
+            admin::print_proxy_config(
+                &format,
+                role.as_deref(),
+                project.as_deref(),
+                profile.as_deref(),
+            );
+            return Ok(());
+        }
         Command::Client(args) => return client::run(args).await,
         Command::Admin(cmd) if !admin_needs_database(&cmd) => return run_admin_remote(cmd).await,
         Command::Context(cmd) => return run_context(cmd).await,
+        Command::Mcp(McpCmd::Proxy {
+            select,
+            project,
+            role,
+            channel,
+        }) => {
+            let mut inputs = select.inputs()?;
+            let host_session = inputs.host_session.clone();
+            // The proxy binds the conversation itself (it also accepts the
+            // host's own variables), so the resolver must not pre-empt it.
+            inputs.host_session = None;
+            let state_dir = inputs.config_dir.clone();
+            return proxy::run(proxy::ProxyOptions {
+                inputs,
+                project,
+                role,
+                channel,
+                host_session,
+                state_dir,
+            })
+            .await;
+        }
         _ => {}
     }
 
@@ -518,9 +633,11 @@ async fn main() -> anyhow::Result<()> {
 async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
     match command {
         // `main` routes these before opening a pool; they cannot arrive here.
-        Command::McpConfig { .. } | Command::Client(_) | Command::Context(_) => {
-            unreachable!("handled in main")
-        }
+        Command::McpConfig { .. }
+        | Command::ProxyConfig { .. }
+        | Command::Client(_)
+        | Command::Context(_)
+        | Command::Mcp(_) => unreachable!("handled in main"),
 
         Command::Migrate => {
             MIGRATOR.run(&pool).await?;
@@ -997,6 +1114,26 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                 cfg.profile.as_deref().unwrap_or_default(),
                 cfg.project.as_deref().unwrap_or("-")
             );
+        }
+        ContextCmd::Hook {
+            binding,
+            event,
+            cwd,
+            digest_hours,
+        } => {
+            let event: hook::Event = event.parse()?;
+            let cwd = match cwd {
+                Some(d) => d,
+                None => std::env::current_dir()?,
+            };
+            let hours = digest_hours.clamp(1, 336);
+            match hook::run(&context::config_dir()?, &binding, event, &cwd, hours).await {
+                Ok(Some(out)) => println!("{out}"),
+                Ok(None) => {}
+                // A hook must never break the host's session: report the
+                // reason on stderr, where the user can find it, and exit 0.
+                Err(e) => eprintln!("ai-crew-sync hook {event:?}: {e:#}"),
+            }
         }
         ContextCmd::Profile(cmd) => {
             let cfg_dir = context::config_dir()?;
