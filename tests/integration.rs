@@ -5712,12 +5712,40 @@ async fn proxy_switches_profiles_only_after_verification_and_never_across_teams(
 /// repository as cwd, and only the environment a hook actually gets. No
 /// BUS_TOKEN, no BUS_SESSION — everything is resolved from the profiles and
 /// the conversation id in the payload.
-fn run_hook(
+async fn run_hook(
     script: &str,
     config_dir: &std::path::Path,
     project_dir: &std::path::Path,
     payload: &str,
     extra_args: &[&str],
+) -> String {
+    // The hook talks HTTP to the harness, which runs on this runtime: waiting
+    // for the child on this thread deadlocks both. Off to a blocking thread,
+    // with a bound so a wedged hook fails the test instead of hanging CI.
+    let (script, config_dir, project_dir, payload) = (
+        script.to_owned(),
+        config_dir.to_path_buf(),
+        project_dir.to_path_buf(),
+        payload.to_owned(),
+    );
+    let extra: Vec<String> = extra_args.iter().map(|a| (*a).to_owned()).collect();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            run_hook_blocking(&script, &config_dir, &project_dir, &payload, &extra)
+        }),
+    )
+    .await
+    .expect("the hook did not finish within 30s")
+    .expect("the hook task panicked")
+}
+
+fn run_hook_blocking(
+    script: &str,
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    payload: &str,
+    extra_args: &[String],
 ) -> String {
     use std::io::Write;
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5734,7 +5762,7 @@ fn run_hook(
     );
     let mut child = std::process::Command::new("sh")
         .arg(&script)
-        .args(extra_args)
+        .args(extra_args.iter().map(String::as_str))
         .current_dir(project_dir)
         .env_clear()
         .env("PATH", path)
@@ -5871,7 +5899,7 @@ async fn five_conversations_share_a_repo_and_stay_separate() {
     // A hook of the implementation conversation acts on THAT window: the
     // same conversation id resolves to the same session, so a heartbeat from
     // the hook updates this window's presence and nobody else's.
-    run_hook("heartbeat.sh", &dir, &repo, "", &["busy"]);
+    run_hook("heartbeat.sh", &dir, &repo, "", &["busy"]).await;
     let after = call(
         design,
         "list_sessions",
@@ -5888,7 +5916,8 @@ async fn five_conversations_share_a_repo_and_stay_separate() {
         &repo,
         &json!({"session_id": "conv-design", "cwd": repo.display().to_string()}).to_string(),
         &[],
-    );
+    )
+    .await;
     let injected: Value = serde_json::from_str(out.trim()).expect("hook emitted JSON");
     let context = injected["hookSpecificOutput"]["additionalContext"]
         .as_str()
@@ -5915,7 +5944,8 @@ async fn five_conversations_share_a_repo_and_stay_separate() {
         &repo,
         &json!({"session_id": "conv-nowhere"}).to_string(),
         &[],
-    );
+    )
+    .await;
     assert!(out.trim().is_empty(), "unconfigured session start: {out}");
 
     // Ending one window leaves the others alone: no idled presence, no
@@ -6031,11 +6061,24 @@ async fn session_credentials_prove_a_window_and_die_with_their_parent() {
     assert!(renewed["expires_in_seconds"].as_i64().unwrap() > 3600);
     assert_eq!(call(&window, "whoami", json!({})).await["agent"], "joaquin");
 
+    // The agent token cannot take a live window: holding it is not proof of
+    // being that conversation.
+    let err = call_expect_error(&agent, "register_session", json!({"session": "conv-a"})).await;
+    assert!(err.contains("already registered and still live"), "{err}");
+    assert!(err.contains("resume_session"), "{err}");
+    assert_eq!(
+        call(&window, "whoami", json!({})).await["session_identity"]["epoch"],
+        1,
+        "the refused registration changed nothing"
+    );
+
     // A resume rotates the secret and bumps the epoch; the old credential is
-    // dead and the old connection is fenced by its stale epoch.
-    let resumed = call(&agent, "register_session", json!({"session": "conv-a"})).await;
+    // dead and the old connection is fenced by its stale epoch. The proof is
+    // the session's own credential.
+    let resumed = call(&window, "resume_session", json!({})).await;
     assert_eq!(resumed["epoch"], 2);
     let resumed_token = resumed["session_token"].as_str().unwrap().to_owned();
+    let window_again = connect(&h.base, &resumed_token).await;
     assert_ne!(resumed_token, session_token);
     assert_eq!(
         mcp_status(&h.base, &session_token).await,
@@ -6049,6 +6092,80 @@ async fn session_credentials_prove_a_window_and_die_with_their_parent() {
     );
     assert_eq!(mcp_status_with_epoch(&h.base, &resumed_token, 2).await, 200);
     let _ = window.cancel().await;
+
+    // Fencing is not only a pre-dispatch check. The middleware's check runs
+    // before the handler, so a request that passed it and then waited on a
+    // row lock would otherwise commit into the session that replaced it. The
+    // guard re-checks inside the writing transaction, which is where it has
+    // to be: here it is exercised directly, with the epoch moved after the
+    // transaction opened.
+    use ai_crew_sync::store::sessions;
+    let stale_ctx = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'joaquin'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "joaquin".into(),
+        team_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM teams WHERE slug = 'acme'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        team_slug: "acme".into(),
+        session: "conv-a".into(),
+        session_id: Some(
+            resumed["session_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        ),
+        // The epoch this connection was admitted with.
+        session_epoch: Some(2),
+        token_id: None,
+    };
+    // Same epoch: the write may proceed.
+    let mut tx = h.pool.begin().await.unwrap();
+    sessions::guard(&mut tx, &stale_ctx)
+        .await
+        .expect("current epoch passes");
+    tx.rollback().await.unwrap();
+
+    // Now the window is resumed by its owner, and the connection admitted at
+    // epoch 2 is refused *inside* the transaction rather than committing.
+    let bumped = call(&window_again, "resume_session", json!({})).await;
+    assert_eq!(bumped["epoch"], 3);
+    // The resume rotated the secret again, so later connections use this one.
+    let resumed_token = bumped["session_token"].as_str().unwrap().to_owned();
+    let _ = window_again.cancel().await;
+    let mut tx = h.pool.begin().await.unwrap();
+    let err = sessions::guard(&mut tx, &stale_ctx)
+        .await
+        .expect_err("a replaced connection must not write");
+    let err = err.to_string();
+    assert!(err.contains("stale"), "{err}");
+    assert!(err.contains("Nothing was written"), "{err}");
+    tx.rollback().await.unwrap();
+
+    // And a revoked session is refused the same way, not only at the door.
+    sqlx::query("UPDATE agent_sessions SET revoked_at = now() WHERE label = 'conv-a'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let mut tx = h.pool.begin().await.unwrap();
+    let current = ai_crew_sync::auth::AuthCtx {
+        session_epoch: Some(3),
+        ..stale_ctx.clone()
+    };
+    let err = sessions::guard(&mut tx, &current)
+        .await
+        .expect_err("a revoked session must not write")
+        .to_string();
+    assert!(err.contains("no longer valid"), "{err}");
+    tx.rollback().await.unwrap();
+    sqlx::query("UPDATE agent_sessions SET revoked_at = NULL WHERE label = 'conv-a'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
 
     // Two agents, two sessions of the same label: separate rows, separate
     // addresses, no collision.

@@ -368,10 +368,24 @@ async fn resolve_session_token(pool: &PgPool, raw: &str) -> Result<AuthCtx, Auth
         return Err(AuthError::SessionExpired);
     }
 
-    let _ = sqlx::query("UPDATE agent_sessions SET last_used_at = now() WHERE id = $1")
-        .bind(session_id)
-        .execute(pool)
-        .await;
+    // Usage bookkeeping must never queue behind a write in flight. A guarded
+    // mutation holds a share lock on this row for its whole transaction, so a
+    // plain UPDATE here would make every concurrent request of the same
+    // window wait for it. SKIP LOCKED steps aside instead, and the one-minute
+    // floor means a busy window writes this once a minute rather than once a
+    // call. Best-effort either way: it is a timestamp, not the request.
+    let _ = sqlx::query(
+        "UPDATE agent_sessions SET last_used_at = now()
+          WHERE id IN (
+              SELECT id FROM agent_sessions
+               WHERE id = $1
+                 AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')
+               FOR UPDATE SKIP LOCKED
+          )",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await;
 
     Ok(AuthCtx {
         agent_id,

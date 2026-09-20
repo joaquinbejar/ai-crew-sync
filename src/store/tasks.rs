@@ -379,6 +379,11 @@ pub async fn claim_task(
         .unwrap_or(DEFAULT_LEASE_SECS)
         .clamp(30, MAX_LEASE_SECS);
 
+    // Serialised with the mutation: a request already queued when its window
+    // was resumed must not commit into the session that replaced it.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
+
     let updated: Option<(Uuid,)> = sqlx::query_as(
         r#"
         UPDATE tasks
@@ -413,8 +418,9 @@ pub async fn claim_task(
     .bind(auth.team_id)
     .bind(&key)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     match updated {
         Some((id,)) => {

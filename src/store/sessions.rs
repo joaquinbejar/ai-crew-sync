@@ -38,12 +38,19 @@ fn ttl_of(requested: Option<i64>) -> i64 {
         .clamp(60, MAX_SESSION_TTL_SECS)
 }
 
-/// Register a session for `label`, or resume the one that exists.
+/// Register a session for `label`.
 ///
 /// Must be called with an **agent token**: a session credential cannot mint
 /// another, which is what keeps a leaked window credential from becoming a
-/// family of them. Resuming rotates the secret and bumps the epoch, so the
-/// process that was replaced is fenced off at its next request.
+/// family of them.
+///
+/// A label that already has a live session is **refused**. Holding the agent
+/// token is not proof of being that window: allowing a silent replacement
+/// would let any holder of the token — or a second token of the same agent —
+/// take over a running conversation, inherit its cursors and claims, and cut
+/// the real window off. Resuming is [`resume`], which requires the session's
+/// own credential; taking a dead window back is an explicit `revoke_session`
+/// first, which is the owner's audited recovery path.
 pub async fn register(
     pool: &PgPool,
     auth: &AuthCtx,
@@ -70,10 +77,10 @@ pub async fn register(
     let raw = generate_session_token();
     let prefix = token_prefix(&raw);
 
-    // One row per (agent, label). A repeat is a resume: new secret, higher
-    // epoch, fresh expiry — the window keeps its identity and its history,
-    // and whoever held the previous secret is fenced.
-    let row: (Uuid, i64, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+    // One row per (agent, label), and the row is only *taken over* when the
+    // one there is dead: revoked, or past its expiry. A live one belongs to
+    // a window that can still speak for itself.
+    let row: Option<(Uuid, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         r#"
         INSERT INTO agent_sessions
             (agent_id, parent_token, label, token_hash, prefix, expires_at)
@@ -86,6 +93,8 @@ pub async fn register(
             expires_at   = EXCLUDED.expires_at,
             revoked_at   = NULL,
             last_used_at = NULL
+        WHERE agent_sessions.revoked_at IS NOT NULL
+           OR agent_sessions.expires_at <= now()
         RETURNING id, epoch, expires_at
         "#,
     )
@@ -95,15 +104,70 @@ pub async fn register(
     .bind(hash_token(&raw))
     .bind(&prefix)
     .bind(ttl as f64)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
 
+    let Some((id, epoch, expires_at)) = row else {
+        return Err(BusError::conflict(format!(
+            "session '{label}' is already registered and still live. Holding the agent \
+             token does not make you that window: reconnect it with resume_session, using \
+             the session credential the process that owns it holds, or close it first \
+             with revoke_session if it is gone for good."
+        )));
+    };
+
     Ok(Issued {
-        id: row.0,
+        id,
         token: raw,
         label,
-        epoch: row.1,
-        expires_at: row.2,
+        epoch,
+        expires_at,
+    })
+}
+
+/// Resume the caller's own session: rotate the secret and bump the epoch, so
+/// the connection this one replaces is fenced at its next request. The proof
+/// is the credential itself, which is why this is not something the agent
+/// token can do.
+pub async fn resume(pool: &PgPool, auth: &AuthCtx, ttl_seconds: Option<i64>) -> BusResult<Issued> {
+    let Some(session_id) = auth.session_id else {
+        return Err(BusError::Forbidden(
+            "resume_session needs the session credential of the window being resumed. \
+             With an agent token, register_session opens a new window and refuses a live \
+             one."
+                .to_owned(),
+        ));
+    };
+    let ttl = ttl_of(ttl_seconds);
+    let raw = generate_session_token();
+    let prefix = token_prefix(&raw);
+    let row: Option<(i64, chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as(
+        "UPDATE agent_sessions
+            SET token_hash = $2,
+                prefix     = $3,
+                epoch      = epoch + 1,
+                expires_at = now() + make_interval(secs => $4),
+                last_used_at = NULL
+          WHERE id = $1 AND revoked_at IS NULL
+          RETURNING epoch, expires_at, label",
+    )
+    .bind(session_id)
+    .bind(hash_token(&raw))
+    .bind(&prefix)
+    .bind(ttl as f64)
+    .fetch_optional(pool)
+    .await?;
+    let Some((epoch, expires_at, label)) = row else {
+        return Err(BusError::not_found(
+            "this session has been revoked; register a new one with your agent token",
+        ));
+    };
+    Ok(Issued {
+        id: session_id,
+        token: raw,
+        label,
+        epoch,
+        expires_at,
     })
 }
 
@@ -187,6 +251,53 @@ pub async fn revoke(pool: &PgPool, auth: &AuthCtx, label: Option<&str>) -> BusRe
         }
     }
     Ok(target)
+}
+
+/// Re-check, **inside the caller's transaction**, that this connection may
+/// still write.
+///
+/// The middleware's check happens before dispatch, which is not the same
+/// thing: a request that was already waiting on a row lock when its window
+/// was resumed would wake up and commit into the session that replaced it.
+/// Running the check in the same transaction as the mutation serialises the
+/// two — the resume either happens before this SELECT, and the write is
+/// refused, or after the COMMIT, and the write was legitimate.
+///
+/// A caller holding a plain agent token has no epoch to fence and passes
+/// through untouched; its label was never a claim of exclusivity.
+pub async fn guard(tx: &mut sqlx::PgConnection, auth: &AuthCtx) -> BusResult<()> {
+    let (Some(session_id), Some(epoch)) = (auth.session_id, auth.session_epoch) else {
+        return Ok(());
+    };
+    // FOR SHARE: concurrent writers of the same session may proceed
+    // together, and a resume (which updates the row) waits for them.
+    let row: Option<(i64, bool, bool)> = sqlx::query_as(
+        "SELECT epoch, (revoked_at IS NOT NULL), (expires_at <= now())
+           FROM agent_sessions WHERE id = $1 FOR SHARE",
+    )
+    .bind(session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((current, revoked, expired)) = row else {
+        return Err(BusError::Unauthenticated(
+            "this session no longer exists; register a new one with your agent token".to_owned(),
+        ));
+    };
+    if revoked || expired {
+        return Err(BusError::Unauthenticated(
+            "this session credential is no longer valid; register a new one with your agent \
+             token"
+                .to_owned(),
+        ));
+    }
+    if current != epoch {
+        return Err(BusError::conflict(format!(
+            "this connection is stale: it carries epoch {epoch} and the session is at \
+             {current}, so another process resumed this window after you. Nothing was \
+             written. Resume the session to take over, or exit."
+        )));
+    }
+    Ok(())
 }
 
 /// The identity a session credential proves, for `whoami`.

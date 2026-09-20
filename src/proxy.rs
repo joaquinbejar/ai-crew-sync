@@ -345,9 +345,73 @@ async fn call_remote(remote: &Remote, name: &str, args: Value) -> anyhow::Result
 }
 
 /// Resolve, connect with the session header, and verify who the token is.
+/// Register this window for the first time. A server too old to know the
+/// tool keeps the label-only connection it has always served; any other
+/// failure is fatal, because continuing would forward with the parent token
+/// under an asserted label while reporting a proven identity.
+async fn register_new(remote: &Remote, session: &str) -> anyhow::Result<Option<SessionProof>> {
+    match call_remote(remote, "register_session", json!({ "session": session })).await {
+        Ok(v) => match v["session_token"].as_str() {
+            Some(token) => Ok(Some(SessionProof {
+                token: token.to_owned(),
+                session_id: v["session_id"].as_str().unwrap_or_default().to_owned(),
+                epoch: v["epoch"].as_i64().unwrap_or(1),
+                expires_at: v["expires_at"].as_str().unwrap_or_default().to_owned(),
+            })),
+            None => anyhow::bail!(
+                "the bus accepted register_session but returned no credential; refusing to \
+                 continue with an asserted label while reporting a proven identity"
+            ),
+        },
+        Err(e) => {
+            let text = e.to_string();
+            // Only "this server has no such tool" is a legacy bus. A refusal,
+            // a database error or a dropped connection is not, and failing
+            // closed is the point.
+            if text.contains("not found") || text.contains("-32601") || text.contains("Method") {
+                tracing::warn!(
+                    "this bus does not issue session credentials; continuing with the label only"
+                );
+                Ok(None)
+            } else {
+                Err(anyhow::anyhow!(
+                    "could not register this window's session: {text}"
+                ))
+            }
+        }
+    }
+}
+
+/// Reconnect a window we already hold a credential for. Its own credential
+/// is the proof, so no agent token is involved; a rejected resume means the
+/// window was revoked or expired and the caller must register afresh.
+async fn resume_with(
+    url: &str,
+    prior: &SessionProof,
+    session: &str,
+) -> anyhow::Result<Option<SessionProof>> {
+    let remote = connect_remote(url, &prior.token, session, Some(prior.epoch))
+        .await
+        .context("the stored session credential could not open a connection")?;
+    let outcome = call_remote(&remote, "resume_session", json!({})).await;
+    let _ = remote.cancel().await;
+    let v =
+        outcome.context("this window's session could not be resumed; it may have been revoked")?;
+    let token = v["session_token"]
+        .as_str()
+        .context("resume_session returned no credential")?;
+    Ok(Some(SessionProof {
+        token: token.to_owned(),
+        session_id: v["session_id"].as_str().unwrap_or_default().to_owned(),
+        epoch: v["epoch"].as_i64().unwrap_or(1),
+        expires_at: v["expires_at"].as_str().unwrap_or_default().to_owned(),
+    }))
+}
+
 async fn establish(
     inputs: &Inputs,
     session: &str,
+    existing_proof: Option<SessionProof>,
 ) -> anyhow::Result<(
     Resolved,
     String,
@@ -377,25 +441,15 @@ async fn establish(
         );
     }
 
-    // Then upgrade: register this window and keep talking with a credential
-    // that *proves* which window it is. A server too old to know the tool
-    // simply keeps the label-only connection, which is what it has always
-    // served.
-    let proof = match call_remote(&remote, "register_session", json!({ "session": session })).await
-    {
-        Ok(v) => v["session_token"].as_str().map(|token| SessionProof {
-            token: token.to_owned(),
-            session_id: v["session_id"].as_str().unwrap_or_default().to_owned(),
-            epoch: v["epoch"].as_i64().unwrap_or(1),
-            expires_at: v["expires_at"].as_str().unwrap_or_default().to_owned(),
-        }),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "this bus does not issue session credentials; continuing with the label only"
-            );
-            None
-        }
+    // Then upgrade: talk with a credential that *proves* which window this
+    // is. Reconnecting an existing window resumes it with the credential
+    // already on disk — the bus refuses to hand a live window to whoever
+    // holds the agent token — and a window with no stored credential
+    // registers a new one.
+    let stored = existing_proof;
+    let proof = match &stored {
+        Some(prior) => resume_with(&resolved.mcp_url, prior, session).await?,
+        None => register_new(&remote, session).await?,
     };
 
     let (remote, tools, instructions) = match &proof {
@@ -501,7 +555,7 @@ impl Proxy {
             project_dir,
         };
         let inputs = proxy.opts.inputs.clone();
-        if let Err(e) = proxy.connect_with(&inputs).await {
+        if let Err(e) = proxy.connect_with(&inputs, true).await {
             tracing::warn!(error = %e, "proxy started without a bus connection");
             proxy.state.write().await.disconnected_reason = Some(format!("{e:#}"));
         }
@@ -510,11 +564,43 @@ impl Proxy {
 
     /// Connect a context and make it current. Verifies before it touches
     /// state; on failure the previous context, if any, stays.
-    async fn connect_with(&self, inputs: &Inputs) -> anyhow::Result<Option<PreviousIdentity>> {
+    /// `reuse_proof` is true when this is the *same* window reconnecting, so
+    /// the credential on disk is its own and a resume is right. A profile
+    /// switch passes false: that credential belongs to the identity being
+    /// left behind, and resuming it would keep speaking as them.
+    async fn connect_with(
+        &self,
+        inputs: &Inputs,
+        reuse_proof: bool,
+    ) -> anyhow::Result<Option<PreviousIdentity>> {
         let _guard = self.switch.lock().await;
-        let session = self.state.read().await.session.clone();
+        let (session, binding_key) = {
+            let st = self.state.read().await;
+            (
+                st.session.clone(),
+                st.host_id.clone().unwrap_or_else(|| st.session.clone()),
+            )
+        };
+        // A credential already on disk for this conversation means this is a
+        // reconnect: resume that window with its own proof rather than
+        // asking the bus to hand it over. Only when the identity is
+        // unchanged — see `reuse_proof`.
+        let existing = reuse_proof
+            .then(|| context::read_binding(&self.opts.state_dir, &binding_key))
+            .flatten()
+            .and_then(|b| match (b.session_token, b.session_id, b.epoch) {
+                (Some(token), Some(session_id), Some(epoch)) if !token.is_empty() => {
+                    Some(SessionProof {
+                        token,
+                        session_id,
+                        epoch,
+                        expires_at: b.expires_at.unwrap_or_default(),
+                    })
+                }
+                _ => None,
+            });
         let (resolved, agent, team, remote, tools, instructions, proof) =
-            establish(inputs, &session).await?;
+            establish(inputs, &session, existing).await?;
 
         // A team switch would let one conversation carry another team's
         // transcript into this one. The credential was verified and is
@@ -566,8 +652,21 @@ impl Proxy {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                     let held = report_holdings(&old.remote, &old.agent, &old.team, &session).await;
-                    // The old identity goes quiet in its own name; its
-                    // claims and locks are left to their leases.
+                    // This window is no longer that identity, so its session
+                    // is closed rather than left live for nobody: a session
+                    // with no process behind it blocks its own label and
+                    // keeps a credential valid for a day. Claims and locks
+                    // are NOT transferred — they stay with the old identity
+                    // and expire on their leases, which is what `held`
+                    // reports back to the caller.
+                    if old.proof.is_some() {
+                        let _ = tokio::time::timeout(
+                            EXIT_TIMEOUT,
+                            call_remote(&old.remote, "revoke_session", json!({})),
+                        )
+                        .await;
+                    }
+                    // The old identity goes quiet in its own name.
                     let _ = tokio::time::timeout(
                         EXIT_TIMEOUT,
                         call_remote(
@@ -718,7 +817,7 @@ impl Proxy {
             // the environment would otherwise win and make the call a no-op.
             inputs.explicit_token = None;
             inputs.explicit_url = None;
-            previous = self.connect_with(&inputs).await?;
+            previous = self.connect_with(&inputs, false).await?;
         } else {
             self.heartbeat("active").await;
             self.write_binding().await;
@@ -785,7 +884,7 @@ impl Proxy {
                 None => self.opts.inputs.clone(),
             }
         };
-        match self.connect_with(&inputs).await {
+        match self.connect_with(&inputs, true).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 self.state.write().await.disconnected_reason = Some(format!("{e:#}"));
@@ -957,36 +1056,58 @@ impl Proxy {
             .await;
             close_remote(remote).await;
         }
-        // The window is closing, so its credential should stop working —
-        // but the binding file stays: a resume of the same conversation
-        // registers again under the same label and keeps its history.
-        self.forget_credential().await;
+        // The credential stays on disk so a restart of this conversation can
+        // resume the window; the record is only stamped as closed, and only
+        // if it still describes this instance.
+        self.mark_closed().await;
     }
 
-    /// Strip the secret from the binding record, leaving the labels a hook
-    /// can still read. A closed window must not leave a usable credential on
-    /// disk for the next process that guesses the path.
-    async fn forget_credential(&self) {
-        let (key, path) = {
+    /// Mark this window closed, **only if the record still describes this
+    /// instance**.
+    ///
+    /// Two things were wrong with clearing it unconditionally. A successor
+    /// proxy for the same conversation may already have replaced the record,
+    /// and wiping it would cut the live window's hooks off from their own
+    /// credential. And the credential itself has to stay: a restart of this
+    /// conversation resumes with it, which is the only way back in — the bus
+    /// refuses to hand a live session to whoever holds the agent token, and
+    /// rightly so. It is a 0600 file scoped to one window and it expires on
+    /// its own.
+    async fn mark_closed(&self) {
+        let (key, mine) = {
             let st = self.state.read().await;
             let key = st.host_id.clone().unwrap_or_else(|| st.session.clone());
-            (
-                key.clone(),
-                context::binding_path(&self.opts.state_dir, &key),
-            )
+            let mine = st
+                .connected
+                .as_ref()
+                .and_then(|c| c.proof.as_ref().map(|p| (p.session_id.clone(), p.epoch)));
+            (key, mine)
         };
+        let path = context::binding_path(&self.opts.state_dir, &key);
         let Ok(text) = std::fs::read_to_string(&path) else {
             return;
         };
         let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
             return;
         };
+        // Ownership check: a record whose session or epoch has moved on
+        // belongs to the instance that replaced us.
+        if let Some((session_id, epoch)) = mine {
+            let same = value["session_id"].as_str() == Some(session_id.as_str())
+                && value["epoch"].as_i64() == Some(epoch);
+            if !same {
+                tracing::debug!(
+                    binding = %key,
+                    "another instance owns this binding now; leaving it alone"
+                );
+                return;
+            }
+        }
         if let Some(map) = value.as_object_mut() {
-            map.remove("session_token");
             map.insert("closed_at".into(), json!(chrono::Utc::now().to_rfc3339()));
         }
         if let Err(e) = context::write_binding_file(&path, &value.to_string()) {
-            tracing::warn!(error = %e, binding = %key, "could not clear the stored credential");
+            tracing::warn!(error = %e, binding = %key, "could not mark the binding closed");
         }
     }
 }

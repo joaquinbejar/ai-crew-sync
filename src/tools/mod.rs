@@ -199,10 +199,11 @@ impl Bus {
                        credential that PROVES which window it is. Call it once per \
                        conversation with your agent token, then send the returned \
                        session_token as the bearer token instead. The label you pass \
-                       becomes your `agent/session` address. Registering the same label \
-                       again resumes that session: new secret, higher epoch, same identity \
-                       and history — the process it replaces is fenced off. A session \
-                       credential cannot register another."
+                       becomes your `agent/session` address. A label whose session is \
+                       still live is REFUSED: holding the agent token does not make you \
+                       that window. Reconnecting the same window is resume_session, with \
+                       its own credential; taking back a window that is gone is \
+                       revoke_session first. A session credential cannot register another."
     )]
     async fn register_session(
         &self,
@@ -223,6 +224,27 @@ impl Bus {
         let issued =
             store::sessions::register(&self.db, &auth, parent, &args.session, args.ttl_seconds)
                 .await?;
+        Ok(Json(store::sessions::credential_of(
+            issued,
+            &auth.agent_name,
+        )))
+    }
+
+    #[tool(
+        description = "Resume the window whose credential made this call: rotate the \
+                       secret and raise the epoch, so the connection being replaced is \
+                       refused at its next request. Identity, address, cursors, claims and \
+                       history are unchanged. Only the holder of the session credential can \
+                       do this — an agent token cannot take over a live window; it can \
+                       revoke_session one that is gone and register a new one."
+    )]
+    async fn resume_session(
+        &self,
+        ctx: RequestContext<rmcp::RoleServer>,
+        Parameters(args): Parameters<RenewSessionArgs>,
+    ) -> Result<Json<SessionCredential>, ErrorData> {
+        let auth = auth_of(&ctx)?;
+        let issued = store::sessions::resume(&self.db, &auth, args.ttl_seconds).await?;
         Ok(Json(store::sessions::credential_of(
             issued,
             &auth.agent_name,

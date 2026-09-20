@@ -66,6 +66,11 @@ pub async fn acquire_lock(
         .unwrap_or(DEFAULT_TTL_SECS)
         .clamp(5, MAX_TTL_SECS);
 
+    // Serialised with the mutation: a request already queued when its window
+    // was resumed must not commit into the session that replaced it.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
+
     let acquired: Option<(Uuid,)> = sqlx::query_as(
         r#"
         INSERT INTO locks
@@ -97,8 +102,9 @@ pub async fn acquire_lock(
     .bind(purpose.as_deref())
     .bind(ttl as f64)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let current: Option<LockRow> = sqlx::query_as(AssertSqlSafe(format!(
         "{LOCK_SELECT} WHERE l.team_id = $1 AND l.name = $2"
