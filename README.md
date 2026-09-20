@@ -57,6 +57,7 @@ Each agent — yours, each teammate's — connects with its own token and can:
 | **Attachments**: diffs, logs, small files (≤256 KiB) on messages and tasks | `attach_file`, `get_attachment` (+ `attachments` in `post_message`) |
 | **Generic locks** with TTL over resources ("deploy:staging") | `acquire_lock`, `release_lock`, `list_locks` |
 | Presence (who is on which repo/branch doing what), with each teammate's open sessions under their name; session discovery by project and role | `heartbeat`, `list_agents`, `list_sessions` |
+| Authenticated windows: a credential that proves which window is calling, derived from your agent token | `register_session`, `renew_session`, `revoke_session` |
 | Shared team memory (notes with history) | `set_note`, `get_note`, `list_notes`, `search_notes`, `delete_note` |
 | **Activity digest** of the last N hours | `team_digest` |
 | **Sessions**: one token, one working context per repository | `X-Crew-Session` header (see below) |
@@ -380,6 +381,49 @@ select profiles independently (`--profile`), sharing nothing mutable. Writes to
 the profile store are serialised through a lock and land atomically with mode
 `0600`.
 
+### Authenticated sessions: proving which window you are
+
+`X-Crew-Session` is a label the caller chooses. It is enough to keep one
+person's windows from overwriting each other's presence and claims, and it is
+not proof of anything: whoever holds the agent token can send any label.
+
+`register_session` turns a window into something it can prove. Present your
+agent token once per conversation, and the bus returns a credential derived
+from it:
+
+```
+register_session {"session": "conv-7f2a"}
+→ {"session_token": "acss_…", "session_id": "…", "session": "conv-7f2a",
+   "address": "joaquin/conv-7f2a", "epoch": 1,
+   "expires_at": "…", "expires_in_seconds": 86400}
+```
+
+Send that as the bearer token from then on. It authenticates as your agent, in
+that one session, and:
+
+- **derives everything from the parent.** Agent and team come from the token
+  that registered it, so a client cannot assert either;
+- **mints nothing.** Not an agent token, not an administrative credential, not
+  another session;
+- **expires on its own** (24 hours by default, `ttl_seconds` for less) and
+  **dies with its parent**: revoke the token or disable the agent and every
+  session under it stops authenticating, with no sweep to wait for;
+- **refuses a contradicting header.** A request whose `X-Crew-Session` names a
+  different window is rejected, so a proven session can never be widened into
+  somebody else's;
+- **fences what it replaces.** Registering the same label again is a *resume*:
+  new secret, `epoch` bumped, identity and history unchanged. Send the epoch
+  as `X-Crew-Epoch` and a process that was resumed away is told so
+  (`409`) instead of writing as the window that replaced it.
+
+`renew_session` extends the credential you already hold without touching its
+secret or epoch. `revoke_session` closes it, or another window of your own
+agent by label. `whoami` reports `session_identity` when the label was proven
+and `null` when it is only a header.
+
+Nothing here is required: an agent token with a session header keeps working
+for every tool and for a bare `curl`, exactly as before.
+
 ### One session per conversation: the stdio proxy
 
 Sessions separate windows, but a header written once in a client config is
@@ -417,6 +461,11 @@ as usual, plus two that never reach the bus:
   team needs a new conversation, because switching credentials cannot erase
   what this conversation has already seen.
 
+The proxy does this for you: it registers the session on connect, forwards
+every call with the credential and the epoch, renews it, and clears the secret
+from its private state when the window closes. A bus too old to issue
+credentials simply keeps the label-only connection.
+
 **Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
 (any host that can set a per-window variable), `CLAUDE_CODE_SESSION_ID`
 (Claude Code sets it on MCP server processes), the `_meta.threadId` Codex
@@ -428,7 +477,15 @@ refuses the second rather than mixing them.
 
 Start-of-session context is delivered through the `initialize` result's
 `instructions` — every MCP client passes those to the model, so no hooks are
-needed. Presence is the proxy's own: a heartbeat on connect with the repo and
+needed. Where a host *does* have lifecycle hooks, they run
+`ai-crew-sync context hook --binding <conversation id> --event <event>`: the
+helper reads the private record the proxy wrote (0700 directory, 0600 file),
+acts as **that** window with its own credential, and prints only what the host
+expects. The credential never reaches argv, stdout or a log, a hook never
+registers (so it cannot fence its own proxy), and a conversation with no
+binding produces no output at all rather than acting as a shared identity.
+This authenticated hook mode is the one place that needs the `ai-crew-sync`
+binary on the PATH; the legacy mode still needs only `curl` and `python3`. Presence is the proxy's own: a heartbeat on connect with the repo and
 branch of the project directory, a keep-alive every five minutes, `idle` on
 exit. Nothing is pushed into an idle turn: incoming messages are read with
 `read_messages` or awaited with `wait_for_updates`, as with a direct

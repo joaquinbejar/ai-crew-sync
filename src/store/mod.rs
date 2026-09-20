@@ -5,6 +5,7 @@ pub mod messaging;
 pub mod notes;
 pub mod presence;
 pub mod quota;
+pub mod sessions;
 pub mod tasks;
 
 pub mod attachments;
@@ -168,6 +169,7 @@ pub async fn whoami(pool: &PgPool, auth: &AuthCtx) -> BusResult<WhoAmI> {
         .await?
         .map(|(_, name)| name);
     let (project, role) = presence::labels_of(pool, auth).await?;
+    let session_identity = sessions::identity(pool, auth).await?;
 
     Ok(WhoAmI {
         agent: auth.agent_name.clone(),
@@ -179,6 +181,7 @@ pub async fn whoami(pool: &PgPool, auth: &AuthCtx) -> BusResult<WhoAmI> {
         session: session_label(auth),
         project,
         role,
+        session_identity,
         default_channel,
         unread_direct_messages: unread,
         open_claimed_tasks: claimed,

@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/heartbeat.sh active",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/heartbeat.sh active --from-payload",
             "timeout": 10000
           },
           {
@@ -32,7 +32,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/heartbeat.sh idle",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/heartbeat.sh idle --from-payload",
             "timeout": 10000
           }
         ]

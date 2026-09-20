@@ -453,6 +453,9 @@ async fn tools_are_advertised_with_schemas() {
         "heartbeat",
         "list_agents",
         "list_sessions",
+        "register_session",
+        "renew_session",
+        "revoke_session",
         "set_note",
         "get_note",
         "list_notes",
@@ -5948,4 +5951,212 @@ async fn five_conversations_share_a_repo_and_stay_separate() {
     }
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
+}
+
+// ------------------------------------------------- authenticated sessions --
+
+/// A session credential proves which window is calling: it is derived from an
+/// agent token, cannot mint anything, dies with its parent, expires on its
+/// own, and a resume fences the connection it replaced.
+#[tokio::test]
+async fn session_credentials_prove_a_window_and_die_with_their_parent() {
+    let h = require_db!("t_sessions_auth");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let other = seed_agent(&h.pool, "acme", "marta").await;
+
+    // Registration takes the agent token and derives everything from it.
+    let agent = connect_with_session(&h.base, &token, "conv-a").await;
+    let cred = call(
+        &agent,
+        "register_session",
+        json!({"session": "conv-a", "ttl_seconds": 3600}),
+    )
+    .await;
+    let session_token = cred["session_token"].as_str().unwrap().to_owned();
+    assert!(session_token.starts_with("acss_"), "{cred}");
+    assert_eq!(cred["session"], "conv-a");
+    assert_eq!(cred["address"], "joaquin/conv-a");
+    assert_eq!(cred["epoch"], 1);
+    assert!(cred["expires_in_seconds"].as_i64().unwrap() <= 3600);
+
+    // It authenticates as that agent in that session, and says so.
+    let window = connect(&h.base, &session_token).await;
+    let me = call(&window, "whoami", json!({})).await;
+    assert_eq!(me["agent"], "joaquin");
+    assert_eq!(me["team"], "acme");
+    assert_eq!(me["session"], "conv-a", "the label is proven, not sent");
+    assert_eq!(me["session_identity"]["epoch"], 1);
+    assert_eq!(me["session_identity"]["session_id"], cred["session_id"]);
+    // A plain agent token has no proven identity.
+    assert!(call(&agent, "whoami", json!({})).await["session_identity"].is_null());
+
+    // It cannot mint: not another session, not anything else.
+    let err = call_expect_error(&window, "register_session", json!({"session": "conv-b"})).await;
+    assert!(err.contains("cannot register another session"), "{err}");
+
+    // A header that disagrees with the proof is refused outright, so a
+    // session credential can never be widened into another window.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/mcp", h.base))
+        .header("Authorization", format!("Bearer {session_token}"))
+        .header("X-Crew-Session", "someone-elses-window")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("authenticates session 'conv-a'"),
+        "{body}"
+    );
+    // The same header, agreeing, is simply redundant.
+    assert_eq!(
+        mcp_status_with_session(&h.base, &session_token, "conv-a").await,
+        200
+    );
+
+    // Renewal extends without disturbing the connection: same secret, same
+    // epoch, later expiry.
+    let renewed = call(&window, "renew_session", json!({"ttl_seconds": 7200})).await;
+    assert!(
+        renewed["session_token"].is_null(),
+        "renewal returns no secret"
+    );
+    assert_eq!(renewed["epoch"], 1);
+    assert!(renewed["expires_in_seconds"].as_i64().unwrap() > 3600);
+    assert_eq!(call(&window, "whoami", json!({})).await["agent"], "joaquin");
+
+    // A resume rotates the secret and bumps the epoch; the old credential is
+    // dead and the old connection is fenced by its stale epoch.
+    let resumed = call(&agent, "register_session", json!({"session": "conv-a"})).await;
+    assert_eq!(resumed["epoch"], 2);
+    let resumed_token = resumed["session_token"].as_str().unwrap().to_owned();
+    assert_ne!(resumed_token, session_token);
+    assert_eq!(
+        mcp_status(&h.base, &session_token).await,
+        401,
+        "old secret is dead"
+    );
+    assert_eq!(
+        mcp_status_with_epoch(&h.base, &resumed_token, 1).await,
+        409,
+        "a connection carrying the old epoch is stale"
+    );
+    assert_eq!(mcp_status_with_epoch(&h.base, &resumed_token, 2).await, 200);
+    let _ = window.cancel().await;
+
+    // Two agents, two sessions of the same label: separate rows, separate
+    // addresses, no collision.
+    let marta = connect(&h.base, &other).await;
+    let hers = call(&marta, "register_session", json!({"session": "conv-a"})).await;
+    assert_eq!(hers["address"], "marta/conv-a");
+    assert_ne!(hers["session_id"], resumed["session_id"]);
+
+    // Revocation: a window can close another window of its own agent, and
+    // never one of somebody else's.
+    let live = connect(&h.base, &resumed_token).await;
+    call(&agent, "register_session", json!({"session": "conv-c"})).await;
+    let gone = call(&live, "revoke_session", json!({"session": "conv-c"})).await;
+    assert_eq!(gone["revoked_session"], "conv-c");
+    let err = call_expect_error(
+        &live,
+        "revoke_session",
+        json!({"session": "conv-a-of-marta"}),
+    )
+    .await;
+    assert!(err.contains("no session"), "{err}");
+    assert_eq!(
+        call(&marta, "whoami", json!({})).await["agent"],
+        "marta",
+        "marta's own session is untouched"
+    );
+
+    // The parent's revocation is the session's revocation: no sweep needed.
+    let (parent_id,): (Uuid,) = sqlx::query_as(
+        "SELECT t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id WHERE a.name = 'joaquin'",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    ai_crew_sync::store::admin::revoke_token(
+        &h.pool,
+        ai_crew_sync::store::admin::Actor::Cli,
+        None,
+        parent_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mcp_status(&h.base, &resumed_token).await,
+        401,
+        "parent revoked"
+    );
+    assert_eq!(mcp_status(&h.base, &token).await, 401);
+    assert_eq!(
+        mcp_status(&h.base, &other).await,
+        200,
+        "another agent is unaffected"
+    );
+
+    // An expired credential says what to do rather than just failing.
+    let fresh = call(&marta, "register_session", json!({"session": "conv-old"})).await;
+    let fresh_token = fresh["session_token"].as_str().unwrap().to_owned();
+    sqlx::query("UPDATE agent_sessions SET expires_at = now() - interval '1 minute' WHERE label = 'conv-old'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/mcp", h.base))
+        .header("Authorization", format!("Bearer {fresh_token}"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("register_session"),
+        "{body}"
+    );
+
+    for c in [agent, live, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// `tools/list` with a bearer and a session header, for status checks.
+async fn mcp_status_with_session(base: &str, token: &str, session: &str) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Crew-Session", session)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// `tools/list` with a bearer and an explicit connection epoch.
+async fn mcp_status_with_epoch(base: &str, token: &str, epoch: i64) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Crew-Epoch", epoch.to_string())
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
 }

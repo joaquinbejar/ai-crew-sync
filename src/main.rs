@@ -1,4 +1,4 @@
-use ai_crew_sync::{MIGRATOR, admin, admin_cli, client, context, proxy, serve, webhooks};
+use ai_crew_sync::{MIGRATOR, admin, admin_cli, client, context, hook, proxy, serve, webhooks};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
@@ -370,6 +370,26 @@ enum ContextCmd {
     /// Manage local profiles (~/.config/ai-crew-sync/profiles.toml).
     #[command(subcommand)]
     Profile(ContextProfileCmd),
+    /// Run one lifecycle hook as the window bound to a host conversation.
+    /// This is what authenticated hooks call: it reads the private binding
+    /// its `mcp proxy` wrote and never prints a credential. A conversation
+    /// with no binding produces no output at all, rather than acting as
+    /// another window.
+    Hook {
+        /// Id of the host conversation, from the hook payload's session_id.
+        #[arg(long)]
+        binding: String,
+        /// session_start | heartbeat | stop | session_end | status
+        #[arg(long)]
+        event: String,
+        /// Working directory the presence line describes; the current
+        /// directory by default.
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        /// Hours of team activity to summarise on session_start.
+        #[arg(long, env = "BUS_DIGEST_HOURS", default_value_t = 8)]
+        digest_hours: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1094,6 +1114,26 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                 cfg.profile.as_deref().unwrap_or_default(),
                 cfg.project.as_deref().unwrap_or("-")
             );
+        }
+        ContextCmd::Hook {
+            binding,
+            event,
+            cwd,
+            digest_hours,
+        } => {
+            let event: hook::Event = event.parse()?;
+            let cwd = match cwd {
+                Some(d) => d,
+                None => std::env::current_dir()?,
+            };
+            let hours = digest_hours.clamp(1, 336);
+            match hook::run(&context::config_dir()?, &binding, event, &cwd, hours).await {
+                Ok(Some(out)) => println!("{out}"),
+                Ok(None) => {}
+                // A hook must never break the host's session: report the
+                // reason on stderr, where the user can find it, and exit 0.
+                Err(e) => eprintln!("ai-crew-sync hook {event:?}: {e:#}"),
+            }
         }
         ContextCmd::Profile(cmd) => {
             let cfg_dir = context::config_dir()?;

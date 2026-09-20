@@ -372,11 +372,43 @@ pub struct Binding {
     pub role: Option<String>,
     pub agent: Option<String>,
     pub team: Option<String>,
+    /// Endpoint the proxy of this conversation is connected to.
+    pub mcp_url: Option<String>,
+    /// The session credential. Present only while the window is open, and
+    /// only ever read by `context hook`: never printed, logged or passed in
+    /// argv.
+    pub session_token: Option<String>,
+    pub session_id: Option<String>,
+    /// Epoch to send with it. A hook uses the proxy's epoch rather than
+    /// registering, which would bump it and fence the proxy it belongs to.
+    pub epoch: Option<i64>,
+    pub expires_at: Option<String>,
+    pub closed_at: Option<String>,
 }
 
+/// Directory holding one record per live conversation. Mode 0700: it is the
+/// only place a session credential is written, and `context hook` is the
+/// only thing that reads one.
+pub const BINDINGS_DIR: &str = "sessions";
+
 pub fn binding_path(dir: &Path, host_id: &str) -> PathBuf {
-    dir.join("sessions")
+    dir.join(BINDINGS_DIR)
         .join(format!("{}.json", binding_key(host_id)))
+}
+
+/// Write a binding record: 0700 directory, 0600 file, atomic replace.
+pub fn write_binding_file(path: &Path, content: &str) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Tightened every time: a directory created by an older version
+            // (or by a careless umask) is corrected rather than trusted.
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    write_private(path, content)
 }
 
 pub fn read_binding(dir: &Path, host_id: &str) -> Option<Binding> {

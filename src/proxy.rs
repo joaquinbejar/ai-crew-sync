@@ -63,7 +63,6 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -129,6 +128,17 @@ fn random_session() -> String {
     )
 }
 
+/// The credential this window proved itself with, when the bus issues them.
+#[derive(Clone, Debug)]
+pub struct SessionProof {
+    /// The secret. Written only to the 0600 binding file, never to a tool
+    /// result, a log or argv.
+    pub token: String,
+    pub session_id: String,
+    pub epoch: i64,
+    pub expires_at: String,
+}
+
 /// The verified, connected context of this instance.
 struct Connected {
     resolved: Resolved,
@@ -137,6 +147,7 @@ struct Connected {
     remote: Arc<Remote>,
     tools: Vec<Tool>,
     remote_instructions: Option<String>,
+    proof: Option<SessionProof>,
     /// Cancelled when this context is replaced; forwarded calls race it.
     ct: CancellationToken,
 }
@@ -285,9 +296,14 @@ pub struct EmptyArgs {}
 
 // --------------------------------------------------------------- connecting --
 
-async fn connect_remote(resolved: &Resolved, session: &str) -> anyhow::Result<Remote> {
-    let mut config = StreamableHttpClientTransportConfig::with_uri(resolved.mcp_url.clone());
-    config.auth_header = Some(resolved.token.clone());
+async fn connect_remote(
+    url: &str,
+    credential: &str,
+    session: &str,
+    epoch: Option<i64>,
+) -> anyhow::Result<Remote> {
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_owned());
+    config.auth_header = Some(credential.to_owned());
     config.allow_stateless = true;
     config.custom_headers.insert(
         crate::auth::SESSION_HEADER.parse()?,
@@ -295,11 +311,23 @@ async fn connect_remote(resolved: &Resolved, session: &str) -> anyhow::Result<Re
             .parse()
             .context("session label is not a valid header value")?,
     );
+    // Fencing is opt-in per connection: with it, a request from a process
+    // that has been resumed away is refused instead of writing as the window
+    // that replaced it.
+    if let Some(epoch) = epoch {
+        config.custom_headers.insert(
+            crate::auth::EPOCH_HEADER.parse()?,
+            epoch
+                .to_string()
+                .parse()
+                .context("epoch is not a valid header value")?,
+        );
+    }
     let transport = StreamableHttpClientTransport::from_config(config);
     let remote = rmcp::model::ClientConfig::default()
         .serve(transport)
         .await
-        .with_context(|| format!("could not connect to {}", resolved.mcp_url))?;
+        .with_context(|| format!("could not connect to {url}"))?;
     Ok(remote)
 }
 
@@ -320,9 +348,19 @@ async fn call_remote(remote: &Remote, name: &str, args: Value) -> anyhow::Result
 async fn establish(
     inputs: &Inputs,
     session: &str,
-) -> anyhow::Result<(Resolved, String, String, Remote, Vec<Tool>, Option<String>)> {
+) -> anyhow::Result<(
+    Resolved,
+    String,
+    String,
+    Remote,
+    Vec<Tool>,
+    Option<String>,
+    Option<SessionProof>,
+)> {
     let resolved = context::resolve(inputs)?;
-    let remote = connect_remote(&resolved, session).await?;
+    // First connection: the agent token, with the label in a header, exactly
+    // as any direct client would.
+    let remote = connect_remote(&resolved.mcp_url, &resolved.token, session, None).await?;
     let me = call_remote(&remote, "whoami", json!({}))
         .await
         .context("the bus did not accept the credential")?;
@@ -338,14 +376,52 @@ async fn establish(
             resolved.profile.as_deref().unwrap_or("?")
         );
     }
-    let tools = remote
-        .list_all_tools()
-        .await
-        .context("could not list the bus's tools")?;
-    let instructions = remote
-        .peer_info()
-        .and_then(|info| info.instructions.clone());
-    Ok((resolved, agent, team, remote, tools, instructions))
+
+    // Then upgrade: register this window and keep talking with a credential
+    // that *proves* which window it is. A server too old to know the tool
+    // simply keeps the label-only connection, which is what it has always
+    // served.
+    let proof = match call_remote(&remote, "register_session", json!({ "session": session })).await
+    {
+        Ok(v) => v["session_token"].as_str().map(|token| SessionProof {
+            token: token.to_owned(),
+            session_id: v["session_id"].as_str().unwrap_or_default().to_owned(),
+            epoch: v["epoch"].as_i64().unwrap_or(1),
+            expires_at: v["expires_at"].as_str().unwrap_or_default().to_owned(),
+        }),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "this bus does not issue session credentials; continuing with the label only"
+            );
+            None
+        }
+    };
+
+    let (remote, tools, instructions) = match &proof {
+        Some(proof) => {
+            let _ = remote.cancel().await;
+            let remote =
+                connect_remote(&resolved.mcp_url, &proof.token, session, Some(proof.epoch))
+                    .await
+                    .context("the session credential could not open a connection")?;
+            let tools = remote
+                .list_all_tools()
+                .await
+                .context("could not list the bus's tools")?;
+            let instructions = remote.peer_info().and_then(|i| i.instructions.clone());
+            (remote, tools, instructions)
+        }
+        None => {
+            let tools = remote
+                .list_all_tools()
+                .await
+                .context("could not list the bus's tools")?;
+            let instructions = remote.peer_info().and_then(|i| i.instructions.clone());
+            (remote, tools, instructions)
+        }
+    };
+    Ok((resolved, agent, team, remote, tools, instructions, proof))
 }
 
 /// Repository and branch of the project directory, for presence. Best
@@ -437,7 +513,7 @@ impl Proxy {
     async fn connect_with(&self, inputs: &Inputs) -> anyhow::Result<Option<PreviousIdentity>> {
         let _guard = self.switch.lock().await;
         let session = self.state.read().await.session.clone();
-        let (resolved, agent, team, remote, tools, instructions) =
+        let (resolved, agent, team, remote, tools, instructions, proof) =
             establish(inputs, &session).await?;
 
         // A team switch would let one conversation carry another team's
@@ -515,6 +591,7 @@ impl Proxy {
             remote: Arc::new(remote),
             tools,
             remote_instructions: instructions,
+            proof,
             ct: CancellationToken::new(),
         };
         {
@@ -559,11 +636,13 @@ impl Proxy {
     /// still say where it is).
     async fn write_binding(&self) {
         let st = self.state.read().await;
-        let key = st
-            .host_id
-            .as_deref()
-            .map(|id| hex::encode(Sha256::digest(id.as_bytes())))
-            .unwrap_or_else(|| st.session.clone());
+        // Keyed by the conversation id when the host gives one — that is what
+        // a hook of the same conversation can look up — and by the session
+        // label otherwise, where nothing else can find it anyway.
+        let key = st.host_id.clone().unwrap_or_else(|| st.session.clone());
+        // The credential goes in here, which is why the file is 0600 inside a
+        // 0700 directory and why `context hook` is the only thing that reads
+        // it. It never reaches a tool result, a log or argv.
         let record = json!({
             "host_id_present": st.host_id.is_some(),
             "binding": st.binding,
@@ -574,15 +653,18 @@ impl Proxy {
             "profile": st.connected.as_ref().and_then(|c| c.resolved.profile.clone()),
             "agent": st.connected.as_ref().map(|c| c.agent.clone()),
             "team": st.connected.as_ref().map(|c| c.team.clone()),
+            "mcp_url": st.connected.as_ref().map(|c| c.resolved.mcp_url.clone()),
+            "session_token": st.connected.as_ref().and_then(|c| c.proof.as_ref().map(|p| p.token.clone())),
+            "session_id": st.connected.as_ref().and_then(|c| c.proof.as_ref().map(|p| p.session_id.clone())),
+            // Hooks send this epoch, so they are fenced with their proxy
+            // rather than fencing it: a hook never bumps it.
+            "epoch": st.connected.as_ref().and_then(|c| c.proof.as_ref().map(|p| p.epoch)),
+            "expires_at": st.connected.as_ref().and_then(|c| c.proof.as_ref().map(|p| p.expires_at.clone())),
             "proxy_pid": std::process::id(),
             "updated_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         });
-        let path = self
-            .opts
-            .state_dir
-            .join("sessions")
-            .join(format!("{key}.json"));
-        if let Err(e) = context::write_private(&path, &record.to_string()) {
+        let path = context::binding_path(&self.opts.state_dir, &key);
+        if let Err(e) = context::write_binding_file(&path, &record.to_string()) {
             tracing::warn!(error = %e, "could not write the session binding");
         }
     }
@@ -874,6 +956,37 @@ impl Proxy {
             )
             .await;
             close_remote(remote).await;
+        }
+        // The window is closing, so its credential should stop working —
+        // but the binding file stays: a resume of the same conversation
+        // registers again under the same label and keeps its history.
+        self.forget_credential().await;
+    }
+
+    /// Strip the secret from the binding record, leaving the labels a hook
+    /// can still read. A closed window must not leave a usable credential on
+    /// disk for the next process that guesses the path.
+    async fn forget_credential(&self) {
+        let (key, path) = {
+            let st = self.state.read().await;
+            let key = st.host_id.clone().unwrap_or_else(|| st.session.clone());
+            (
+                key.clone(),
+                context::binding_path(&self.opts.state_dir, &key),
+            )
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        if let Some(map) = value.as_object_mut() {
+            map.remove("session_token");
+            map.insert("closed_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+        }
+        if let Err(e) = context::write_binding_file(&path, &value.to_string()) {
+            tracing::warn!(error = %e, binding = %key, "could not clear the stored credential");
         }
     }
 }

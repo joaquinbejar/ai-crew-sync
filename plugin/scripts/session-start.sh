@@ -26,6 +26,20 @@ if [ -z "${BUS_TOKEN:-}" ] && ! command -v ai-crew-sync >/dev/null 2>&1; then
 fi
 [ -n "${BUS_TOKEN:-}" ] && [ -z "${BUS_URL:-}" ] && exit 0
 
+# Authenticated mode: this conversation's proxy registered a session, so the
+# helper acts as THAT window with its own credential. It prints the host's
+# JSON or nothing at all; it never falls back to another identity, and the
+# credential never passes through this script.
+if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
+    case "$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)" in
+        *'"authenticated"'*)
+            ai-crew-sync context hook --binding "$HOST_SESSION" --event session_start \
+                --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true
+            exit 0
+            ;;
+    esac
+fi
+
 # Identity first: nothing is injected into the conversation until the bus has
 # confirmed who this window is. A digest from a credential that turns out to
 # belong to another agent — or to nobody — is worse than no digest.
