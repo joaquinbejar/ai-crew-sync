@@ -292,7 +292,7 @@ pub async fn set_conversations(
         audit(
             &mut tx,
             actor,
-            "team.create",
+            "team.capability",
             Some(team_id),
             Some(team_id),
             serde_json::json!({ "slug": slug, "conversations_enabled": enabled }),

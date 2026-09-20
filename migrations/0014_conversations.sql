@@ -59,12 +59,21 @@ CREATE TABLE projects (
     UNIQUE (id, team_id)
 );
 
+-- The team is stored and constrained on both sides, the way 0004 did it for
+-- every other cross-team relation: the application filters by team, but a
+-- grant that crosses teams must be impossible in the database, not merely
+-- unreachable through the current callers.
 CREATE TABLE project_agent_access (
-    project_id  UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    agent_id    UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    project_id  UUID NOT NULL,
+    agent_id    UUID NOT NULL,
+    team_id     UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
     granted_by  UUID REFERENCES agents(id) ON DELETE SET NULL,
     granted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (project_id, agent_id)
+    PRIMARY KEY (project_id, agent_id),
+    FOREIGN KEY (project_id, team_id) REFERENCES projects (id, team_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (agent_id, team_id) REFERENCES agents (id, team_id)
+        ON DELETE CASCADE
 );
 
 -- ------------------------------------------------------------ conversations --
@@ -108,6 +117,13 @@ CREATE TABLE conversation_memberships (
     conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     agent_id        UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     session         TEXT NOT NULL DEFAULT '',
+    -- The authenticated window this seat belongs to, when there is one. A
+    -- seat taken by a registered session can only be used by that session's
+    -- own credential: the label in a header is a name, not a proof, and the
+    -- parent agent token must go through the audited recovery path rather
+    -- than silently sitting in its window's chair. NULL is the legacy seat,
+    -- matched by label as before.
+    session_id      UUID REFERENCES agent_sessions(id) ON DELETE SET NULL,
     role            TEXT NOT NULL DEFAULT 'participant'
                     CHECK (role IN ('owner', 'moderator', 'participant', 'observer')),
     state           TEXT NOT NULL DEFAULT 'invited'
@@ -123,6 +139,11 @@ CREATE TABLE conversation_memberships (
     -- membership that took it over. The old row is kept: its receipts and
     -- authorship are history, not something to rewrite.
     superseded_by   UUID REFERENCES conversation_memberships(id) ON DELETE SET NULL,
+    -- The open transfer proposal this seat would take over when it accepts.
+    -- Named explicitly, because "some transfer by this agent exists" is not
+    -- the same question: an unrelated invitation must not close a seat, and
+    -- one transfer must not close several.
+    transfer_from   UUID REFERENCES conversation_memberships(id) ON DELETE SET NULL,
     UNIQUE (conversation_id, agent_id, session)
 );
 
@@ -131,6 +152,7 @@ CREATE INDEX conversation_memberships_agent_idx
     WHERE state IN ('invited', 'active');
 
 -- ---------------------------------------------------------------- messages --
+-- (the NOTIFY trigger for these is at the end of this file, after the table)
 
 CREATE TABLE conversation_messages (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -221,3 +243,45 @@ CREATE INDEX conversation_audit_team_idx ON conversation_audit (team_id, id DESC
 
 COMMENT ON TABLE conversation_audit IS
     'Append-only log of conversation and membership actions. Never contains a message body.';
+
+-- ------------------------------------------------------------ audit trail --
+--
+-- Turning a capability on or off is its own action. It was recorded as
+-- 'team.create', which makes an audit reader unable to tell "conversations
+-- were enabled" from "this team was created" — and the audit trail exists
+-- precisely to answer that kind of question.
+
+ALTER TABLE admin_audit
+    DROP CONSTRAINT admin_audit_action_check,
+    ADD CONSTRAINT admin_audit_action_check CHECK (action IN (
+        'team.create', 'team.capability', 'agent.create', 'agent.enable',
+        'agent.disable', 'token.issue', 'token.revoke',
+        'admin.grant', 'admin.revoke'));
+
+-- ----------------------------------------------------------------- events --
+--
+-- Conversation sends land on the same 'bus_events' channel every other
+-- mutation uses, so `wait_for_conversation_updates` wakes when a message
+-- arrives instead of discovering it on its next poll. The payload carries ids
+-- only, never a body: a private thread's content does not travel on a channel
+-- the webhook dispatcher also listens to.
+
+CREATE FUNCTION notify_conversation_message() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    conv_team UUID;
+BEGIN
+    SELECT team_id INTO conv_team FROM conversations WHERE id = NEW.conversation_id;
+    PERFORM pg_notify('bus_events', json_build_object(
+        'kind', 'conversation_message',
+        'team_id', conv_team,
+        'id', NEW.id,
+        'conversation_id', NEW.conversation_id,
+        'seq', NEW.seq,
+        'sender_agent_id', NEW.sender_agent
+    )::text);
+    RETURN NULL;
+END $$;
+
+CREATE TRIGGER conversation_messages_notify
+    AFTER INSERT ON conversation_messages
+    FOR EACH ROW EXECUTE FUNCTION notify_conversation_message();

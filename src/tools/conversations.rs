@@ -544,7 +544,7 @@ impl Bus {
         let auth = auth_of(&ctx)?;
         let id = uuid_arg("conversation_id", &args.conversation_id)?;
         Ok(Json(
-            store::recover_history(&self.db, &auth, id, args.limit).await?,
+            store::recover_history(&self.db, &auth, id, args.after_seq, args.limit).await?,
         ))
     }
 }

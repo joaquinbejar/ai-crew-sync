@@ -77,6 +77,15 @@ pub async fn register(
     let raw = generate_session_token();
     let prefix = token_prefix(&raw);
 
+    // Serialised with owner recovery on the agent row. Recovery checks that
+    // no window is live and then reads private history; without a lock both
+    // of them can be true at once — it sees none, and this inserts one.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR UPDATE")
+        .bind(auth.agent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
     // One row per (agent, label), and the row is only *taken over* when the
     // one there is dead: revoked, or past its expiry. A live one belongs to
     // a window that can still speak for itself.
@@ -104,8 +113,9 @@ pub async fn register(
     .bind(hash_token(&raw))
     .bind(&prefix)
     .bind(ttl as f64)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let Some((id, epoch, expires_at)) = row else {
         return Err(BusError::conflict(format!(

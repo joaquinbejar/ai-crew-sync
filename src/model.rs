@@ -656,7 +656,8 @@ pub struct ConversationUpdates {
 pub struct ConversationActivity {
     pub conversation_id: String,
     pub title: String,
-    /// Highest sequence you have not read yet.
+    /// Highest sequence currently stored in the thread. It is not a read
+    /// cursor: it does not move with what you have read or acknowledged.
     pub last_seq: i64,
     /// Messages addressed to you that you have not acknowledged.
     pub unacknowledged: i64,

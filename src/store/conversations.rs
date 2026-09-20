@@ -44,6 +44,17 @@ pub const MAX_MEMBERS: i64 = 200;
 /// Refuse early and clearly when the team has not turned conversations on.
 /// The tools are advertised only to teams that have, but a direct call must
 /// be refused too: a catalogue is not an authorization boundary.
+/// Whether this caller's team has conversations turned on. Used to decide
+/// what to advertise; `require_capability` is what decides what to allow.
+pub async fn capability_enabled(pool: &PgPool, auth: &AuthCtx) -> BusResult<bool> {
+    let enabled: Option<(bool,)> =
+        sqlx::query_as("SELECT conversations_enabled FROM teams WHERE id = $1")
+            .bind(auth.team_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(matches!(enabled, Some((true,))))
+}
+
 pub async fn require_capability(pool: &PgPool, auth: &AuthCtx) -> BusResult<()> {
     let enabled: Option<(bool,)> =
         sqlx::query_as("SELECT conversations_enabled FROM teams WHERE id = $1")
@@ -112,11 +123,12 @@ pub async fn create_project(pool: &PgPool, auth: &AuthCtx, name: &str) -> BusRes
             // The creator has access to what they created; everyone else
             // needs a grant.
             sqlx::query(
-                "INSERT INTO project_agent_access (project_id, agent_id, granted_by)
-                 VALUES ($1, $2, $2) ON CONFLICT DO NOTHING",
+                "INSERT INTO project_agent_access (project_id, agent_id, team_id, granted_by)
+                 VALUES ($1, $2, $3, $2) ON CONFLICT DO NOTHING",
             )
             .bind(id)
             .bind(auth.agent_id)
+            .bind(auth.team_id)
             .execute(&mut *tx)
             .await?;
             audit(
@@ -201,13 +213,32 @@ pub async fn set_project_access(
     let target = crate::store::agent_id_by_name(pool, auth.team_id, agent).await?;
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
+    // The caller's own grant is re-read and locked *inside* this
+    // transaction. Checked only before it, a revoke can commit in between
+    // and the revoked caller still hands access to somebody else — while
+    // the tool promises a revocation takes effect immediately.
+    let still_mine: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT project_id FROM project_agent_access
+          WHERE project_id = $1 AND agent_id = $2 FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(auth.agent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if still_mine.is_none() {
+        return Err(BusError::Forbidden(
+            "your access to this project has been revoked, so you cannot change anyone              else's. Nothing was written."
+                .to_owned(),
+        ));
+    }
     if grant {
         sqlx::query(
-            "INSERT INTO project_agent_access (project_id, agent_id, granted_by)
-             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            "INSERT INTO project_agent_access (project_id, agent_id, team_id, granted_by)
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
         )
         .bind(project_id)
         .bind(target)
+        .bind(auth.team_id)
         .bind(auth.agent_id)
         .execute(&mut *tx)
         .await?;
@@ -356,7 +387,11 @@ pub async fn access(pool: &PgPool, auth: &AuthCtx, conversation: Uuid) -> BusRes
     )> = sqlx::query_as(
         "SELECT c.visibility, c.title, c.archived_at, c.last_seq, c.project_id,
                 COALESCE(
-                  c.project_id IS NOT NULL AND EXISTS (
+                  -- Only a project-visible thread is readable by project
+                  -- grant. A private thread that also names a project is
+                  -- still private: the grant governs the project, not
+                  -- everything that mentions it.
+                  c.visibility = 'project' AND c.project_id IS NOT NULL AND EXISTS (
                     SELECT 1 FROM project_agent_access a
                      WHERE a.project_id = c.project_id AND a.agent_id = $3), false)
            FROM conversations c
@@ -372,13 +407,20 @@ pub async fn access(pool: &PgPool, auth: &AuthCtx, conversation: Uuid) -> BusRes
         // must not learn that another team has a conversation with this id.
         return Err(BusError::not_found("no such conversation"));
     };
+    // A seat taken by a registered window belongs to that window, and the
+    // label in a header is a name rather than a proof. The parent agent
+    // token cannot sit in its own window's chair — that is what the audited
+    // `recover_conversation_history` exists for. A legacy seat (session_id
+    // NULL) keeps matching by label, as it always did.
     let membership: Option<(Uuid, String, String, Option<i64>)> = sqlx::query_as(
         "SELECT id, role, state, history_from_seq FROM conversation_memberships
-          WHERE conversation_id = $1 AND agent_id = $2 AND session = $3",
+          WHERE conversation_id = $1 AND agent_id = $2 AND session = $3
+            AND (session_id IS NULL OR $4::uuid IS NOT NULL)",
     )
     .bind(conversation)
     .bind(auth.agent_id)
     .bind(&auth.session)
+    .bind(auth.session_id)
     .fetch_optional(pool)
     .await?;
     Ok(Access {
@@ -450,7 +492,15 @@ pub async fn create_conversation(
     require_capability(pool, auth).await?;
     let title = check_title("title", &input.title)?;
     let project_id = match (&input.project, input.private) {
-        (Some(p), _) => Some(project_id_for(pool, auth, p).await?),
+        (Some(_), true) => {
+            // Both would mean "members only" and "everyone with the project
+            // grant" at once, and one of the two would be a lie to whoever
+            // spoke in it.
+            return Err(BusError::invalid(
+                "a conversation is either private or visible to a project, not both. Drop                  `project` for a members-only thread, or `private` for a project one.",
+            ));
+        }
+        (Some(p), false) => Some(project_id_for(pool, auth, p).await?),
         (None, true) => None,
         (None, false) => {
             return Err(BusError::invalid(
@@ -494,13 +544,14 @@ pub async fn create_conversation(
     // The creator owns it, from the beginning.
     sqlx::query(
         "INSERT INTO conversation_memberships
-            (conversation_id, agent_id, session, role, state, history_from_seq, invited_by,
-             accepted_at)
-         VALUES ($1, $2, $3, 'owner', 'active', NULL, $2, now())",
+            (conversation_id, agent_id, session, session_id, role, state, history_from_seq,
+             invited_by, accepted_at)
+         VALUES ($1, $2, $3, $4, 'owner', 'active', NULL, $2, now())",
     )
     .bind(id)
     .bind(auth.agent_id)
     .bind(&auth.session)
+    .bind(auth.session_id)
     .execute(&mut *tx)
     .await?;
 
@@ -564,7 +615,14 @@ pub async fn conversation_info(
     .bind(id)
     .fetch_one(pool)
     .await?;
-    let members = members_of(pool, id).await?;
+    // Who is in the thread is the members' business. A project grant lets
+    // you read a project thread; it does not tell you which windows of which
+    // people are in it, with their roles and history boundaries.
+    let members = if a.membership.is_some() {
+        members_of(pool, id).await?
+    } else {
+        Vec::new()
+    };
     let mine = a.membership.as_ref().and_then(|m| {
         members
             .iter()
@@ -734,10 +792,20 @@ pub async fn invite(
     let agent_id = crate::store::agent_id_by_name(pool, auth.team_id, &agent).await?;
     let session = session.unwrap_or_default();
 
+    let mut tx = pool.begin().await?;
+    crate::store::sessions::guard(&mut tx, auth).await?;
+    // Lock the thread, then count. Read outside the transaction, two
+    // concurrent invitations both see room and both commit, and the cap is
+    // a suggestion.
+    let (last_seq,): (i64,) =
+        sqlx::query_as("SELECT last_seq FROM conversations WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
     let (count,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM conversation_memberships WHERE conversation_id = $1")
             .bind(id)
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await?;
     if count >= MAX_MEMBERS {
         return Err(BusError::conflict(format!(
@@ -745,15 +813,30 @@ pub async fn invite(
         )));
     }
 
+    // Was this address removed from the thread? Re-admitting is a moderator
+    // decision and stays allowed, but it is recorded as one, and it never
+    // hands back the history the removal took away — whatever the inviter
+    // asks for.
+    let removed: Option<(String,)> = sqlx::query_as(
+        "SELECT state FROM conversation_memberships
+          WHERE conversation_id = $1 AND agent_id = $2 AND session = $3
+          FOR UPDATE",
+    )
+    .bind(id)
+    .bind(agent_id)
+    .bind(&session)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let readmitting = removed.as_ref().map(|r| r.0.as_str()) == Some("removed");
+
     // History boundary: from the start only when an inviter with the right
-    // to see it says so, otherwise from here on. Recorded either way.
-    let from_seq: Option<i64> = if history_from_start {
+    // to see it says so, otherwise from here on. Recorded either way. A
+    // re-admission is always from here on.
+    let from_seq: Option<i64> = if history_from_start && !readmitting {
         None
     } else {
-        Some(a.last_seq)
+        Some(last_seq)
     };
-    let mut tx = pool.begin().await?;
-    crate::store::sessions::guard(&mut tx, auth).await?;
     sqlx::query(
         "INSERT INTO conversation_memberships
             (conversation_id, agent_id, session, role, state, history_from_seq, invited_by)
@@ -762,6 +845,12 @@ pub async fn invite(
             role = EXCLUDED.role,
             state = CASE WHEN conversation_memberships.state IN ('left', 'removed')
                          THEN 'invited' ELSE conversation_memberships.state END,
+            history_from_seq = CASE WHEN conversation_memberships.state = 'removed'
+                                    THEN EXCLUDED.history_from_seq
+                                    ELSE conversation_memberships.history_from_seq END,
+            -- A seat that is being re-offered is not the seat the old window
+            -- held: whoever accepts has to prove it is them again.
+            session_id = NULL,
             invited_by = EXCLUDED.invited_by,
             invited_at = now(),
             ended_at = NULL",
@@ -778,7 +867,11 @@ pub async fn invite(
         &mut tx,
         auth,
         Some(id),
-        "member.invite",
+        if readmitting {
+            "member.readmit"
+        } else {
+            "member.invite"
+        },
         Some(agent_id),
         serde_json::json!({ "address": address, "role": role, "history_from_seq": from_seq }),
     )
@@ -791,11 +884,32 @@ pub async fn invite(
 /// the same agent is a different address and a different membership.
 pub async fn join(pool: &PgPool, auth: &AuthCtx, id: Uuid) -> BusResult<ConversationInfo> {
     require_capability(pool, auth).await?;
+    // If this label is a registered window, only that window may take the
+    // seat. Otherwise the parent agent token could accept an invitation
+    // addressed to one of its own windows and then read, send and
+    // acknowledge as it — without the audit trail that the documented
+    // recovery path carries.
+    if !auth.session.is_empty() && auth.session_id.is_none() {
+        let (live,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM agent_sessions
+              WHERE agent_id = $1 AND label = $2 AND revoked_at IS NULL AND expires_at > now()",
+        )
+        .bind(auth.agent_id)
+        .bind(&auth.session)
+        .fetch_one(pool)
+        .await?;
+        if live > 0 {
+            return Err(BusError::Forbidden(format!(
+                "'{}' is a registered window and this call carries an agent token, not that                  window's session credential. Ask that window to join, or use                  recover_conversation_history, which is the audited way for an agent to                  reach its own windows' threads.",
+                auth.session
+            )));
+        }
+    }
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
     let updated: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE conversation_memberships
-            SET state = 'active', accepted_at = now()
+            SET state = 'active', accepted_at = now(), session_id = $4
           WHERE conversation_id = $1 AND agent_id = $2 AND session = $3
             AND state = 'invited'
           RETURNING id",
@@ -803,6 +917,7 @@ pub async fn join(pool: &PgPool, auth: &AuthCtx, id: Uuid) -> BusResult<Conversa
     .bind(id)
     .bind(auth.agent_id)
     .bind(&auth.session)
+    .bind(auth.session_id)
     .fetch_optional(&mut *tx)
     .await?;
     if updated.is_none() {
@@ -976,8 +1091,50 @@ pub async fn send(
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
 
-    // Idempotency first, inside the transaction: a retry that raced the
-    // original must see it rather than allocate a second sequence.
+    // Lock the thread before deciding anything. Two things depend on it:
+    // two retries of one request_id serialize here instead of racing to the
+    // unique index, and the authorization below is re-read while it cannot
+    // change underneath.
+    let (archived_now,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT archived_at FROM conversations WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if archived_now.is_some() {
+        return Err(BusError::conflict(
+            "this conversation is archived; its history stays readable",
+        ));
+    }
+    // Membership as it is *now*. It was checked before this transaction
+    // opened, and a removal that committed in between must take effect on
+    // this call rather than the next one.
+    let current: Option<(String, String)> = sqlx::query_as(
+        "SELECT state, role FROM conversation_memberships
+          WHERE conversation_id = $1 AND agent_id = $2 AND session = $3
+            AND (session_id IS NULL OR $4::uuid IS NOT NULL)
+          FOR SHARE",
+    )
+    .bind(id)
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .bind(auth.session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let can_send_now = matches!(
+        current
+            .as_ref()
+            .map(|(state, role)| (state.as_str(), role.as_str())),
+        Some(("active", "owner")) | Some(("active", "moderator")) | Some(("active", "participant"))
+    );
+    if !can_send_now {
+        return Err(BusError::Forbidden(
+            "your membership of this conversation is no longer one that can post. Nothing              was written."
+                .to_owned(),
+        ));
+    }
+
+    // Idempotency, under that lock: a retry that raced the original sees it
+    // rather than allocating a second sequence.
     let existing: Option<(Uuid, i64, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "SELECT id, seq, body, created_at FROM conversation_messages
           WHERE conversation_id = $1 AND request_id = $2",
@@ -1161,12 +1318,20 @@ pub async fn read(
     .fetch_all(pool)
     .await?;
 
+    // One query for every receipt on the page. A page of 200 messages used
+    // to be 200 extra round trips, which is a read that gets slower exactly
+    // as a thread gets busier.
+    let mut mine: std::collections::HashMap<Uuid, ReceiptInfo> = std::collections::HashMap::new();
+    if let Some(m) = &a.membership {
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+        for (message_id, receipt) in receipts_for(pool, &ids, m.id).await? {
+            mine.insert(message_id, receipt);
+        }
+    }
+
     let mut messages = Vec::with_capacity(rows.len());
     for (mid, seq, from, from_session, body, reply_to, metadata, created_at) in rows {
-        let my_receipt = match &a.membership {
-            Some(m) => receipt_of(pool, mid, m.id).await?,
-            None => None,
-        };
+        let my_receipt = mine.remove(&mid);
         messages.push(ConversationMessage {
             message_id: mid.to_string(),
             seq,
@@ -1186,6 +1351,61 @@ pub async fn read(
         history_from_seq: a.membership.as_ref().and_then(|m| m.history_from_seq),
         messages,
     })
+}
+
+/// Every receipt this membership holds on a page of messages, in one query.
+#[allow(clippy::type_complexity)]
+async fn receipts_for(
+    pool: &PgPool,
+    message_ids: &[Uuid],
+    membership_id: Uuid,
+) -> BusResult<Vec<(Uuid, ReceiptInfo)>> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(
+        Uuid,
+        String,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT r.message_id, ag.name, m.session, r.stored_at, r.delivered_at, r.presented_at,
+                r.acknowledged_at, r.resolved_at, r.note
+           FROM message_receipts r
+           JOIN conversation_memberships m ON m.id = r.membership_id
+           JOIN agents ag ON ag.id = m.agent_id
+          WHERE r.message_id = ANY($1) AND r.membership_id = $2",
+    )
+    .bind(message_ids)
+    .bind(membership_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(message_id, agent, session, stored, delivered, presented, acked, resolved, note)| {
+                (
+                    message_id,
+                    ReceiptInfo {
+                        address: address_of(&agent, &session),
+                        session: (!session.is_empty()).then_some(session),
+                        agent,
+                        stored_at: ts_opt(stored),
+                        delivered_at: ts_opt(delivered),
+                        presented_at: ts_opt(presented),
+                        acknowledged_at: ts_opt(acked),
+                        resolved_at: ts_opt(resolved),
+                        note,
+                    },
+                )
+            },
+        )
+        .collect())
 }
 
 async fn receipt_of(
@@ -1320,13 +1540,18 @@ pub async fn ack(
     // Only a recipient has a receipt row. Someone who joined after the
     // message was sent was not asked, and saying they acknowledged it would
     // put them in a denominator they were never in.
+    // The membership state is re-read inside this update, not trusted from
+    // the check above: a removal that committed while this request waited
+    // takes effect here.
     let updated: Option<(Uuid,)> = sqlx::query_as(
-        "UPDATE message_receipts
+        "UPDATE message_receipts r
             SET acknowledged_at = COALESCE(acknowledged_at, now()),
                 resolved_at = CASE WHEN $3 THEN COALESCE(resolved_at, now()) ELSE resolved_at END,
                 note = COALESCE($4, note)
-          WHERE message_id = $1 AND membership_id = $2
-          RETURNING membership_id",
+           FROM conversation_memberships m
+          WHERE r.message_id = $1 AND r.membership_id = $2
+            AND m.id = r.membership_id AND m.state = 'active'
+          RETURNING r.membership_id",
     )
     .bind(message_id)
     .bind(membership.id)
@@ -1371,7 +1596,20 @@ pub async fn receipts(
     let Some((conversation_id, seq)) = row else {
         return Err(BusError::not_found("no such message"));
     };
-    readable(pool, auth, conversation_id).await?;
+    let a = readable(pool, auth, conversation_id).await?;
+    // The same boundary `get_message` applies. A receipt carries recipient
+    // addresses and a free-text note, which is the discussion itself often
+    // enough; a member who may not read the message may not read who
+    // answered it either.
+    if let Some(m) = &a.membership
+        && let Some(floor) = m.history_from_seq
+        && seq <= floor
+    {
+        return Err(BusError::Forbidden(
+            "this message is before the point your membership starts, so its receipts are              not yours to read either"
+                .to_owned(),
+        ));
+    }
     let rows: Vec<(
         String,
         String,
@@ -1496,25 +1734,47 @@ pub async fn transfer_membership(
 
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
-    sqlx::query(
+    // The source seat is re-read and locked here: it was active when the
+    // request arrived, and leaving or being removed in between must stop
+    // the transfer rather than hand over a seat that no longer exists.
+    let source: Option<(String,)> =
+        sqlx::query_as("SELECT state FROM conversation_memberships WHERE id = $1 FOR UPDATE")
+            .bind(mine.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if source.as_ref().map(|s| s.0.as_str()) != Some("active") {
+        return Err(BusError::conflict(
+            "your membership of this conversation is no longer active, so there is nothing              to transfer. Nothing was written.",
+        ));
+    }
+    let moved: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO conversation_memberships
-            (conversation_id, agent_id, session, role, state, history_from_seq, invited_by)
-         SELECT $1, $2, $3, m.role, 'invited', m.history_from_seq, $2
+            (conversation_id, agent_id, session, role, state, history_from_seq, invited_by,
+             transfer_from)
+         SELECT $1, $2, $3, m.role, 'invited', m.history_from_seq, $2, m.id
            FROM conversation_memberships m WHERE m.id = $4
          ON CONFLICT (conversation_id, agent_id, session) DO UPDATE SET
             role = EXCLUDED.role,
             state = CASE WHEN conversation_memberships.state IN ('left', 'removed')
                          THEN 'invited' ELSE conversation_memberships.state END,
             history_from_seq = EXCLUDED.history_from_seq,
+            transfer_from = EXCLUDED.transfer_from,
+            session_id = NULL,
             invited_at = now(),
-            ended_at = NULL",
+            ended_at = NULL
+         RETURNING id",
     )
     .bind(id)
     .bind(auth.agent_id)
     .bind(&session)
     .bind(mine.id)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
+    if moved.is_none() {
+        return Err(BusError::conflict(
+            "that window's seat could not be offered the transfer; nothing was written",
+        ));
+    }
     // The link is recorded now; the supersede happens when the target joins.
     sqlx::query("UPDATE conversation_memberships SET superseded_by = NULL WHERE id = $1")
         .bind(mine.id)
@@ -1546,21 +1806,29 @@ async fn supersede_predecessor(
     conversation: Uuid,
     new_membership: Uuid,
 ) -> BusResult<()> {
+    // Exactly the seat this one was offered, and only if that proposal is
+    // still the open one. "Some transfer by this agent exists" would let an
+    // unrelated invitation close a live seat, and one transfer close
+    // several.
     sqlx::query(
-        "UPDATE conversation_memberships
+        "UPDATE conversation_memberships p
             SET state = 'left', ended_at = now(), superseded_by = $3
-          WHERE conversation_id = $1 AND agent_id = $2 AND id <> $3
-            AND state = 'active'
-            AND superseded_by IS NULL
-            AND EXISTS (SELECT 1 FROM conversation_audit a
-                         WHERE a.conversation_id = $1 AND a.action = 'member.transfer'
-                           AND a.actor_agent = $2)",
+           FROM conversation_memberships n
+          WHERE n.id = $3 AND n.transfer_from = p.id
+            AND p.conversation_id = $1 AND p.agent_id = $2 AND p.id <> $3
+            AND p.state = 'active'
+            AND p.superseded_by IS NULL",
     )
     .bind(conversation)
     .bind(auth.agent_id)
     .bind(new_membership)
-    .execute(tx)
+    .execute(&mut *tx)
     .await?;
+    // The proposal is spent either way: accepted once, not standing.
+    sqlx::query("UPDATE conversation_memberships SET transfer_from = NULL WHERE id = $1")
+        .bind(new_membership)
+        .execute(tx)
+        .await?;
     Ok(())
 }
 
@@ -1576,6 +1844,7 @@ pub async fn recover_history(
     pool: &PgPool,
     auth: &AuthCtx,
     id: Uuid,
+    after_seq: Option<i64>,
     limit: Option<i64>,
 ) -> BusResult<ConversationRead> {
     require_capability(pool, auth).await?;
@@ -1589,13 +1858,18 @@ pub async fn recover_history(
     // Serialised with registration: a window opening right now must either
     // block this recovery or happen after it, never race it.
     let mut tx = pool.begin().await?;
-    // The rows are locked, not counted, because Postgres refuses FOR UPDATE
-    // with an aggregate — and locking is the point: a window registering
-    // right now either blocks this recovery or happens after it.
+    // Lock the AGENT row, not the session rows. Locking the sessions that
+    // exist locks nothing against the one about to be inserted: registration
+    // writes a new row, conflicts with no held lock, and can slip in between
+    // this check and the read below. Registration takes the same lock, so
+    // the two serialise on something that is always there.
+    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR UPDATE")
+        .bind(auth.agent_id)
+        .fetch_one(&mut *tx)
+        .await?;
     let live: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM agent_sessions
-          WHERE agent_id = $1 AND revoked_at IS NULL AND expires_at > now()
-          FOR UPDATE",
+          WHERE agent_id = $1 AND revoked_at IS NULL AND expires_at > now()",
     )
     .bind(auth.agent_id)
     .fetch_all(&mut *tx)
@@ -1626,12 +1900,18 @@ pub async fn recover_history(
                JOIN conversations c ON c.id = m.conversation_id
               WHERE m.conversation_id = $1
                 AND c.team_id = $2
+                AND m.seq > $5
                 AND m.deleted_at IS NULL
                 AND EXISTS (
                     SELECT 1 FROM conversation_memberships me
                      WHERE me.conversation_id = m.conversation_id
                        AND me.agent_id = $3
                        AND me.state <> 'removed'
+                       -- An invitation is not membership: a window that was
+                       -- asked and never answered read nothing, and its
+                       -- agent recovers nothing on its behalf. A seat that
+                       -- was active once still counts, however it ended.
+                       AND me.accepted_at IS NOT NULL
                        AND m.seq > COALESCE(me.history_from_seq, 0))
                 -- A project thread additionally needs current project access.
                 AND (c.visibility = 'private' OR EXISTS (
@@ -1644,6 +1924,7 @@ pub async fn recover_history(
     .bind(auth.team_id)
     .bind(auth.agent_id)
     .bind(limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE))
+    .bind(after_seq.unwrap_or(0))
     .fetch_all(&mut *tx)
     .await?;
     if rows.is_empty() {
@@ -1663,9 +1944,14 @@ pub async fn recover_history(
     .await?;
     tx.commit().await?;
 
+    // A real cursor: recovery can be more than one page, and a caller that
+    // is told `None` stops at the page limit believing it has everything.
+    let next_after_seq = (rows.len() as i64 == limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE))
+        .then(|| rows.last().map(|r| r.1))
+        .flatten();
     Ok(ConversationRead {
         conversation_id: id.to_string(),
-        next_after_seq: None,
+        next_after_seq,
         history_from_seq: None,
         messages: rows
             .into_iter()
