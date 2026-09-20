@@ -139,17 +139,29 @@ pub fn to_call_with(
             ("create_channel", json!({"name": name, "topic": topic}))
         }
         ClientCmd::Agents { online } => ("list_agents", json!({"online_only": online})),
+        ClientCmd::Sessions {
+            project,
+            role,
+            online,
+            limit,
+        } => (
+            "list_sessions",
+            json!({"project": project, "role": role, "online_only": online, "limit": limit}),
+        ),
         ClientCmd::Beat {
             status,
             repo,
             branch,
             activity,
+            project,
+            role,
             ttl_seconds,
         } => (
             "heartbeat",
             json!({
                 "status": status, "repo": repo, "branch": branch,
-                "activity": activity, "ttl_seconds": ttl_seconds
+                "activity": activity, "project": project, "role": role,
+                "ttl_seconds": ttl_seconds
             }),
         ),
         ClientCmd::Tasks { status, mine } => {
@@ -289,11 +301,19 @@ mod tests {
                 topic: None,
             },
             ClientCmd::Agents { online: false },
+            ClientCmd::Sessions {
+                project: None,
+                role: None,
+                online: false,
+                limit: None,
+            },
             ClientCmd::Beat {
                 status: None,
                 repo: None,
                 branch: None,
                 activity: None,
+                project: None,
+                role: None,
                 ttl_seconds: None,
             },
             ClientCmd::Tasks {

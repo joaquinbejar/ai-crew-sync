@@ -34,6 +34,13 @@ pub struct WhoAmI {
     /// `null` means the shared session: you sent no header, and your presence,
     /// task claims and locks are not separated from your other sessions.
     pub session: Option<String>,
+    /// Discovery labels this session last published with `heartbeat`
+    /// (`project`, `role`). Absent until set, so a client that never labels
+    /// its windows sees exactly the response it saw before.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub role: Option<String>,
     /// Channel this session posts to when `post_message` is called with
     /// neither `channel` nor `to` — the one named after your session, if the
     /// team has one. `null` means there is none, so you must always say where
@@ -71,6 +78,12 @@ pub struct AgentInfo {
     pub branch: Option<String>,
     /// Free-text description of what this agent is currently doing.
     pub activity: Option<String>,
+    /// Discovery labels the session set about itself (see `list_sessions`).
+    /// Absent when never set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub role: Option<String>,
     pub last_seen: Option<String>,
     /// True when *any* of this agent's sessions has a live presence lease.
     pub online: bool,
@@ -92,8 +105,52 @@ pub struct AgentSession {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub activity: Option<String>,
+    /// Discovery labels this session set about itself. Absent when never set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub role: Option<String>,
     pub last_seen: Option<String>,
     pub online: bool,
+}
+
+/// One session as `list_sessions` reports it: addressable, with its
+/// discovery labels. Two sessions may share every label and still be two
+/// entries, because the address differs.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SessionEntry {
+    pub agent: String,
+    /// Absent for the shared session.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session: Option<String>,
+    /// What to put in `to` (or `ask_agent`'s `to`) to reach this session.
+    /// `agent/session` for a named one; the bare `agent` for the shared
+    /// session — and see `exact` before treating that as private.
+    pub address: String,
+    /// True when `address` reaches **this window and no other**. False for
+    /// the shared session, whose address is the bare agent name: that is a
+    /// broadcast to every window of that agent, named ones included, so it
+    /// is the wrong place to send a private instruction. There is no address
+    /// that reaches the shared session alone.
+    pub exact: bool,
+    pub project: Option<String>,
+    pub role: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub activity: Option<String>,
+    /// One of `active`, `idle`, `busy`, `blocked`, `offline`.
+    pub status: String,
+    pub online: bool,
+    pub last_seen: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SessionList {
+    pub sessions: Vec<SessionEntry>,
+    /// Sessions returned. When it equals the limit there may be more: narrow
+    /// with `project` or `role`.
+    pub count: usize,
+    pub limit: i64,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

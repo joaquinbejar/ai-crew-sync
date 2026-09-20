@@ -203,14 +203,33 @@ pub async fn default_channel(pool: &PgPool, auth: &AuthCtx) -> BusResult<Option<
     if auth.session.is_empty() {
         return Ok(None);
     }
-    let name = normalize_channel(&auth.session);
-    let row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM channels WHERE team_id = $1 AND name = $2")
-            .bind(auth.team_id)
-            .bind(&name)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.map(|r| (r.0, name)))
+    // The project label first: a session whose label is an opaque id (the
+    // stdio proxy mints those) still posts to the channel named after the
+    // project it declared. Then the session name itself, which is how
+    // clients that name sessions after repositories have always worked.
+    // An opaque label matches no channel and gets no default, rather than
+    // one it never asked for.
+    let (project, _) = super::presence::labels_of(pool, auth).await?;
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(p) = project.filter(|p| !p.is_empty()) {
+        candidates.push(normalize_channel(&p));
+    }
+    let by_session = normalize_channel(&auth.session);
+    if !candidates.contains(&by_session) {
+        candidates.push(by_session);
+    }
+    for name in candidates {
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM channels WHERE team_id = $1 AND name = $2")
+                .bind(auth.team_id)
+                .bind(&name)
+                .fetch_optional(pool)
+                .await?;
+        if let Some((id,)) = row {
+            return Ok(Some((id, name)));
+        }
+    }
+    Ok(None)
 }
 
 /// Read-cursor key for a scope, kept apart per session and per view.

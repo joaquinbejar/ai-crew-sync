@@ -60,7 +60,7 @@ y puede:
 | **RPC agente↔agente**: preguntar a un compañero y esperar su respuesta en una llamada | `ask_agent` |
 | **Adjuntos**: diffs, logs, archivos pequeños (≤256 KiB) en mensajes y tareas | `attach_file`, `get_attachment` (+ `attachments` en `post_message`) |
 | **Locks genéricos** con TTL sobre recursos ("deploy:staging") | `acquire_lock`, `release_lock`, `list_locks` |
-| Presencia (quién está en qué repo/rama haciendo qué), con las sesiones abiertas de cada compañero bajo su nombre | `heartbeat`, `list_agents` |
+| Presencia (quién está en qué repo/rama haciendo qué), con las sesiones abiertas de cada compañero bajo su nombre; descubrimiento de sesiones por proyecto y rol | `heartbeat`, `list_agents`, `list_sessions` |
 | Memoria compartida del equipo (notas con historial) | `set_note`, `get_note`, `list_notes`, `search_notes`, `delete_note` |
 | **Resumen de actividad** de las últimas N horas | `team_digest` |
 | **Sesiones**: un token, un contexto de trabajo por repo | cabecera `X-Crew-Session` (abajo) |
@@ -432,6 +432,42 @@ dani                active  Layer-V/core-manager@issue-151       settlements v2
 `online_count` cuenta *compañeros*, no sesiones. Una sesión que deja de mandar
 heartbeat caduca sola y no toca a las demás.
 
+#### Encontrar la ventana correcta: `project` y `role`
+
+Una etiqueta de sesión separa bien claims y cursores y se teclea mal, sobre
+todo cuando son ids opacos acuñados por conversación. Dos **etiquetas de
+descubrimiento** opcionales en `heartbeat` lo resuelven: `project` (el
+proyecto lógico, normalmente el repositorio) y `role` (qué hace esa ventana
+allí: `implementation`, `design`, `review`, …). Después:
+
+```
+list_sessions {"project": "market-data", "role": "review", "online_only": true}
+→ {"sessions": [
+     {"agent": "joaquin", "session": "s-9c0d1e2f", "address": "joaquin/s-9c0d1e2f",
+      "project": "market-data", "role": "review", "status": "active", "online": true, …},
+     {"agent": "joaquin", "session": "s-3a4b5c6d", "address": "joaquin/s-3a4b5c6d", …}],
+   "count": 2, "limit": 200}
+```
+
+`address` es lo que va en `to` (o en el `to` de `ask_agent`), y **`exact` dice
+si llega a una sola ventana**. Es `true` para una sesión con nombre y `false`
+para la compartida, cuya dirección es el nombre pelado del agente: eso llega a
+*todas* sus ventanas, incluidas las nombradas, así que nunca es un destino
+privado y no existe ninguna dirección que llegue solo a la sesión compartida.
+Dos revisores comparten rol y conservan dos direcciones exactas: el
+descubrimiento devuelve ambas y quien llama elige una; nunca se enruta nada a
+"quien tenga el rol", ni se difunde una instrucción privada a todos. Las etiquetas son lo que
+una sesión dijo de sí misma: no son identidad (eso es el token), no son un
+permiso, y varias ventanas pueden compartirlas. También fijan el canal por
+defecto: una sesión que declaró `project = "market-data"` publica en
+`#market-data` cuando no nombra canal, sea cual sea su etiqueta de sesión; una
+etiqueta opaca que no coincide con ningún canal no recibe ninguno, en vez de
+uno sorprendente. Omite una etiqueta para conservarla, envía `""` para
+borrarla. `whoami` devuelve ambas y `list_agents` las muestra bajo cada sesión.
+
+Consola: `ai-crew-sync client sessions --project market-data --role review
+--online`, y `client beat --project market-data --role design`.
+
 Los campos de nivel superior `activity`/`repo`/`branch` resumen **una** de las
 sesiones del compañero, elegida en este orden: una sesión **viva** antes que
 una muerta, una **con nombre** antes que la compartida, y luego la actualizada
@@ -617,6 +653,7 @@ ai-crew-sync client send --channel deploys --body "staging lleva la 1.4.2"
 ai-crew-sync client send --to marta --body "mira el PR 421"
 ai-crew-sync client read --scope inbox
 ai-crew-sync client agents
+ai-crew-sync client sessions --project market-data --role review   # direcciones exactas
 ai-crew-sync client task create refactor-auth --title "Reescribir refresh de tokens"
 ai-crew-sync client task create update-clients --title "Actualizar clientes" \
     --depends-on refactor-auth              # pipeline: bloqueada hasta acabar la 1ª

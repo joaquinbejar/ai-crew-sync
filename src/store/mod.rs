@@ -167,6 +167,7 @@ pub async fn whoami(pool: &PgPool, auth: &AuthCtx) -> BusResult<WhoAmI> {
     let default_channel = messaging::default_channel(pool, auth)
         .await?
         .map(|(_, name)| name);
+    let (project, role) = presence::labels_of(pool, auth).await?;
 
     Ok(WhoAmI {
         agent: auth.agent_name.clone(),
@@ -176,6 +177,8 @@ pub async fn whoami(pool: &PgPool, auth: &AuthCtx) -> BusResult<WhoAmI> {
         // Stored as '' and reported as null: the database wants a value in a
         // primary key, the caller wants "you are not in a named session".
         session: session_label(auth),
+        project,
+        role,
         default_channel,
         unread_direct_messages: unread,
         open_claimed_tasks: claimed,

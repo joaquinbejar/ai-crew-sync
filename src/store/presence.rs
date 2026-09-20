@@ -3,7 +3,7 @@ use sqlx::PgPool;
 use crate::{
     auth::AuthCtx,
     error::{BusError, BusResult},
-    model::{AgentInfo, AgentList, AgentSession, ts_opt},
+    model::{AgentInfo, AgentList, AgentSession, SessionEntry, SessionList, ts_opt},
 };
 
 const DEFAULT_TTL_SECS: i64 = 600; // 10 minutes
@@ -11,12 +11,61 @@ const MAX_TTL_SECS: i64 = 86_400;
 /// Repo, branch and activity are a status line, not a log.
 const MAX_PRESENCE_FIELD_BYTES: usize = 256;
 
+/// A discovery label (project, role): one lower-case word people type and
+/// filter by. Bounded like a session label.
+pub const MAX_LABEL_BYTES: usize = 64;
+
 pub struct HeartbeatInput {
     pub status: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub activity: Option<String>,
+    /// Discovery labels. `None` keeps the previous value, `Some("")` clears.
+    pub project: Option<String>,
+    pub role: Option<String>,
     pub ttl_seconds: Option<i64>,
+}
+
+/// Normalise a discovery label the way session labels are: trimmed and
+/// lower-cased so `Review` and `review` are one role, ASCII, one word.
+/// Empty means "clear" and is passed through.
+pub fn normalize_label(field: &str, raw: &str) -> BusResult<String> {
+    let label = raw.trim().to_lowercase();
+    if label.is_empty() {
+        return Ok(label);
+    }
+    if label.len() > MAX_LABEL_BYTES {
+        return Err(BusError::invalid(format!(
+            "{field} is {} bytes; the limit is {MAX_LABEL_BYTES}",
+            label.len()
+        )));
+    }
+    if !label
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return Err(BusError::invalid(format!(
+            "{field} may only contain ASCII letters, digits, '-', '_', '.' and ':' \
+             (got '{raw}'); it is a label to filter by, not a description — put that \
+             in activity"
+        )));
+    }
+    Ok(label)
+}
+
+/// The discovery labels a session last published, for `whoami`.
+pub async fn labels_of(
+    pool: &PgPool,
+    auth: &AuthCtx,
+) -> BusResult<(Option<String>, Option<String>)> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT project, role FROM agent_presence WHERE agent_id = $1 AND session = $2",
+    )
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or((None, None)))
 }
 
 pub async fn heartbeat(
@@ -64,6 +113,14 @@ pub async fn heartbeat(
         )?),
         None => None,
     };
+    let project = match input.project.as_deref() {
+        Some(v) => Some(normalize_label("project", v)?),
+        None => None,
+    };
+    let role = match input.role.as_deref() {
+        Some(v) => Some(normalize_label("role", v)?),
+        None => None,
+    };
 
     // Upsert on (agent_id, session), and report back the row just written.
     // Reading it from list_agents instead would pick whichever session came
@@ -75,19 +132,22 @@ pub async fn heartbeat(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
         bool,
     ) = sqlx::query_as(
         r#"
         WITH up AS (
             INSERT INTO agent_presence
-                (agent_id, session, status, repo, branch, activity, updated_at, expires_at)
+                (agent_id, session, status, repo, branch, activity, project, role,
+                 updated_at, expires_at)
             -- NULLIF on the insert path too: the CASE below only runs on
             -- conflict, so a first heartbeat for a new or freshly swept
             -- session stored '' and reported an empty string where the
             -- update path reports null.
-            VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), now(),
-                    now() + make_interval(secs => $7))
+            VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($8, ''), NULLIF($9, ''),
+                    now(), now() + make_interval(secs => $7))
             ON CONFLICT (agent_id, session) DO UPDATE SET
                 status     = EXCLUDED.status,
                 -- keep the previous value when the caller omits a field
@@ -104,9 +164,19 @@ pub async fn heartbeat(
                                  WHEN $6 = '' THEN NULL
                                  ELSE COALESCE(EXCLUDED.activity, agent_presence.activity)
                              END,
+                -- Same rule for the discovery labels.
+                project    = CASE
+                                 WHEN $8 = '' THEN NULL
+                                 ELSE COALESCE(EXCLUDED.project, agent_presence.project)
+                             END,
+                role       = CASE
+                                 WHEN $9 = '' THEN NULL
+                                 ELSE COALESCE(EXCLUDED.role, agent_presence.role)
+                             END,
                 updated_at = now(),
                 expires_at = EXCLUDED.expires_at
-            RETURNING agent_id, status, repo, branch, activity, updated_at, expires_at
+            RETURNING agent_id, status, repo, branch, activity, project, role,
+                      updated_at, expires_at
         )
         SELECT a.name,
                a.display_name,
@@ -114,6 +184,8 @@ pub async fn heartbeat(
                up.repo,
                up.branch,
                up.activity,
+               up.project,
+               up.role,
                up.updated_at,
                up.expires_at > now() AS online
         FROM up
@@ -127,6 +199,8 @@ pub async fn heartbeat(
     .bind(branch.as_deref())
     .bind(activity.as_deref())
     .bind(ttl as f64)
+    .bind(project.as_deref())
+    .bind(role.as_deref())
     .fetch_one(pool)
     .await?;
 
@@ -148,7 +222,8 @@ pub async fn heartbeat(
     .execute(pool)
     .await;
 
-    let (name, display_name, status, repo, branch, activity, updated_at, online) = row;
+    let (name, display_name, status, repo, branch, activity, project, role, updated_at, online) =
+        row;
     Ok(AgentInfo {
         name,
         display_name,
@@ -157,6 +232,8 @@ pub async fn heartbeat(
         repo,
         branch,
         activity,
+        project,
+        role,
         last_seen: ts_opt(updated_at),
         online,
         // The heartbeat reports the session it just wrote, not a survey of the
@@ -195,6 +272,8 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
         bool,
     )> = sqlx::query_as(
@@ -206,6 +285,8 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
                p.repo,
                p.branch,
                p.activity,
+               p.project,
+               p.role,
                p.updated_at,
                COALESCE(p.expires_at > now(), false) AS online
         FROM agents a
@@ -236,7 +317,20 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
     // Rows arrive grouped by agent and already in the order sessions should be
     // reported in, so one pass is enough.
     let mut agents: Vec<AgentInfo> = Vec::new();
-    for (name, display_name, session, status, repo, branch, activity, updated_at, online) in rows {
+    for (
+        name,
+        display_name,
+        session,
+        status,
+        repo,
+        branch,
+        activity,
+        project,
+        role,
+        updated_at,
+        online,
+    ) in rows
+    {
         let entry = AgentSession {
             // '' in the database, null on the wire: the shared session has no
             // name, and reporting one would invent a context that is not there.
@@ -249,6 +343,8 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
             repo,
             branch,
             activity,
+            project,
+            role,
             last_seen: ts_opt(updated_at),
             online,
         };
@@ -268,6 +364,8 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
                 repo: entry.repo.clone(),
                 branch: entry.branch.clone(),
                 activity: entry.activity.clone(),
+                project: entry.project.clone(),
+                role: entry.role.clone(),
                 last_seen: entry.last_seen.clone(),
                 online: entry.online,
                 sessions: vec![entry],
@@ -293,5 +391,128 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
     Ok(AgentList {
         agents,
         online_count,
+    })
+}
+
+/// Upper bound on a `list_sessions` page; the filters exist so nobody needs it.
+pub const MAX_SESSIONS: i64 = 1000;
+pub const DEFAULT_SESSIONS: i64 = 200;
+
+pub struct SessionFilter {
+    pub project: Option<String>,
+    pub role: Option<String>,
+    pub online_only: bool,
+    pub limit: Option<i64>,
+}
+
+/// Every session in the caller's team, one entry each, addressable. The
+/// shared session (no label) is listed too: it is where clients that send no
+/// header live, and `agent` alone is its address.
+pub async fn list_sessions(
+    pool: &PgPool,
+    auth: &AuthCtx,
+    filter: SessionFilter,
+) -> BusResult<SessionList> {
+    let project = match filter.project.as_deref() {
+        Some(v) => Some(normalize_label("project", v)?).filter(|s| !s.is_empty()),
+        None => None,
+    };
+    let role = match filter.role.as_deref() {
+        Some(v) => Some(normalize_label("role", v)?).filter(|s| !s.is_empty()),
+        None => None,
+    };
+    let limit = filter
+        .limit
+        .unwrap_or(DEFAULT_SESSIONS)
+        .clamp(1, MAX_SESSIONS);
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    )> = sqlx::query_as(
+        r#"
+        SELECT a.name,
+               p.session,
+               p.status,
+               p.repo,
+               p.branch,
+               p.activity,
+               p.project,
+               p.role,
+               p.updated_at,
+               (p.expires_at > now()) AS online
+        FROM agent_presence p
+        JOIN agents a ON a.id = p.agent_id
+        WHERE a.team_id = $1
+          AND a.disabled_at IS NULL
+          AND ($2::text IS NULL OR p.project = $2)
+          AND ($3::text IS NULL OR p.role = $3)
+          AND (NOT $4::bool OR p.expires_at > now())
+        -- Live first, then most recently active, then by address so the
+        -- order is stable between calls.
+        ORDER BY (p.expires_at > now()) DESC, p.updated_at DESC, a.name, p.session
+        LIMIT $5
+        "#,
+    )
+    .bind(auth.team_id)
+    .bind(project.as_deref())
+    .bind(role.as_deref())
+    .bind(filter.online_only)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let sessions: Vec<SessionEntry> = rows
+        .into_iter()
+        .map(
+            |(
+                agent,
+                session,
+                status,
+                repo,
+                branch,
+                activity,
+                project,
+                role,
+                updated_at,
+                online,
+            )| {
+                // The shared session has no address of its own: the bare
+                // `agent` reaches every window that agent has. Reported
+                // as-is, because the row is real presence, and flagged, so a
+                // caller cannot mistake it for a private target.
+                let exact = !session.is_empty();
+                let address = if exact {
+                    format!("{agent}/{session}")
+                } else {
+                    agent.clone()
+                };
+                SessionEntry {
+                    address,
+                    exact,
+                    session: (!session.is_empty()).then_some(session),
+                    agent,
+                    project,
+                    role,
+                    repo,
+                    branch,
+                    activity,
+                    status: if online { status } else { "offline".into() },
+                    online,
+                    last_seen: ts_opt(Some(updated_at)),
+                }
+            },
+        )
+        .collect();
+    Ok(SessionList {
+        count: sessions.len(),
+        sessions,
+        limit,
     })
 }
