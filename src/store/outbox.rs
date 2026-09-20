@@ -32,6 +32,9 @@ pub struct Lease {
     pub message_id: Uuid,
     pub conversation_id: Uuid,
     pub team_id: Uuid,
+    /// The backend this slot was enqueued for. A worker for another one
+    /// must not publish it.
+    pub backend: String,
     pub payload: String,
     pub publish_key: Uuid,
     /// The generation this lease was taken at. A settle that does not match
@@ -86,7 +89,8 @@ pub async fn enqueue(
 /// Take the next due slot, if there is one. `FOR UPDATE SKIP LOCKED`, so N
 /// workers never take the same one.
 pub async fn lease(pool: &PgPool, worker: &str) -> BusResult<Option<Lease>> {
-    let row: Option<(Uuid, Uuid, Uuid, String, Uuid, i64, i32)> = sqlx::query_as(
+    #[allow(clippy::type_complexity)]
+    let row: Option<(Uuid, Uuid, Uuid, String, String, Uuid, i64, i32)> = sqlx::query_as(
         "UPDATE conversation_outbox o
             SET state = 'leased',
                 leased_by = $1,
@@ -102,19 +106,29 @@ pub async fn lease(pool: &PgPool, worker: &str) -> BusResult<Option<Lease>> {
                ORDER BY next_attempt_at, created_at
                FOR UPDATE SKIP LOCKED
                LIMIT 1)
-          RETURNING o.message_id, o.conversation_id, o.team_id, o.payload, o.publish_key,
-                    o.generation, o.attempts",
+          RETURNING o.message_id, o.conversation_id, o.team_id, o.backend, o.payload,
+                    o.publish_key, o.generation, o.attempts",
     )
     .bind(worker)
     .bind(LEASE_SECS as f64)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(
-        |(message_id, conversation_id, team_id, payload, publish_key, generation, attempts)| {
+        |(
+            message_id,
+            conversation_id,
+            team_id,
+            backend,
+            payload,
+            publish_key,
+            generation,
+            attempts,
+        )| {
             Lease {
                 message_id,
                 conversation_id,
                 team_id,
+                backend,
                 payload,
                 publish_key,
                 generation,
@@ -269,7 +283,7 @@ pub async fn reconcile<B: MessagingBackend>(
     backend: &B,
     lease: &Lease,
 ) -> BusResult<Settled> {
-    match backend.reconcile(lease.publish_key).await? {
+    match backend.reconcile(&envelope_of(lease)).await? {
         Some(locator) => settle(pool, lease, Published::Confirmed(locator)).await,
         None => {
             settle(
@@ -291,18 +305,50 @@ pub async fn run_once<B: MessagingBackend>(
     let Some(lease) = lease(pool, worker).await? else {
         return Ok(None);
     };
+    // The slot records which backend it was enqueued for. A worker holding
+    // a different one would publish the body somewhere nobody is looking
+    // and settle it with a locator the reader cannot use.
+    if lease.backend != backend.name() {
+        let backend_name = backend.name();
+        tracing::warn!(
+            slot = %lease.message_id,
+            wanted = %lease.backend,
+            worker = %backend_name,
+            "a worker leased a slot for another backend; releasing it"
+        );
+        release(pool, &lease, "leased by a worker for another backend").await?;
+        return Ok(Some(Settled::Fenced));
+    }
     // Nothing is held here. A publish that takes a minute costs a lease,
     // not a lock.
-    let outcome = backend
-        .publish(Envelope {
-            message_id: lease.message_id,
-            conversation_id: lease.conversation_id,
-            team_id: lease.team_id,
-            body: lease.payload.clone(),
-            publish_key: lease.publish_key,
-        })
-        .await;
+    let outcome = backend.publish(envelope_of(&lease)).await;
     Ok(Some(settle(pool, &lease, outcome).await?))
+}
+
+fn envelope_of(lease: &Lease) -> Envelope {
+    Envelope {
+        message_id: lease.message_id,
+        conversation_id: lease.conversation_id,
+        team_id: lease.team_id,
+        body: lease.payload.clone(),
+        publish_key: lease.publish_key,
+    }
+}
+
+/// Put a leased slot back without counting it as an attempt.
+async fn release(pool: &PgPool, lease: &Lease, why: &str) -> BusResult<()> {
+    sqlx::query(
+        "UPDATE conversation_outbox
+            SET state = 'pending', leased_by = NULL, lease_expires_at = NULL,
+                attempts = GREATEST(attempts - 1, 0), last_error = $3, updated_at = now()
+          WHERE message_id = $1 AND generation = $2",
+    )
+    .bind(lease.message_id)
+    .bind(lease.generation)
+    .bind(why)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// What is outstanding, for an operator and for the pause/drain controls.

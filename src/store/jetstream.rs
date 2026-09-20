@@ -178,12 +178,37 @@ impl JetStreamBackend {
     pub async fn deprovision(config: &Config, team_id: Uuid) -> BusResult<()> {
         let client = connect_client(config).await?;
         let context = jetstream::new(client);
-        let _ = context.delete_stream(stream_name(team_id)).await;
-        Ok(())
+        let name = stream_name(team_id);
+        match context.delete_stream(&name).await {
+            Ok(_) => Ok(()),
+            // Already gone is the outcome the caller asked for.
+            Err(e) if e.to_string().contains("not found") => Ok(()),
+            // Anything else left the data in place, and an operator who is
+            // told "removed" would believe otherwise.
+            Err(e) => Err(BusError::invalid(format!(
+                "could not delete '{name}' ({e}). The stream and its bodies are still there."
+            ))),
+        }
     }
 
     pub fn stream(&self) -> &str {
         &self.stream
+    }
+
+    /// A sequence in **this** team's stream, or a refusal.
+    ///
+    /// The stream name is checked, not discarded. A forged
+    /// `jetstream:<someone-elses-stream>:<n>` would otherwise be read as
+    /// sequence n of this one, and the envelope check would pass whenever
+    /// that sequence happened to be ours.
+    fn parse_own_locator(&self, raw: &str) -> BusResult<u64> {
+        let (stream, sequence) = parse_locator(raw)?;
+        if stream != self.stream {
+            return Err(BusError::Forbidden(
+                "that locator names another stream".to_owned(),
+            ));
+        }
+        Ok(sequence)
     }
 }
 
@@ -212,6 +237,16 @@ impl MessagingBackend for JetStreamBackend {
     }
 
     async fn publish(&self, envelope: Envelope) -> Published {
+        // The subject comes from this adapter's team and the header from
+        // the envelope's. If they disagree, publishing would write one
+        // team's body into another's stream, where the team it belongs to
+        // could never read it.
+        if envelope.team_id != self.team_id {
+            return Published::Fatal(format!(
+                "this adapter serves team {} and the envelope is for {}",
+                self.team_id, envelope.team_id
+            ));
+        }
         let subject = subject(self.team_id, envelope.conversation_id);
         let mut headers = async_nats::HeaderMap::new();
         // The broker's own deduplication, inside its window; ours covers the
@@ -252,7 +287,7 @@ impl MessagingBackend for JetStreamBackend {
     }
 
     async fn fetch(&self, locator: &Locator) -> BusResult<Option<String>> {
-        let sequence = parse_locator(&locator.0)?;
+        let sequence = self.parse_own_locator(&locator.0)?;
         let stream = self
             .context
             .get_stream(&self.stream)
@@ -288,39 +323,39 @@ impl MessagingBackend for JetStreamBackend {
         Ok(0)
     }
 
-    async fn reconcile(&self, publish_key: Uuid) -> BusResult<Option<Locator>> {
-        // JetStream deduplicates on Nats-Msg-Id inside its window, so a
-        // republish of the same key returns the original sequence with
-        // `duplicate` set. That is the cheapest honest answer to "did my
-        // write land": ask, and read what comes back.
-        let subject = format!("acs.{}.probe", self.team_id.simple());
-        let mut headers = async_nats::HeaderMap::new();
-        headers.insert(MSG_ID_HEADER, publish_key.to_string().as_str());
-        let probe = self
-            .context
-            .publish_with_headers(subject, headers, bytes::Bytes::new())
-            .await;
-        let Ok(ack) = probe else { return Ok(None) };
-        match ack.await {
-            Ok(ack) if ack.duplicate => Ok(Some(Locator(format!(
-                "jetstream:{}:{}",
-                ack.stream, ack.sequence
-            )))),
-            // Not a duplicate means the broker had not seen this key, so the
-            // original write did not land and a retry is safe. The probe
-            // itself is an empty message on a subject nothing consumes.
-            Ok(_) => Ok(None),
-            Err(_) => Ok(None),
+    async fn reconcile(&self, envelope: &Envelope) -> BusResult<Option<Locator>> {
+        // Present the real envelope again under the same `Nats-Msg-Id`.
+        // Inside the deduplication window the broker recognises it and
+        // answers with the original sequence; outside it, the body lands
+        // now. Both answers are a canonical locator for one logical
+        // message, which is what the caller needs.
+        //
+        // The alternative — a small probe carrying the key — is worse than
+        // useless. Deduplication is per stream, so a probe that could
+        // answer at all is a probe that was stored, it consumes the bounded
+        // stream, and it takes the key the real body needed. The locator
+        // then names an empty message and the body never lands at all.
+        match self.publish(envelope.clone()).await {
+            Published::Confirmed(locator) => Ok(Some(locator)),
+            // Still no answer, or a refusal. Nothing is claimed either way;
+            // the slot stays and the ordinary path retries or gives up.
+            Published::Retryable(_) | Published::Fatal(_) => Ok(None),
         }
     }
 }
 
-/// `jetstream:<stream>:<sequence>`.
-fn parse_locator(raw: &str) -> BusResult<u64> {
-    raw.rsplit(':')
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| BusError::invalid("not a locator this backend issued"))
+/// `jetstream:<stream>:<sequence>`, parsed into its parts.
+fn parse_locator(raw: &str) -> BusResult<(&str, u64)> {
+    let mut parts = raw.split(':');
+    let (Some("jetstream"), Some(stream), Some(sequence), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(BusError::invalid("not a locator this backend issued"));
+    };
+    let sequence = sequence
+        .parse::<u64>()
+        .map_err(|_| BusError::invalid("not a locator this backend issued"))?;
+    Ok((stream, sequence))
 }
 
 /// Tell apart "try again" from "this will never work". Getting this wrong in
@@ -362,8 +397,19 @@ mod tests {
 
     #[test]
     fn a_locator_round_trips_and_a_forged_one_is_refused() {
-        assert_eq!(parse_locator("jetstream:ACS_T_x:42").unwrap(), 42);
+        assert_eq!(
+            parse_locator("jetstream:ACS_T_x:42").unwrap(),
+            ("ACS_T_x", 42)
+        );
         assert!(parse_locator("nonsense").is_err());
+        assert!(
+            parse_locator("ACS_T_x:42").is_err(),
+            "the prefix is checked"
+        );
+        assert!(
+            parse_locator("jetstream:ACS_T_x:42:extra").is_err(),
+            "a locator has three parts and no more"
+        );
     }
 
     #[test]

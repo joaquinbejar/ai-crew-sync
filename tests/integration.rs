@@ -7460,13 +7460,20 @@ async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
         Some("the empty state needs a spinner")
     );
 
-    // Another team cannot read it even holding the locator. Two independent
-    // reasons, and either is a pass: the locator names a sequence in *their*
-    // stream, which does not hold it, and the envelope's team is checked
-    // rather than trusted if it ever did.
+    // Another team cannot read it even holding the locator. Three
+    // independent reasons and any of them is a pass: the locator names a
+    // stream that is not theirs, that stream would not hold the sequence
+    // anyway, and the envelope's team is checked rather than trusted if it
+    // ever got that far.
     match theirs.fetch(&locator).await {
         Ok(None) => {}
-        Err(e) => assert!(e.to_string().contains("another team"), "{e}"),
+        Err(e) => {
+            let why = e.to_string();
+            assert!(
+                why.contains("another stream") || why.contains("another team"),
+                "{why}"
+            );
+        }
         Ok(Some(body)) => panic!("another team read a body it must not see: {body}"),
     }
 
@@ -7477,17 +7484,51 @@ async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
         other => panic!("{other:?}"),
     };
     assert_eq!(again, locator, "a retry must not duplicate the body");
-    // And reconciliation recognises the key for the uncertain case.
+    // Reconciliation answers the uncertain case without inventing a second
+    // logical message, and without writing a probe that would take the key
+    // the body needs.
     assert_eq!(
-        backend.reconcile(key).await.unwrap(),
+        backend.reconcile(&envelope).await.unwrap(),
         Some(locator.clone()),
         "reconcile must find a key the broker has seen"
     );
+    let unseen = Envelope {
+        message_id: Uuid::new_v4(),
+        conversation_id: conversation,
+        team_id: team,
+        body: "reconciled into existence".into(),
+        publish_key: Uuid::new_v4(),
+    };
+    let landed = backend.reconcile(&unseen).await.unwrap().unwrap();
     assert_eq!(
-        backend.reconcile(Uuid::new_v4()).await.unwrap(),
-        None,
-        "a key the broker never saw means the write did not land"
+        backend.fetch(&landed).await.unwrap().as_deref(),
+        Some("reconciled into existence"),
+        "the locator must name the body, not an empty probe"
     );
+    assert_eq!(
+        backend.reconcile(&unseen).await.unwrap(),
+        Some(landed),
+        "reconciling twice is still one message"
+    );
+
+    // An envelope for another team is refused rather than written into this
+    // team's stream, where the team it belongs to could never read it.
+    let stranger = backend
+        .publish(Envelope {
+            message_id: Uuid::new_v4(),
+            conversation_id: conversation,
+            team_id: Uuid::new_v4(),
+            body: "not mine".into(),
+            publish_key: Uuid::new_v4(),
+        })
+        .await;
+    assert!(matches!(stranger, Published::Fatal(_)), "{stranger:?}");
+
+    // A locator naming another stream is refused before it reaches the
+    // broker, rather than read as that sequence of this one.
+    let forged = Locator(format!("jetstream:ACS_T_{}:1", Uuid::new_v4().simple()));
+    let err = backend.fetch(&forged).await.unwrap_err().to_string();
+    assert!(err.contains("another stream"), "{err}");
 
     // The 1 MiB body contract still fits once headers and framing are added
     // — but only because the fixture raises the server's own max_payload as
@@ -7521,14 +7562,21 @@ async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
         .await;
     assert!(matches!(outcome, Published::Fatal(_)), "{outcome:?}");
 
-    // An unknown locator is absent, not an error, and a forged one is
-    // refused rather than guessed at.
+    // A sequence this stream does not hold is absent, not an error. A
+    // locator naming another stream, or no stream at all, is refused rather
+    // than guessed at.
     assert!(
         backend
-            .fetch(&Locator("jetstream:ACS_T_x:999999".into()))
+            .fetch(&Locator(format!("jetstream:{}:999999", backend.stream())))
             .await
             .unwrap()
             .is_none()
+    );
+    assert!(
+        backend
+            .fetch(&Locator("jetstream:ACS_T_x:1".into()))
+            .await
+            .is_err()
     );
     assert!(backend.fetch(&Locator("nonsense".into())).await.is_err());
 
