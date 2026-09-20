@@ -510,7 +510,6 @@ async fn tools_are_advertised_with_schemas() {
         "resume_session",
         "renew_session",
         "revoke_session",
-
         "set_note",
         "get_note",
         "list_notes",
@@ -8086,9 +8085,18 @@ async fn each_recipient_holds_its_own_durable_inbox() {
     let backend = JetStreamBackend::connect(&config, team).await.unwrap();
 
     let owner = connect_with_session(&h.base, &owner_token, "impl").await;
-    let review = connect_with_session(&h.base, &dani_token, "review").await;
     let design = connect_with_session(&h.base, &dani_token, "design").await;
     let marta = connect_with_session(&h.base, &marta_token, "review").await;
+    // One of the three is a registered window, so the inbox is exercised
+    // with a real session credential and not only with a header label.
+    let dani_agent = connect(&h.base, &dani_token).await;
+    let review_cred = call(
+        &dani_agent,
+        "register_session",
+        json!({"session": "review"}),
+    )
+    .await;
+    let review = connect(&h.base, review_cred["session_token"].as_str().unwrap()).await;
 
     let convo = call(
         &owner,
@@ -8190,7 +8198,7 @@ async fn each_recipient_holds_its_own_durable_inbox() {
     call(
         &review,
         "ack_message",
-        json!({"message_id": sent["message_id"], "resolved": true}),
+        json!({"message_id": sent["message_id"]}),
     )
     .await;
     let receipts = call(
@@ -8200,8 +8208,60 @@ async fn each_recipient_holds_its_own_durable_inbox() {
     )
     .await;
     assert_eq!(receipts["acknowledged"], 1);
-    assert_eq!(receipts["resolved"], 1);
+    assert_eq!(receipts["resolved"], 0);
     assert_eq!(receipts["total"], 3);
+
+    // The parent agent token cannot read its own window's inbox, or record
+    // a delivery on its behalf. The label in the header is a name.
+    let impostor = connect_with_session(&h.base, &dani_token, "review").await;
+    let err = call_expect_error(&impostor, "fetch_conversation_inbox", json!({})).await;
+    assert!(err.contains("registered window"), "{err}");
+    let err = call_expect_error(
+        &impostor,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [first["references"][0]["delivery_id"]]}),
+    )
+    .await;
+    assert!(err.contains("registered window"), "{err}");
+    let err = call_expect_error(&impostor, "conversation_inbox_status", json!({})).await;
+    assert!(err.contains("registered window"), "{err}");
+
+    // A later observation on the same message is a new notification. The
+    // sender is told to look again when the recipient resolves it, not only
+    // the first time it acknowledged.
+    inbox::publish_pending(&h.pool, &backend, team, 100)
+        .await
+        .unwrap();
+    call(
+        &review,
+        "ack_message",
+        json!({"message_id": sent["message_id"], "resolved": true, "note": "and done"}),
+    )
+    .await;
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        1,
+        "resolving after acknowledging is a second thing to tell the sender"
+    );
+    let (events,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM inbox_events WHERE kind = 'receipt' AND message_id = $1",
+    )
+    .bind(
+        sent["message_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap(),
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        events, 2,
+        "acknowledged and resolved are two observations, not one coalesced row"
+    );
 
     // A process that takes a reference and dies before confirming: the
     // reference is not lost and no receipt is invented. A second fetch does
@@ -8219,6 +8279,20 @@ async fn each_recipient_holds_its_own_durable_inbox() {
     assert_eq!(state["address"], "dani/design");
     assert_eq!(state["undelivered"], 1, "the authority still says one");
     assert_eq!(state["handed_out_unconfirmed"], 1);
+
+    // Offered again once that hand-out has gone stale, it is the same
+    // reference under the same delivery id. A second row for the same
+    // reference used to violate the unique index and fail the whole fetch.
+    sqlx::query("UPDATE inbox_deliveries SET handed_at = now() - interval '10 minutes'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let redelivered = call(&design, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(redelivered["references"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        redelivered["references"][0]["delivery_id"], taken["references"][0]["delivery_id"],
+        "a redelivery finds the hand-out that is already open: {redelivered}"
+    );
     // The confirmation arrives after the restart, with the reference the
     // spool kept. Confirming twice changes nothing.
     let id = taken["references"][0]["delivery_id"].clone();
@@ -8367,7 +8441,15 @@ async fn each_recipient_holds_its_own_durable_inbox() {
     .await;
     assert_eq!(read["messages"].as_array().unwrap().len(), 1);
 
-    for c in [owner, review, design, marta, marta_window] {
+    for c in [
+        owner,
+        review,
+        design,
+        marta,
+        marta_window,
+        dani_agent,
+        impostor,
+    ] {
         let _ = c.cancel().await;
     }
     h.shutdown().await;

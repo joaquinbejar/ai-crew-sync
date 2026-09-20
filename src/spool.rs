@@ -82,6 +82,11 @@ pub fn append(path: &Path, entries: &[Entry]) -> anyhow::Result<Vec<Entry>> {
     if fresh.is_empty() {
         return Ok(fresh);
     }
+    // A process killed mid-write leaves a line with no newline. Appending
+    // straight onto it would glue the next entry to that fragment, fsync
+    // happily, and lose both on the next read — after the bus had already
+    // been told they were held.
+    repair_tail(path)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -99,6 +104,23 @@ pub fn append(path: &Path, entries: &[Entry]) -> anyhow::Result<Vec<Entry>> {
     // The durability claim is this call. Without it, "delivered" is a hope.
     file.sync_all().context("fsync of the inbox spool")?;
     Ok(fresh)
+}
+
+/// Terminate an interrupted final line before anything is appended.
+fn repair_tail(path: &Path) -> anyhow::Result<()> {
+    let Ok(text) = std::fs::read(path) else {
+        return Ok(());
+    };
+    if text.is_empty() || text.ends_with(b"\n") {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Every entry the spool still holds. A malformed line is skipped rather
@@ -182,12 +204,13 @@ mod tests {
         let path = dir.join("s.jsonl");
         append(&path, &[entry("a")]).unwrap();
         {
+            // No newline: a process killed mid-write leaves exactly this.
             use std::io::Write as _;
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
                 .unwrap();
-            writeln!(f, "{{\"delivery_id\": \"hal").unwrap();
+            write!(f, "{{\"delivery_id\": \"hal").unwrap();
         }
         append(&path, &[entry("b")]).unwrap();
         let held = read(&path);

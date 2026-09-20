@@ -931,22 +931,7 @@ pub async fn join(pool: &PgPool, auth: &AuthCtx, id: Uuid) -> BusResult<Conversa
     // addressed to one of its own windows and then read, send and
     // acknowledge as it — without the audit trail that the documented
     // recovery path carries.
-    if !auth.session.is_empty() && auth.session_id.is_none() {
-        let (live,): (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM agent_sessions
-              WHERE agent_id = $1 AND label = $2 AND revoked_at IS NULL AND expires_at > now()",
-        )
-        .bind(auth.agent_id)
-        .bind(&auth.session)
-        .fetch_one(pool)
-        .await?;
-        if live > 0 {
-            return Err(BusError::Forbidden(format!(
-                "'{}' is a registered window and this call carries an agent token, not that                  window's session credential. Ask that window to join, or use                  recover_conversation_history, which is the audited way for an agent to                  reach its own windows' threads.",
-                auth.session
-            )));
-        }
-    }
+    crate::store::sessions::require_window(pool, auth).await?;
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
     let updated: Option<(Uuid,)> = sqlx::query_as(
@@ -1936,7 +1921,13 @@ pub async fn ack(
     // itself: a notification cannot exist without the receipt it reports,
     // and a receipt cannot be written without queueing the notification.
     // A no-op for a thread on Postgres, where the event hub already does it.
-    crate::store::inbox::enqueue_receipt_reference(&mut tx, message_id).await?;
+    crate::store::inbox::enqueue_receipt_reference(
+        &mut tx,
+        message_id,
+        membership.id,
+        if resolved { "resolved" } else { "acknowledged" },
+    )
+    .await?;
     tx.commit().await?;
     receipt_of(pool, message_id, membership.id)
         .await?

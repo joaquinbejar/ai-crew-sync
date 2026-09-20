@@ -384,19 +384,35 @@ impl JetStreamBackend {
     /// What this recipient's consumer holds. A missing consumer is a fact,
     /// not an empty inbox.
     pub async fn inbox_status(&self, recipient_key: &str) -> BusResult<InboxStatus> {
-        let Ok(stream) = self
+        let stream = match self
             .context
             .get_stream(inbox_stream_name(self.team_id))
             .await
-        else {
-            return Ok(InboxStatus::default());
+        {
+            Ok(stream) => stream,
+            // A stream that is not there is a fact. A broker that cannot be
+            // reached is a different one, and reporting an empty cache
+            // during an outage is how an operator concludes the inbox is
+            // drained when it is not.
+            Err(e) if e.to_string().contains("not found") => return Ok(InboxStatus::default()),
+            Err(e) => {
+                return Err(BusError::invalid(format!(
+                    "could not read the inbox stream: {e}"
+                )));
+            }
         };
         let durable = format!("IN_{recipient_key}");
-        let Ok(mut consumer) = stream
+        let mut consumer = match stream
             .get_consumer::<jetstream::consumer::pull::Config>(&durable)
             .await
-        else {
-            return Ok(InboxStatus::default());
+        {
+            Ok(consumer) => consumer,
+            Err(e) if e.to_string().contains("not found") => return Ok(InboxStatus::default()),
+            Err(e) => {
+                return Err(BusError::invalid(format!(
+                    "could not read this window's consumer: {e}"
+                )));
+            }
         };
         let info = consumer
             .info()

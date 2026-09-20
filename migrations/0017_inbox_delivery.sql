@@ -33,9 +33,14 @@ CREATE TABLE inbox_events (
     last_error      TEXT,
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- One reference per recipient per message per kind. A retry of the
-    -- publication is the same row, never a second notification.
-    UNIQUE (kind, message_id, recipient_key)
+    -- What distinguishes one notification from the next for the same
+    -- message and recipient. Empty for a message reference, which happens
+    -- once; for a receipt it names the observation, so a later resolution
+    -- is a new notification and a repeat of the same one is not.
+    dedup           TEXT NOT NULL DEFAULT '',
+    -- A retry of the publication is the same row, never a second
+    -- notification.
+    UNIQUE (kind, message_id, recipient_key, dedup)
 );
 
 CREATE INDEX inbox_events_due_idx ON inbox_events (next_attempt_at)
@@ -63,15 +68,22 @@ CREATE TABLE inbox_deliveries (
     -- acknowledge.
     ack_subject   TEXT NOT NULL DEFAULT '',
     stream_seq    BIGINT,
+    -- Matches inbox_events.dedup, so a receipt notification and a message
+    -- reference for the same message are two hand-outs, not one.
+    event_dedup   TEXT NOT NULL DEFAULT '',
     handed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     confirmed_at  TIMESTAMPTZ
 );
 
 CREATE INDEX inbox_deliveries_open_idx ON inbox_deliveries (recipient_key, handed_at)
     WHERE confirmed_at IS NULL;
-CREATE UNIQUE INDEX inbox_deliveries_seq_idx
-    ON inbox_deliveries (recipient_key, stream_seq)
-    WHERE stream_seq IS NOT NULL;
+-- One open hand-out per reference. A redelivery, or two fetches racing each
+-- other, must find the row that is already out rather than make a second
+-- one: the same reference handed over twice under two ids is how a
+-- confirmation ends up settling the wrong thing.
+CREATE UNIQUE INDEX inbox_deliveries_open_unique
+    ON inbox_deliveries (recipient_key, message_id, event_dedup)
+    WHERE confirmed_at IS NULL;
 
 COMMENT ON TABLE inbox_deliveries IS
     'References handed to a client, and whether it confirmed holding them durably.';

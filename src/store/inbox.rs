@@ -80,6 +80,7 @@ pub async fn enqueue_message_references(
                 'message', msg.id, m.id,
                 jsonb_build_object(
                     'kind', 'message',
+                    'dedup', '',
                     'message_id', msg.id,
                     'conversation_id', c.id,
                     'seq', msg.seq,
@@ -92,7 +93,7 @@ pub async fn enqueue_message_references(
            JOIN conversations c ON c.id = msg.conversation_id
            JOIN agents sender ON sender.id = msg.sender_agent
           WHERE r.message_id = $1
-         ON CONFLICT (kind, message_id, recipient_key) DO NOTHING",
+         ON CONFLICT (kind, message_id, recipient_key, dedup) DO NOTHING",
     )
     .bind(message_id)
     .execute(tx)
@@ -109,25 +110,37 @@ pub async fn enqueue_message_references(
 pub async fn enqueue_receipt_reference(
     tx: &mut sqlx::PgConnection,
     message_id: Uuid,
+    membership_id: Uuid,
+    observation: &str,
 ) -> BusResult<u64> {
+    // The observation is part of the key. Coalescing every receipt change
+    // for a message into one row means the sender is told once and never
+    // again: a later resolution, or a second recipient answering, conflicts
+    // with the row already there and queues nothing.
+    let dedup = format!("{membership_id}:{observation}");
     let done = sqlx::query(
         "INSERT INTO inbox_events
-            (team_id, recipient_key, kind, message_id, membership_id, payload)
+            (team_id, recipient_key, kind, message_id, membership_id, payload, dedup)
          SELECT c.team_id,
                 CASE WHEN msg.sender_session = '' THEN 'a' || replace(ag.id::text, '-', '')
                      ELSE 'a' || replace(ag.id::text, '-', '') || '_'
                           || encode(convert_to(msg.sender_session, 'UTF8'), 'hex')
                 END,
-                'receipt', msg.id, NULL,
+                'receipt', msg.id, $2,
                 jsonb_build_object('kind', 'receipt', 'message_id', msg.id,
-                                   'conversation_id', c.id, 'seq', msg.seq)
+                                   'conversation_id', c.id, 'seq', msg.seq,
+                                   'observation', $3::text, 'dedup', $4::text),
+                $4
            FROM conversation_messages msg
            JOIN conversations c ON c.id = msg.conversation_id
            JOIN agents ag ON ag.id = msg.sender_agent
           WHERE msg.id = $1 AND c.backend <> 'postgres'
-         ON CONFLICT (kind, message_id, recipient_key) DO NOTHING",
+         ON CONFLICT (kind, message_id, recipient_key, dedup) DO NOTHING",
     )
     .bind(message_id)
+    .bind(membership_id)
+    .bind(observation)
+    .bind(&dedup)
     .execute(tx)
     .await?;
     Ok(done.rows_affected())
@@ -203,6 +216,10 @@ pub async fn fetch(
     limit: Option<i64>,
 ) -> BusResult<InboxBatch> {
     crate::store::conversations::require_capability(pool, auth).await?;
+    // An inbox belongs to a window, and a label in a header is not proof of
+    // being one. Without this, the parent agent token could take its own
+    // window's references and record them as delivered on its behalf.
+    crate::store::sessions::require_window(pool, auth).await?;
     let limit = limit.unwrap_or(DEFAULT_BATCH).clamp(1, MAX_BATCH);
     let key = caller_key(auth);
     let mut references = Vec::new();
@@ -254,6 +271,14 @@ pub async fn fetch(
         let rest = limit - references.len() as i64;
         references.extend(reconcile_from_postgres(pool, auth, &key, rest).await?);
     }
+    // Receipt notifications are not in message_receipts — the sender is not
+    // a recipient of its own message — so they are rebuilt from the events
+    // themselves, or an inbox loss would cost the sender every "look again"
+    // it had not yet collected.
+    if (references.len() as i64) < limit {
+        let rest = limit - references.len() as i64;
+        references.extend(reconcile_receipt_events(pool, auth, &key, rest).await?);
+    }
     let more = references.len() as i64 >= limit;
     Ok(InboxBatch {
         references,
@@ -279,16 +304,24 @@ async fn record_broker_reference(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| BusError::invalid("a reference without a message id"))?;
 
-    let existing: Option<(Uuid, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
-        "SELECT id, confirmed_at FROM inbox_deliveries
-          WHERE recipient_key = $1 AND message_id = $2
-          ORDER BY handed_at DESC LIMIT 1",
+    let dedup = payload
+        .get("dedup")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    // Already confirmed means this is a redelivery of something the holder
+    // has, so the answer is an acknowledgement rather than another copy.
+    let (confirmed,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM inbox_deliveries
+          WHERE recipient_key = $1 AND message_id = $2 AND event_dedup = $3
+            AND confirmed_at IS NOT NULL",
     )
     .bind(key)
     .bind(message_id)
-    .fetch_optional(pool)
+    .bind(&dedup)
+    .fetch_one(pool)
     .await?;
-    if let Some((_, Some(_))) = existing {
+    if confirmed > 0 {
         return Ok(None);
     }
 
@@ -317,19 +350,36 @@ async fn record_broker_reference(
     let membership: Option<(Uuid,)> = sqlx::query_as(
         "SELECT r.membership_id FROM message_recipients r
            JOIN conversation_memberships cm ON cm.id = r.membership_id
-          WHERE r.message_id = $1 AND cm.agent_id = $2 AND cm.session = $3",
+          WHERE r.message_id = $1 AND cm.agent_id = $2 AND cm.session = $3
+            AND cm.state = 'active'",
     )
     .bind(message_id)
     .bind(auth.agent_id)
     .bind(&auth.session)
     .fetch_optional(pool)
     .await?;
+    // A message reference is for a recipient, and a membership that has
+    // ended is not one any more. The reference names a private thread, its
+    // sender and when it was sent, so it is not harmless to hand over.
+    // A receipt notification is for the sender, who is not a recipient.
+    if membership.is_none() && dedup.is_empty() {
+        return Ok(None);
+    }
 
+    // One open hand-out per reference. A redelivery, or two fetches racing,
+    // finds the row that is already out and returns its id rather than
+    // making a second one under a different delivery id.
     let (delivery_id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO inbox_deliveries
             (team_id, recipient_key, session_id, epoch, message_id, membership_id,
-             ack_subject, stream_seq)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ack_subject, stream_seq, event_dedup)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (recipient_key, message_id, event_dedup) WHERE confirmed_at IS NULL
+         DO UPDATE SET ack_subject = EXCLUDED.ack_subject,
+                       stream_seq = EXCLUDED.stream_seq,
+                       session_id = EXCLUDED.session_id,
+                       epoch = EXCLUDED.epoch,
+                       handed_at = now()
          RETURNING id",
     )
     .bind(auth.team_id)
@@ -340,6 +390,7 @@ async fn record_broker_reference(
     .bind(membership.map(|m| m.0))
     .bind(&r.ack_subject)
     .bind(r.stream_seq as i64)
+    .bind(&dedup)
     .fetch_one(pool)
     .await?;
 
@@ -412,7 +463,10 @@ async fn reconcile_from_postgres(
         let (delivery_id,): (Uuid,) = sqlx::query_as(
             "INSERT INTO inbox_deliveries
                 (team_id, recipient_key, session_id, epoch, message_id, membership_id)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (recipient_key, message_id, event_dedup) WHERE confirmed_at IS NULL
+             DO UPDATE SET handed_at = now()
+             RETURNING id",
         )
         .bind(auth.team_id)
         .bind(key)
@@ -442,6 +496,83 @@ async fn reconcile_from_postgres(
     Ok(out)
 }
 
+/// Receipt notifications this window has not confirmed, from the events
+/// themselves.
+async fn reconcile_receipt_events(
+    pool: &PgPool,
+    auth: &AuthCtx,
+    key: &str,
+    limit: i64,
+) -> BusResult<Vec<InboxReference>> {
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        Uuid,
+        String,
+        Uuid,
+        i64,
+        String,
+        String,
+        chrono::DateTime<chrono::Utc>,
+    )> = sqlx::query_as(
+        "SELECT e.message_id, e.dedup, m.conversation_id, m.seq, ag.name,
+                    m.sender_session, m.created_at
+               FROM inbox_events e
+               JOIN conversation_messages m ON m.id = e.message_id
+               JOIN agents ag ON ag.id = m.sender_agent
+              WHERE e.recipient_key = $1 AND e.kind = 'receipt' AND e.state = 'published'
+                AND m.deleted_at IS NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM inbox_deliveries d
+                     WHERE d.recipient_key = $1 AND d.message_id = e.message_id
+                       AND d.event_dedup = e.dedup
+                       AND (d.confirmed_at IS NOT NULL
+                            OR d.handed_at > now() - interval '5 minutes'))
+              ORDER BY e.created_at
+              LIMIT $2",
+    )
+    .bind(key)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (message_id, dedup, conversation_id, seq, from, from_session, created_at) in rows {
+        let (delivery_id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO inbox_deliveries
+                (team_id, recipient_key, session_id, epoch, message_id, event_dedup)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (recipient_key, message_id, event_dedup) WHERE confirmed_at IS NULL
+             DO UPDATE SET handed_at = now()
+             RETURNING id",
+        )
+        .bind(auth.team_id)
+        .bind(key)
+        .bind(auth.session_id)
+        .bind(auth.session_epoch)
+        .bind(message_id)
+        .bind(&dedup)
+        .fetch_one(pool)
+        .await?;
+        out.push(InboxReference {
+            delivery_id: delivery_id.to_string(),
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            seq,
+            from_address: if from_session.is_empty() {
+                from.clone()
+            } else {
+                format!("{from}/{from_session}")
+            },
+            from,
+            created_at: ts(created_at),
+            redelivered: false,
+            source: "bus".to_owned(),
+            kind: "receipt".to_owned(),
+        });
+    }
+    Ok(out)
+}
+
 /// The caller says it holds these references durably. Only now is
 /// `delivered_at` written, and only after that is the broker acknowledged.
 ///
@@ -455,6 +586,7 @@ pub async fn confirm(
     delivery_ids: &[String],
 ) -> BusResult<i64> {
     crate::store::conversations::require_capability(pool, auth).await?;
+    crate::store::sessions::require_window(pool, auth).await?;
     if delivery_ids.is_empty() {
         return Err(BusError::invalid(
             "nothing to confirm: pass the delivery_id of each reference you hold",
@@ -512,7 +644,19 @@ pub async fn confirm(
     // Only now the broker. An acknowledgement lost here costs a redelivery,
     // which the next fetch recognises; acknowledging before the commit would
     // cost the reference itself.
-    if let Ok(AnyBackend::JetStream(backend)) = backends.for_team(pool, auth.team_id).await {
+    // The acknowledgement goes to the broker this deployment has, not to
+    // whatever the team's *default route* is now: a team routed back to
+    // Postgres still has references outstanding on the broker, and they
+    // would redeliver for ever.
+    let has_ack = rows.iter().any(|(_, subject, _)| !subject.is_empty());
+    if has_ack
+        && let Ok(AnyBackend::JetStream(backend)) = backends
+            .named(
+                crate::store::jetstream::JetStreamBackend::NAME,
+                auth.team_id,
+            )
+            .await
+    {
         for (_, ack_subject, _) in &rows {
             if let Err(e) = backend.ack_reference(ack_subject).await {
                 tracing::warn!(error = %e, "a delivery was committed but not acknowledged");
@@ -530,6 +674,7 @@ pub async fn state(
     auth: &AuthCtx,
 ) -> BusResult<InboxState> {
     crate::store::conversations::require_capability(pool, auth).await?;
+    crate::store::sessions::require_window(pool, auth).await?;
     let key = caller_key(auth);
     let (undelivered,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM message_receipts r

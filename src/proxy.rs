@@ -1039,7 +1039,26 @@ impl Proxy {
         let confirm =
             CallToolRequestParams::new("confirm_inbox_delivery".to_string()).with_arguments(params);
         match self.forward(confirm, host_ct).await {
-            Ok(_) => {
+            Ok(result) => {
+                // The bus says how many it actually committed. A stale
+                // epoch, or a partial result, answers successfully and
+                // writes nothing; marking the spool confirmed anyway would
+                // throw away the only evidence that they are still owed.
+                let committed = result
+                    .structured_content
+                    .as_ref()
+                    .and_then(|v| v.get("confirmed"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                if committed as usize != to_confirm.len() {
+                    tracing::warn!(
+                        sent = to_confirm.len(),
+                        committed,
+                        "the bus confirmed fewer references than were sent; keeping the rest \
+                         in the spool"
+                    );
+                    return result;
+                }
                 for entry in held.iter_mut() {
                     if to_confirm.contains(&entry.delivery_id) {
                         entry.confirmed = true;
