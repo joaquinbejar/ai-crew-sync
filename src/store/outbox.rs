@@ -608,7 +608,15 @@ pub async fn release_published_bodies(
             AND m.publication_state = 'stored'
             AND m.canonical_locator IS NOT NULL
             AND m.body <> ''
-            AND m.created_at <= now() - make_interval(secs => $2)",
+            AND m.created_at <= now() - make_interval(secs => $2)
+            -- Never a body a supervised move copied. That one is the
+            -- rollback source, and it is released by `conversations
+            -- cleanup` with the window an operator states, not by a sweep
+            -- five minutes later.
+            AND NOT EXISTS (
+                SELECT 1 FROM conversation_migration_items i
+                  JOIN conversation_migrations g ON g.id = i.migration_id
+                 WHERE i.message_id = m.id AND g.state = 'cut_over')",
     )
     .bind(conversation)
     .bind(min_age_secs as f64)

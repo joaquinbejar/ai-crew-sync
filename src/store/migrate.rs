@@ -87,6 +87,9 @@ pub struct Plan {
     pub already_there: i64,
     /// Why this conversation cannot be moved, when it cannot.
     pub blocked: Option<String>,
+    /// True when a run is already open for it: the command continues that
+    /// one instead of starting another.
+    pub resuming: bool,
 }
 
 /// Plan a move for every conversation of a team, or for a chosen few.
@@ -109,23 +112,49 @@ pub async fn plan(
     let mut plans = Vec::with_capacity(rows.len());
     for (id, title, backend, paused) in rows {
         let (messages, bytes, already): (i64, i64, i64) = sqlx::query_as(
+            // A body already released to its backend is empty here, and a
+            // rollback still has to copy it. The size recorded when it was
+            // moved is what that costs.
             "SELECT count(*),
-                    COALESCE(sum(length(body)), 0)::bigint,
-                    count(*) FILTER (WHERE backend = $2)
-               FROM conversation_messages
-              WHERE conversation_id = $1 AND deleted_at IS NULL",
+                    COALESCE(sum(COALESCE(NULLIF(length(m.body), 0),
+                        (SELECT i.bytes FROM conversation_migration_items i
+                          WHERE i.message_id = m.id
+                          ORDER BY i.bytes DESC LIMIT 1), 0)), 0)::bigint,
+                    count(*) FILTER (WHERE m.backend = $2)
+               FROM conversation_messages m
+              WHERE m.conversation_id = $1 AND m.deleted_at IS NULL",
         )
         .bind(id)
         .bind(direction.target())
         .fetch_one(pool)
         .await?;
-        let blocked = if backend == direction.target() && already == messages {
+        // An open run for this direction is one to *resume*, not a reason to
+        // refuse. A process that died holding the pause would otherwise
+        // leave the thread paused for ever, with the documented command
+        // reporting success and doing nothing.
+        let (open_runs,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM conversation_migrations
+              WHERE conversation_id = $1 AND direction = $2
+                AND state IN ('planned', 'copying', 'verified')",
+        )
+        .bind(id)
+        .bind(direction.column())
+        .fetch_one(pool)
+        .await?;
+        let blocked = if backend == direction.target() && already == messages && open_runs == 0 {
             Some(format!("already on {}", direction.target()))
-        } else if paused.is_some() {
-            Some("a move is already in progress on this thread".to_owned())
+        } else if paused.is_some() && open_runs == 0 {
+            // Paused with no run behind it: something cleared the run and
+            // left the flag. Say so rather than silently writing through it.
+            Some(
+                "this thread is paused and no move owns the pause; clear write_paused_at \
+                 before trying again"
+                    .to_owned(),
+            )
         } else {
             None
         };
+        let resuming = open_runs > 0;
         plans.push(Plan {
             conversation_id: id,
             title,
@@ -134,6 +163,7 @@ pub async fn plan(
             bytes,
             already_there: already,
             blocked,
+            resuming,
         });
     }
     Ok(plans)
@@ -164,17 +194,33 @@ async fn open_run(
     conversation_id: Uuid,
     direction: Direction,
 ) -> BusResult<Uuid> {
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM conversation_migrations
-          WHERE conversation_id = $1 AND direction = $2
+    // One run per conversation at a time, decided under the conversation's
+    // own lock. Two operators starting a move on the same thread would
+    // otherwise each open one, and the first to fail would lift the pause
+    // out from under the other.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let existing: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, direction FROM conversation_migrations
+          WHERE conversation_id = $1
             AND state IN ('planned', 'copying', 'verified')
           ORDER BY started_at DESC LIMIT 1",
     )
     .bind(conversation_id)
-    .bind(direction.column())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    if let Some((id,)) = existing {
+    if let Some((id, open_direction)) = existing {
+        if open_direction != direction.column() {
+            return Err(BusError::conflict(format!(
+                "a move of this conversation to {} is already open. Let it finish or fail \
+                 before moving it the other way.",
+                open_direction.trim_start_matches("to_")
+            )));
+        }
+        tx.commit().await?;
         return Ok(id);
     }
     let (id,): (Uuid,) = sqlx::query_as(
@@ -184,8 +230,9 @@ async fn open_run(
     .bind(team_id)
     .bind(conversation_id)
     .bind(direction.column())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -207,10 +254,18 @@ pub async fn run(
     // The pause covers copy and verification. It is one conversation, and a
     // sender is told what is happening rather than seeing a mysterious
     // refusal.
+    // Taken with the row lock a send uses to allocate its sequence, so a
+    // send in flight either commits before the pause or sees it.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
     sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
         .bind(conversation_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     let outcome = copy_and_verify(
         pool,
@@ -290,12 +345,12 @@ async fn copy_and_verify(
                     .fetch(&Locator(locator), *message_id)
                     .await?
                     .ok_or_else(|| {
-                    BusError::not_found(format!(
-                        "the broker no longer holds the body of {message_id}. A body that \
+                        BusError::not_found(format!(
+                            "the broker no longer holds the body of {message_id}. A body that \
                              is gone cannot be copied back; tombstone it deliberately or \
                              restore the stream first."
-                    ))
-                })?
+                        ))
+                    })?
             }
         };
         let sum = checksum(&body);
@@ -314,6 +369,37 @@ async fn copy_and_verify(
         .bind(body.len() as i64)
         .execute(pool)
         .await?;
+
+        // A resumed run that already recorded a locator checks whether that
+        // body is there before publishing again. The broker's deduplication
+        // is windowed, so republishing after a long interruption would make
+        // a second physical copy of one logical message.
+        let recorded: Option<(Option<String>, String)> = sqlx::query_as(
+            "SELECT target_locator, state FROM conversation_migration_items
+              WHERE migration_id = $1 AND message_id = $2",
+        )
+        .bind(migration_id)
+        .bind(message_id)
+        .fetch_optional(pool)
+        .await?;
+        if let Some((Some(recorded_locator), _)) = recorded
+            && direction == Direction::ToJetStream
+            && let Ok(Some(there)) = jetstream
+                .fetch(&Locator(recorded_locator.clone()), *message_id)
+                .await
+            && checksum(&there) == sum
+        {
+            sqlx::query(
+                "UPDATE conversation_migration_items SET state = 'verified'
+                  WHERE migration_id = $1 AND message_id = $2",
+            )
+            .bind(migration_id)
+            .bind(message_id)
+            .execute(pool)
+            .await?;
+            copied += 1;
+            continue;
+        }
 
         // Write to the target. The idempotency key is derived from the
         // message itself, so a resumed run presents the same key and the
@@ -466,21 +552,47 @@ async fn copy_and_verify(
 
 /// Give up on a move, lift the pause and leave the thread exactly as it was.
 pub async fn abort(pool: &PgPool, migration_id: Uuid, why: &str) -> BusResult<()> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
+    let row: Option<(Uuid, String)> = sqlx::query_as(
         "UPDATE conversation_migrations SET state = 'failed', finished_at = now(),
                 last_error = $2
-          WHERE id = $1 RETURNING conversation_id",
+          WHERE id = $1 RETURNING conversation_id, direction",
     )
     .bind(migration_id)
     .bind(why)
     .fetch_optional(pool)
     .await?;
-    if let Some((conversation_id,)) = row {
-        sqlx::query("UPDATE conversations SET write_paused_at = NULL WHERE id = $1")
-            .bind(conversation_id)
-            .execute(pool)
-            .await?;
+    let Some((conversation_id, direction)) = row else {
+        return Ok(());
+    };
+    // A reverse move writes each body into its row as it copies. Nothing
+    // was cut over, so those rows are still JetStream-authoritative and the
+    // half-written local copy must not be served as if it were the body.
+    if direction == "to_postgres" {
+        sqlx::query(
+            "UPDATE conversation_messages m
+                SET body = ''
+               FROM conversation_migration_items i
+              WHERE i.migration_id = $1 AND m.id = i.message_id
+                AND m.backend <> 'postgres'",
+        )
+        .bind(migration_id)
+        .execute(pool)
+        .await?;
     }
+    // Only if this run still owns the pause: another run may have taken the
+    // thread since, and reopening it under that one would be worse than the
+    // failure being reported.
+    sqlx::query(
+        "UPDATE conversations c SET write_paused_at = NULL
+          WHERE c.id = $1
+            AND NOT EXISTS (
+                SELECT 1 FROM conversation_migrations g
+                 WHERE g.conversation_id = c.id
+                   AND g.state IN ('planned', 'copying', 'verified'))",
+    )
+    .bind(conversation_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -496,16 +608,25 @@ pub async fn cleanup(
     rollback_window_hours: i64,
     apply: bool,
 ) -> BusResult<(i64, i64)> {
+    if rollback_window_hours < 0 {
+        // A negative window points into the future and would drop the
+        // source copies of a move that finished a moment ago.
+        return Err(BusError::invalid(
+            "the rollback window cannot be negative; it is how long a completed move must \
+             have been finished before its source bodies may be dropped",
+        ));
+    }
     let (count, bytes): (i64, i64) = sqlx::query_as(
         "SELECT count(*), COALESCE(sum(length(m.body)), 0)::bigint
            FROM conversation_messages m
            JOIN conversations c ON c.id = m.conversation_id
           WHERE c.team_id = $1 AND m.backend = 'jetstream' AND m.body <> ''
             AND m.canonical_locator IS NOT NULL
-            AND EXISTS (
-                SELECT 1 FROM conversation_migrations g
-                 WHERE g.conversation_id = c.id AND g.state = 'cut_over'
-                   AND g.finished_at < now() - make_interval(secs => $2))",
+            AND (SELECT g.direction = 'to_jetstream'
+                        AND g.finished_at < now() - make_interval(secs => $2)
+                   FROM conversation_migrations g
+                  WHERE g.conversation_id = c.id AND g.state = 'cut_over'
+                  ORDER BY g.finished_at DESC LIMIT 1)",
     )
     .bind(team_id)
     .bind((rollback_window_hours * 3600) as f64)
@@ -521,10 +642,11 @@ pub async fn cleanup(
           WHERE c.id = m.conversation_id AND c.team_id = $1
             AND m.backend = 'jetstream' AND m.body <> ''
             AND m.canonical_locator IS NOT NULL
-            AND EXISTS (
-                SELECT 1 FROM conversation_migrations g
-                 WHERE g.conversation_id = c.id AND g.state = 'cut_over'
-                   AND g.finished_at < now() - make_interval(secs => $2))",
+            AND (SELECT g.direction = 'to_jetstream'
+                        AND g.finished_at < now() - make_interval(secs => $2)
+                   FROM conversation_migrations g
+                  WHERE g.conversation_id = c.id AND g.state = 'cut_over'
+                  ORDER BY g.finished_at DESC LIMIT 1)",
     )
     .bind(team_id)
     .bind((rollback_window_hours * 3600) as f64)

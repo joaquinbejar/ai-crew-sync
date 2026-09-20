@@ -171,9 +171,10 @@ pub async fn conversations_migrate(
             p.title.chars().take(30).collect::<String>(),
             p.messages,
             human_bytes(p.bytes),
-            match &p.blocked {
-                Some(why) => format!("  — skipped: {why}"),
-                None => String::new(),
+            match (&p.blocked, p.resuming) {
+                (Some(why), _) => format!("  — skipped: {why}"),
+                (None, true) => "  — resuming an interrupted move".to_owned(),
+                (None, false) => String::new(),
             }
         );
     }

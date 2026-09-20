@@ -1107,21 +1107,6 @@ pub async fn send(
             "this conversation is archived; its history stays readable",
         ));
     }
-    // A supervised backend move holds this one thread still while it copies
-    // the tail. Seconds, not minutes, and only this thread: the rest of the
-    // bus is unaffected, and a sender is told what is happening rather than
-    // seeing a refusal it cannot act on.
-    let (paused,): (Option<chrono::DateTime<chrono::Utc>>,) =
-        sqlx::query_as("SELECT write_paused_at FROM conversations WHERE id = $1")
-            .bind(id)
-            .fetch_one(pool)
-            .await?;
-    if let Some(since) = paused {
-        let secs = (chrono::Utc::now() - since).num_seconds().max(0);
-        return Err(BusError::conflict(format!(
-            "this conversation's storage is being moved by an operator and writes are              paused (for {secs}s so far). Reading still works. Try again in a moment;              nothing you have sent was lost."
-        )));
-    }
     let body = crate::store::check_text("message body", &input.body, MAX_BODY_BYTES)?;
     if body.is_empty() {
         return Err(BusError::invalid("a message body is required"));
@@ -1137,15 +1122,32 @@ pub async fn send(
     // two retries of one request_id serialize here instead of racing to the
     // unique index, and the authorization below is re-read while it cannot
     // change underneath.
-    let (archived_now,): (Option<chrono::DateTime<chrono::Utc>>,) =
-        sqlx::query_as("SELECT archived_at FROM conversations WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let (archived_now, paused): (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = sqlx::query_as(
+        "SELECT archived_at, write_paused_at FROM conversations WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
     if archived_now.is_some() {
         return Err(BusError::conflict(
             "this conversation is archived; its history stays readable",
         ));
+    }
+    // A supervised backend move holds this one thread still while it copies
+    // the tail. Read under the same lock the move takes: checked outside the
+    // transaction, a request that passed a moment earlier lands after the
+    // tail was copied and is left behind. Seconds, not minutes, and only
+    // this thread.
+    if let Some(since) = paused {
+        let secs = (chrono::Utc::now() - since).num_seconds().max(0);
+        return Err(BusError::conflict(format!(
+            "this conversation's storage is being moved by an operator and writes are \
+             paused (for {secs}s so far). Reading still works. Try again in a moment; \
+             nothing you have sent was lost."
+        )));
     }
     // Membership as it is *now*. It was checked before this transaction
     // opened, and a removal that committed in between must take effect on

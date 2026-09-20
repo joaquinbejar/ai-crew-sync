@@ -158,8 +158,14 @@ authoritative backend and the thread's routing in one transaction.
   with a message saying why, for as long as the copy takes.
 - A failure cuts nothing over, lifts the pause and leaves the thread exactly
   as it was.
-- An interrupted run resumes: what is already verified is not copied again,
-  and the per-message evidence is in `conversation_migration_items`.
+- An interrupted run resumes: run the same command again. What is already
+  verified is not copied again, a body that was copied but not verified is
+  checked where it landed before anything is published a second time, and
+  the per-message evidence is in `conversation_migration_items`. A thread
+  whose run is still open is reported as *resuming*, not skipped.
+- The ordinary publication sweep never touches a migration's source copies.
+  They are the rollback, and only `conversations cleanup` drops them, with
+  the window you state.
 - Ids, sequence, authorship, memberships and every observed receipt are
   untouched. **No acknowledgement is ever invented**, in either direction.
 

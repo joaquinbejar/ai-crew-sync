@@ -194,10 +194,18 @@ impl Backends {
     /// Every team whose conversations are routed off Postgres. The worker
     /// reconciles these on startup; nobody else has anything to reconcile.
     pub async fn routed_teams(&self, pool: &PgPool) -> BusResult<Vec<Uuid>> {
-        let rows: Vec<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM teams WHERE default_backend <> 'postgres'")
-                .fetch_all(pool)
-                .await?;
+        // Not only the teams whose *default* is a broker. A team routed
+        // back to Postgres still has threads whose bodies are on the
+        // broker; skipping it would stop publishing their inbox references
+        // and stop reconciling their uncertain publications.
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM teams t
+              WHERE t.default_backend <> 'postgres'
+                 OR EXISTS (SELECT 1 FROM conversations c
+                             WHERE c.team_id = t.id AND c.backend <> 'postgres')",
+        )
+        .fetch_all(pool)
+        .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 }

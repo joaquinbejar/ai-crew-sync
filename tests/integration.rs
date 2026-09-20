@@ -8583,6 +8583,63 @@ async fn a_conversation_moves_between_backends_and_back_without_losing_anything(
         would_drop, 0,
         "nothing is dropped inside the rollback window"
     );
+    assert!(
+        migrate::cleanup(&h.pool, team, -1, false).await.is_err(),
+        "a negative window would point into the future"
+    );
+
+    // And the ordinary publication sweep leaves them alone. It releases
+    // bodies the outbox staged; a migration source copy is the rollback,
+    // and only `conversations cleanup` may drop it.
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, None, 0)
+            .await
+            .unwrap(),
+        0,
+        "the five minute sweep must not eat the rollback source"
+    );
+    let (still_local,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM conversation_messages WHERE conversation_id = $1 AND body <> ''",
+    )
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(still_local, 3);
+
+    // An interrupted run resumes through the same command. The process
+    // died holding the pause, and the plan says so instead of skipping the
+    // thread and reporting success.
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'copying')",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert!(plans[0].blocked.is_none(), "{:?}", plans[0].blocked);
+    assert!(plans[0].resuming, "an open run is resumed, not refused");
+    let resumed = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToJetStream)
+        .await
+        .unwrap();
+    assert_eq!(resumed.state, "cut_over");
+    let (paused,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT write_paused_at FROM conversations WHERE id = $1")
+            .bind(cuuid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(paused.is_none(), "resuming finishes and reopens the thread");
 
     // New messages go where the thread now lives, and are published like
     // any other: acceptance is not storage.
