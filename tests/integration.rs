@@ -6938,6 +6938,25 @@ async fn a_private_thread_answers_only_to_the_windows_that_are_in_it() {
     assert!(err.contains("registered window"), "{err}");
     assert!(err.contains("recover_conversation_history"), "{err}");
 
+    // An invitation is not membership, and it does not read what was said
+    // before it was answered.
+    let waiting = call(&window, "list_conversations", json!({})).await;
+    assert!(
+        waiting["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == cid.as_str()),
+        "an invitee can see that it was invited: {waiting}"
+    );
+    let err = call_expect_error(
+        &window,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("join_conversation first"), "{err}");
+
     call(
         &window,
         "join_conversation",
@@ -7099,10 +7118,11 @@ async fn the_outbox_survives_failures_between_acceptance_and_confirmation() {
     outbox::set_publication(&h.pool, cuuid, true).await.unwrap();
 
     // Acceptance is not storage, and the caller is told so.
+    let rid = request_id();
     let sent = call(
         &owner,
         "send_conversation_message",
-        json!({"conversation_id": cid, "body": "published later", "request_id": request_id()}),
+        json!({"conversation_id": cid, "body": "published later", "request_id": rid}),
     )
     .await;
     assert_eq!(sent["stored"], false, "accepted, not yet stored: {sent}");
@@ -7146,6 +7166,40 @@ async fn the_outbox_survives_failures_between_acceptance_and_confirmation() {
         state, "pending_publication",
         "a retry does not fabricate stored"
     );
+
+    // A client retry of the same request_id gets the original's real
+    // state, not a storage confirmation the first call never got.
+    let again = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "published later", "request_id": rid}),
+    )
+    .await;
+    assert_eq!(again["message_id"], sent["message_id"]);
+    assert_eq!(
+        again["stored"], false,
+        "the retry reports what the message is, not what a synchronous send would be"
+    );
+
+    // And a reader does not walk past it. The pending message is the end of
+    // the readable thread until it settles, so a cursor cannot step over a
+    // gap that is about to fill.
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["message_id"] != sent["message_id"]),
+        "a message awaiting publication is not history yet: {page}"
+    );
+    let err = call_expect_error(
+        &dani,
+        "get_conversation_message",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(err.contains("has not confirmed it yet"), "{err}");
 
     // Fencing: a worker whose lease expired settles nothing. Take a lease,
     // let another worker take it over, then try to settle the stale one.

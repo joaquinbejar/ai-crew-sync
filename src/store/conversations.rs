@@ -346,6 +346,20 @@ impl Access {
                 Some("active") | Some("invited")
             )
     }
+    /// Reading the thread's *contents*, which an invitation does not grant.
+    ///
+    /// An invitee can see that a thread exists and who invited them — that
+    /// is what they are deciding about — and nothing that was said in it
+    /// until they accept. Otherwise an invitation would be a way to read a
+    /// private thread without ever joining it, which is the opposite of
+    /// what "a thread cannot conscript a window" means.
+    pub fn can_read_messages(&self) -> bool {
+        self.by_project
+            || matches!(
+                self.membership.as_ref().map(|m| m.state.as_str()),
+                Some("active")
+            )
+    }
     /// Observers read and acknowledge; they do not write.
     pub fn can_send(&self) -> bool {
         matches!(
@@ -440,6 +454,19 @@ pub async fn access(pool: &PgPool, auth: &AuthCtx, conversation: Uuid) -> BusRes
 }
 
 /// Resolve and require read access in one step.
+/// Refuse a content read to a seat that has not been accepted.
+fn require_accepted(a: &Access) -> BusResult<()> {
+    if a.can_read_messages() {
+        return Ok(());
+    }
+    Err(BusError::Forbidden(
+        "you have been invited to this conversation and have not accepted. Call \
+         join_conversation first; an invitation is not membership, and it does not read \
+         what was said before you answered it."
+            .to_owned(),
+    ))
+}
+
 async fn readable(pool: &PgPool, auth: &AuthCtx, conversation: Uuid) -> BusResult<Access> {
     let a = access(pool, auth, conversation).await?;
     if !a.can_read() {
@@ -1135,15 +1162,16 @@ pub async fn send(
 
     // Idempotency, under that lock: a retry that raced the original sees it
     // rather than allocating a second sequence.
-    let existing: Option<(Uuid, i64, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT id, seq, body, created_at FROM conversation_messages
+    let existing: Option<(Uuid, i64, String, chrono::DateTime<chrono::Utc>, String)> =
+        sqlx::query_as(
+            "SELECT id, seq, body, created_at, publication_state FROM conversation_messages
           WHERE conversation_id = $1 AND request_id = $2",
-    )
-    .bind(id)
-    .bind(input.request_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some((mid, seq, stored_body, created_at)) = existing {
+        )
+        .bind(id)
+        .bind(input.request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if let Some((mid, seq, stored_body, created_at, publication_state)) = existing {
         if stored_body != body {
             return Err(BusError::conflict(
                 "this request_id already sent a different message. Use a fresh UUID for a \
@@ -1156,7 +1184,10 @@ pub async fn send(
             message_id: mid.to_string(),
             conversation_id: id.to_string(),
             seq,
-            stored: true,
+            // What the original actually is, not what the first call was
+            // told. A retry of an accepted-but-unpublished message must not
+            // be handed a storage confirmation the first call did not get.
+            stored: publication_state == "stored",
             recipients,
             created_at: ts(created_at),
         });
@@ -1311,6 +1342,7 @@ pub async fn read(
 ) -> BusResult<ConversationRead> {
     require_capability(pool, auth).await?;
     let a = readable(pool, auth, id).await?;
+    require_accepted(&a)?;
     let limit = limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
     // A member reads from its own boundary; a project reader sees the thread
     // from the start, which is what project visibility means.
@@ -1331,11 +1363,19 @@ pub async fn read(
         serde_json::Value,
         chrono::DateTime<chrono::Utc>,
     )> = sqlx::query_as(
+        // A message that has been accepted and not yet confirmed is not
+        // history: reading past it would let a cursor walk over a gap that
+        // is about to fill, and a reader would never come back for it. The
+        // page stops at the first one.
         "SELECT m.id, m.seq, ag.name, m.sender_session, m.body, m.reply_to, m.metadata,
                 m.created_at
            FROM conversation_messages m
            JOIN agents ag ON ag.id = m.sender_agent
           WHERE m.conversation_id = $1 AND m.seq > $2 AND m.deleted_at IS NULL
+            AND m.seq < COALESCE((SELECT min(p.seq) FROM conversation_messages p
+                                   WHERE p.conversation_id = $1
+                                     AND p.publication_state = 'pending_publication'),
+                                 9223372036854775807)
           ORDER BY m.seq
           LIMIT $3",
     )
@@ -1483,6 +1523,7 @@ pub async fn get_message(
     message_id: Uuid,
 ) -> BusResult<ConversationMessage> {
     require_capability(pool, auth).await?;
+    #[allow(clippy::type_complexity)]
     let row: Option<(
         Uuid,
         i64,
@@ -1492,9 +1533,10 @@ pub async fn get_message(
         Option<Uuid>,
         serde_json::Value,
         chrono::DateTime<chrono::Utc>,
+        String,
     )> = sqlx::query_as(
         "SELECT m.conversation_id, m.seq, ag.name, m.sender_session, m.body, m.reply_to,
-                    m.metadata, m.created_at
+                    m.metadata, m.created_at, m.publication_state
                FROM conversation_messages m
                JOIN agents ag ON ag.id = m.sender_agent
               WHERE m.id = $1 AND m.deleted_at IS NULL",
@@ -1502,14 +1544,30 @@ pub async fn get_message(
     .bind(message_id)
     .fetch_optional(pool)
     .await?;
-    let Some((conversation_id, seq, from, from_session, body, reply_to, metadata, created_at)) =
-        row
+    let Some((
+        conversation_id,
+        seq,
+        from,
+        from_session,
+        body,
+        reply_to,
+        metadata,
+        created_at,
+        publication_state,
+    )) = row
     else {
         return Err(BusError::not_found("no such message"));
     };
     // Access is rechecked here, now: a membership that ended since the
     // message was sent does not keep reading it.
     let a = readable(pool, auth, conversation_id).await?;
+    require_accepted(&a)?;
+    if publication_state == "pending_publication" {
+        return Err(BusError::conflict(
+            "this message has been accepted but its backend has not confirmed it yet. It \
+             is not lost; read it again in a moment.",
+        ));
+    }
     if let Some(m) = &a.membership
         && let Some(floor) = m.history_from_seq
         && seq <= floor
@@ -1624,6 +1682,7 @@ pub async fn receipts(
         return Err(BusError::not_found("no such message"));
     };
     let a = readable(pool, auth, conversation_id).await?;
+    require_accepted(&a)?;
     // The same boundary `get_message` applies. A receipt carries recipient
     // addresses and a free-text note, which is the discussion itself often
     // enough; a member who may not read the message may not read who

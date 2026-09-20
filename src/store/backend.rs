@@ -106,12 +106,19 @@ pub struct PostgresBackend {
     /// Fault injection for the tests. Production constructs `new`, which
     /// leaves every fault off.
     faults: Faults,
+    /// Retryable failures still owed, counted down as they are served. In
+    /// an `Arc` because the backend is cloned and the count is one budget,
+    /// not one per clone.
+    retryable_left: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// What to make go wrong, and how often. Off in production by construction.
 #[derive(Clone, Debug, Default)]
 pub struct Faults {
-    /// Fail the next N publishes with a retryable error.
+    /// Fail the next N publishes with a retryable error, and then stop. A
+    /// fault that never runs out is a different test — it models a backend
+    /// that is down, not a transient failure — and the two must not be the
+    /// same knob.
     pub retryable: usize,
     /// Fail the next publish fatally.
     pub fatal: bool,
@@ -127,12 +134,18 @@ impl PostgresBackend {
         Self {
             pool,
             faults: Faults::default(),
+            retryable_left: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     /// Only the tests construct this.
     pub fn with_faults(pool: PgPool, faults: Faults) -> Self {
-        Self { pool, faults }
+        let left = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(faults.retryable));
+        Self {
+            pool,
+            faults,
+            retryable_left: left,
+        }
     }
 
     pub const NAME: &'static str = "postgres";
@@ -150,7 +163,15 @@ impl MessagingBackend for PostgresBackend {
         if self.faults.fatal {
             return Published::Fatal("the backend refused this payload".into());
         }
-        if self.faults.retryable > 0 {
+        if self
+            .retryable_left
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| (left > 0).then(|| left - 1),
+            )
+            .is_ok()
+        {
             return Published::Retryable("the backend was unreachable".into());
         }
         // Idempotent by construction: the row already exists, and confirming

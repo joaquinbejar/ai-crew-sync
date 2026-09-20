@@ -146,8 +146,13 @@ pub async fn settle(pool: &PgPool, lease: &Lease, outcome: Published) -> BusResu
         Published::Confirmed(Locator(locator)) => {
             let mut tx = pool.begin().await?;
             let deleted: Option<(Uuid,)> = sqlx::query_as(
+                // Generation *and* an unexpired lease. A worker whose lease
+                // ran out no longer owns this slot, whether or not anyone
+                // else has picked it up yet, and settling anyway is exactly
+                // the write the fence exists to refuse.
                 "DELETE FROM conversation_outbox
                   WHERE message_id = $1 AND generation = $2
+                    AND lease_expires_at IS NOT NULL AND lease_expires_at > now()
                   RETURNING message_id",
             )
             .bind(lease.message_id)
@@ -185,6 +190,11 @@ pub async fn settle(pool: &PgPool, lease: &Lease, outcome: Published) -> BusResu
             // ever.
             let give_up = lease.attempts >= MAX_ATTEMPTS;
             let backoff = (1_i64 << lease.attempts.min(6)) as f64;
+            // The slot and the message's state move together. Two
+            // statements and a crash in between leaves a slot marked failed
+            // and a message still saying pending, which is a gap nobody can
+            // resolve.
+            let mut tx = pool.begin().await?;
             let updated: Option<(Uuid,)> = sqlx::query_as(
                 "UPDATE conversation_outbox
                     SET state = CASE WHEN $4 THEN 'failed' ELSE 'pending' END,
@@ -194,6 +204,7 @@ pub async fn settle(pool: &PgPool, lease: &Lease, outcome: Published) -> BusResu
                         last_error = $5,
                         updated_at = now()
                   WHERE message_id = $1 AND generation = $2
+                    AND lease_expires_at IS NOT NULL AND lease_expires_at > now()
                   RETURNING message_id",
             )
             .bind(lease.message_id)
@@ -201,46 +212,51 @@ pub async fn settle(pool: &PgPool, lease: &Lease, outcome: Published) -> BusResu
             .bind(backoff)
             .bind(give_up)
             .bind(&why)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?;
             if updated.is_none() {
                 return Ok(Settled::Fenced);
             }
             if give_up {
-                mark_failed(pool, lease.message_id).await?;
+                mark_failed(&mut tx, lease.message_id).await?;
+                tx.commit().await?;
                 Ok(Settled::Failed)
             } else {
+                tx.commit().await?;
                 Ok(Settled::Retrying {
                     attempts: lease.attempts,
                 })
             }
         }
         Published::Fatal(why) => {
+            let mut tx = pool.begin().await?;
             let updated: Option<(Uuid,)> = sqlx::query_as(
                 "UPDATE conversation_outbox
                     SET state = 'failed', leased_by = NULL, lease_expires_at = NULL,
                         last_error = $3, updated_at = now()
                   WHERE message_id = $1 AND generation = $2
+                    AND lease_expires_at IS NOT NULL AND lease_expires_at > now()
                   RETURNING message_id",
             )
             .bind(lease.message_id)
             .bind(lease.generation)
             .bind(&why)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?;
             if updated.is_none() {
                 return Ok(Settled::Fenced);
             }
-            mark_failed(pool, lease.message_id).await?;
+            mark_failed(&mut tx, lease.message_id).await?;
+            tx.commit().await?;
             Ok(Settled::Failed)
         }
     }
 }
 
-async fn mark_failed(pool: &PgPool, message_id: Uuid) -> BusResult<()> {
+async fn mark_failed(conn: &mut sqlx::PgConnection, message_id: Uuid) -> BusResult<()> {
     sqlx::query("UPDATE conversation_messages SET publication_state = 'failed' WHERE id = $1")
         .bind(message_id)
-        .execute(pool)
+        .execute(conn)
         .await?;
     Ok(())
 }
@@ -308,7 +324,7 @@ pub async fn status(pool: &PgPool, team_id: Uuid) -> BusResult<Status> {
             count(*) FILTER (WHERE state = 'leased'),
             count(*) FILTER (WHERE state = 'failed'),
             extract(epoch FROM now() - min(created_at) FILTER (WHERE state <> 'failed'))::bigint,
-            sum(payload_bytes)::bigint
+            sum(payload_bytes) FILTER (WHERE state <> 'failed')::bigint
            FROM conversation_outbox WHERE team_id = $1",
     )
     .bind(team_id)
@@ -330,13 +346,21 @@ pub async fn status(pool: &PgPool, team_id: Uuid) -> BusResult<Status> {
 /// reading the thread would see a gap that never closes. Drain first, which
 /// `status` is how you watch.
 pub async fn set_publication(pool: &PgPool, conversation_id: Uuid, outbox: bool) -> BusResult<()> {
+    // The conversation row is what a send locks to take its sequence, so
+    // taking it here is what stops a send from enqueueing work for a mode
+    // that has just been switched off.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
     if !outbox {
         let (left,): (i64,) = sqlx::query_as(
             "SELECT count(*) FROM conversation_outbox
               WHERE conversation_id = $1 AND state <> 'failed'",
         )
         .bind(conversation_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
         if left > 0 {
             return Err(crate::error::BusError::conflict(format!(
@@ -349,7 +373,8 @@ pub async fn set_publication(pool: &PgPool, conversation_id: Uuid, outbox: bool)
     sqlx::query("UPDATE conversations SET publication = $2 WHERE id = $1")
         .bind(conversation_id)
         .bind(if outbox { "outbox" } else { "sync" })
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
