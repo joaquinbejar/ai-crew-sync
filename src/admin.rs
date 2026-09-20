@@ -50,6 +50,64 @@ pub async fn team_capability(pool: &PgPool, team: &str, conversations: bool) -> 
     Ok(())
 }
 
+/// Route a team's new conversations to a backend, and say plainly what that
+/// does and does not do.
+pub async fn team_backend(pool: &PgPool, team: &str, backend: &str) -> anyhow::Result<()> {
+    let id = team_id(pool, team).await?;
+    store::set_default_backend(pool, Actor::Cli, id, backend).await?;
+    println!("team '{team}': new conversations are created on '{backend}'");
+    println!(
+        "Existing threads keep the backend they were created on. Nothing was migrated, and \
+         nothing will be by this command."
+    );
+    if backend == "jetstream" {
+        println!(
+            "Check before anyone writes: the stream exists (`ai-crew-sync team stream --team \
+             {team} --nats-url ...`) and the server was started with --nats-url. Without \
+             both, sends are accepted and stay pending."
+        );
+    }
+    Ok(())
+}
+
+/// Create or remove a team's stream. An operator action with its own
+/// credential; the server process deliberately cannot do it.
+pub async fn team_stream(
+    pool: &PgPool,
+    team: &str,
+    nats_url: &str,
+    credentials: Option<String>,
+    remove: bool,
+) -> anyhow::Result<()> {
+    let id = team_id(pool, team).await?;
+    let mut config = crate::store::jetstream::Config::new(nats_url.to_owned());
+    config.credentials = credentials;
+    if remove {
+        let (routed,): (String,) =
+            sqlx::query_as("SELECT default_backend FROM teams WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+        if routed == "jetstream" {
+            anyhow::bail!(
+                "team '{team}' still creates its conversations on JetStream. Route it back \
+                 with `team capability --backend postgres` first; deleting the stream now \
+                 would drop bodies its threads still point at."
+            );
+        }
+        crate::store::jetstream::JetStreamBackend::deprovision(&config, id).await?;
+        println!("team '{team}': stream removed, with every body it held");
+        return Ok(());
+    }
+    let name = crate::store::jetstream::JetStreamBackend::provision(&config, id).await?;
+    println!("team '{team}': stream '{name}' ready");
+    println!(
+        "This routes nobody. `team capability --team {team} --backend jetstream` is what \
+         sends new conversations there."
+    );
+    Ok(())
+}
+
 fn human_bytes(n: i64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = n as f64;
@@ -113,6 +171,41 @@ pub async fn team_usage(pool: &PgPool, team: &str) -> anyhow::Result<()> {
         let days = (chrono::Utc::now() - oldest).num_days();
         println!("  oldest message  {days} day(s) ago");
     }
+    // Publication, for a team routed off Postgres. Shown only when there is
+    // something to show: on the default backend the queue is always empty
+    // and a permanent "0 pending" line is noise.
+    let (backend,): (String,) = sqlx::query_as("SELECT default_backend FROM teams WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+    let outbox = crate::store::outbox::status(pool, id).await?;
+    if backend != "postgres" || outbox.pending + outbox.leased + outbox.failed > 0 {
+        println!("  backend         {backend}");
+        println!(
+            "  publication     {} pending, {} in flight, {} failed ({})",
+            outbox.pending,
+            outbox.leased,
+            outbox.failed,
+            human_bytes(outbox.pending_bytes)
+        );
+        if let Some(secs) = outbox.oldest_pending_seconds
+            && secs > 300
+        {
+            println!(
+                "  ⚠ the oldest unpublished message is {} minute(s) old. Check the broker \
+                 and that a replica is draining (--publication-worker).",
+                secs / 60
+            );
+        }
+        if outbox.failed > 0 {
+            println!(
+                "  ⚠ {} message(s) will not be published. Their slots stay so the gap is \
+                 visible; readers are told.",
+                outbox.failed
+            );
+        }
+    }
+
     if let Some(pct) = u.percent_used()
         && pct >= 80.0
     {

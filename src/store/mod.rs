@@ -9,6 +9,7 @@ pub mod notes;
 pub mod outbox;
 pub mod presence;
 pub mod quota;
+pub mod routing;
 pub mod sessions;
 pub mod tasks;
 

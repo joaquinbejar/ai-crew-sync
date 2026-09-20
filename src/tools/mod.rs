@@ -78,11 +78,25 @@ repository name, and use task keys that a human would recognise.
 pub struct Bus {
     pub db: PgPool,
     pub hub: EventHub,
+    /// Where each conversation's bodies live. Postgres for everyone unless
+    /// an operator routed a team elsewhere and started the server with a
+    /// broker.
+    pub backends: crate::store::routing::Backends,
     pub tool_router: ToolRouter<Self>,
 }
 
 impl Bus {
+    /// The default installation: every body in Postgres, no broker.
     pub fn new(db: PgPool, hub: EventHub) -> Self {
+        let backends = crate::store::routing::Backends::postgres_only(db.clone());
+        Self::with_backends(db, hub, backends)
+    }
+
+    pub fn with_backends(
+        db: PgPool,
+        hub: EventHub,
+        backends: crate::store::routing::Backends,
+    ) -> Self {
         let tool_router = Self::core_router()
             + Self::messaging_router()
             + Self::tasks_router()
@@ -96,6 +110,7 @@ impl Bus {
         Self {
             db,
             hub,
+            backends,
             tool_router,
         }
     }

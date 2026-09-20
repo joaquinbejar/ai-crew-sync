@@ -44,6 +44,9 @@ struct Harness {
     servers: Vec<tokio::task::JoinHandle<()>>,
     /// The schema this harness owns, so replicas can join it.
     schema: String,
+    /// The broker this harness's servers can reach, when the test needs
+    /// one. `None` is the default installation: Postgres only.
+    nats: Option<String>,
 }
 
 impl Harness {
@@ -51,7 +54,8 @@ impl Harness {
     /// production topology: N processes, one Postgres, each with its own
     /// LISTEN connection and its own in-process event hub.
     async fn add_replica(&mut self) -> String {
-        let (base, handle) = spawn_server(self.pool.clone(), self.ct.child_token()).await;
+        let (base, handle) =
+            spawn_server(self.pool.clone(), self.ct.child_token(), self.nats.clone()).await;
         self.servers.push(handle);
         base
     }
@@ -102,6 +106,7 @@ impl Drop for Harness {
 async fn spawn_server(
     pool: PgPool,
     ct: CancellationToken,
+    nats: Option<String>,
 ) -> (String, tokio::task::JoinHandle<()>) {
     let app = build_router(
         pool,
@@ -114,6 +119,12 @@ async fn spawn_server(
             // than any real agent, and the limiter has its own tests.
             rate_limit_per_minute: 0,
             dashboard_secret: b"test-dashboard-secret".to_vec(),
+            nats_url: nats,
+            nats_credentials: None,
+            // The publication tests drive the outbox themselves, one step at
+            // a time, so the timing under test is the test's and not a
+            // background loop's.
+            publication_worker: false,
         },
         ct.clone(),
     );
@@ -128,6 +139,17 @@ async fn spawn_server(
 }
 
 async fn setup(schema: &str) -> Option<Harness> {
+    setup_with(schema, None).await
+}
+
+/// Same, with a broker the server can reach: for the tests that route a
+/// team's conversations off Postgres.
+async fn setup_with_broker(schema: &str) -> Option<Harness> {
+    let nats = nats_url();
+    setup_with(schema, Some(nats)).await
+}
+
+async fn setup_with(schema: &str, nats: Option<String>) -> Option<Harness> {
     let url = db_url()?;
     let pool = PgPoolOptions::new()
         .max_connections(8)
@@ -160,7 +182,7 @@ async fn setup(schema: &str) -> Option<Harness> {
     MIGRATOR.run(&pool).await.expect("migrate");
 
     let ct = CancellationToken::new();
-    let (base, handle) = spawn_server(pool.clone(), ct.child_token()).await;
+    let (base, handle) = spawn_server(pool.clone(), ct.child_token(), nats.clone()).await;
 
     Some(Harness {
         pool,
@@ -168,6 +190,7 @@ async fn setup(schema: &str) -> Option<Harness> {
         ct,
         servers: vec![handle],
         schema: schema.to_owned(),
+        nats,
     })
 }
 
@@ -321,6 +344,9 @@ async fn setup_rate_limited(schema: &str, per_minute: u32) -> Option<Harness> {
             max_request_bytes: 64 * 1024,
             rate_limit_per_minute: per_minute,
             dashboard_secret: b"test-dashboard-secret".to_vec(),
+            nats_url: None,
+            nats_credentials: None,
+            publication_worker: false,
         },
         child.clone(),
     );
@@ -337,6 +363,7 @@ async fn setup_rate_limited(schema: &str, per_minute: u32) -> Option<Harness> {
         ct,
         servers: vec![handle],
         schema: schema.to_owned(),
+        nats: None,
     })
 }
 
@@ -345,6 +372,26 @@ async fn setup_rate_limited(schema: &str, per_minute: u32) -> Option<Harness> {
 /// Postgres setup fails the run instead of passing zero tests.
 fn db_required() -> bool {
     std::env::var("AI_CREW_SYNC_REQUIRE_DB").is_ok_and(|v| v != "0")
+}
+
+/// Same, for the tests that need the JetStream fixture as well. Missing
+/// infrastructure fails visibly: `nats_url()` panics rather than skipping.
+macro_rules! require_db_broker {
+    ($schema:expr) => {
+        match setup_with_broker($schema).await {
+            Some(h) => h,
+            None => {
+                assert!(
+                    !db_required(),
+                    "AI_CREW_SYNC_REQUIRE_DB is set but TEST_DATABASE_URL is not: \
+                     the integration suite would have silently passed without \
+                     touching a database"
+                );
+                eprintln!("skipping: TEST_DATABASE_URL not set");
+                return;
+            }
+        }
+    };
 }
 
 macro_rules! require_db {
@@ -7181,25 +7228,27 @@ async fn the_outbox_survives_failures_between_acceptance_and_confirmation() {
         "the retry reports what the message is, not what a synchronous send would be"
     );
 
-    // And a reader does not walk past it. The pending message is the end of
-    // the readable thread until it settles, so a cursor cannot step over a
-    // gap that is about to fill.
+    // And a reader is told what it is looking at. The message keeps its
+    // place in the sequence and says it is not stored yet, which is what a
+    // cursor needs to not walk over a gap it never knew about.
     let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
-    assert!(
-        page["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|m| m["message_id"] != sent["message_id"]),
-        "a message awaiting publication is not history yet: {page}"
-    );
-    let err = call_expect_error(
+    let pending = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["message_id"] == sent["message_id"])
+        .expect("the message is in the thread, not hidden from it");
+    assert_eq!(pending["publication"], "pending_publication");
+    let one = call(
         &dani,
         "get_conversation_message",
         json!({"message_id": sent["message_id"]}),
     )
     .await;
-    assert!(err.contains("has not confirmed it yet"), "{err}");
+    assert_eq!(
+        one["publication"], "pending_publication",
+        "never reported as stored before the backend says so: {one}"
+    );
 
     // Fencing: a worker whose lease expired settles nothing. Take a lease,
     // let another worker take it over, then try to settle the stale one.
@@ -7492,6 +7541,9 @@ async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
         Some(locator.clone()),
         "reconcile must find a key the broker has seen"
     );
+    // A key it has never seen lands now, under that same key, and answers
+    // with where it went. One logical message, and reconciling twice does
+    // not make it two.
     let unseen = Envelope {
         message_id: Uuid::new_v4(),
         conversation_id: conversation,
@@ -7625,5 +7677,328 @@ async fn the_default_backend_stays_postgres_with_no_broker_involved() {
     .await;
     assert_eq!(sent["stored"], true);
     let _ = client.cancel().await;
+    h.shutdown().await;
+}
+
+/// Phase 5: a conversation routed to JetStream publishes through the outbox
+/// to a real broker, reports `stored` only on a PubAck, survives a process
+/// death mid-publication, reads its history back by locator, and revalidates
+/// access at the moment the body is served.
+#[tokio::test]
+async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::{conversations as convo_store, outbox};
+
+    let h = require_db_broker!("t_jetstream_publication");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    // Routing is an operator decision, per team, and it only affects
+    // conversations created afterwards.
+    let before = connect_with_session(&h.base, &token, "before").await;
+    let legacy = call(
+        &before,
+        "create_conversation",
+        json!({"title": "postgres thread", "private": true}),
+    )
+    .await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "jetstream thread", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let cuuid: Uuid = cid.parse().unwrap();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+
+    // The earlier conversation kept Postgres; the new one is routed.
+    let (old_backend,): (String,) =
+        sqlx::query_as("SELECT backend FROM conversations WHERE id = $1")
+            .bind(legacy["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(old_backend, "postgres", "existing threads are not migrated");
+    let (new_backend, publication): (String, String) =
+        sqlx::query_as("SELECT backend, publication FROM conversations WHERE id = $1")
+            .bind(cuuid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (new_backend.as_str(), publication.as_str()),
+        ("jetstream", "outbox")
+    );
+
+    // Acceptance is not storage, and the receipts do not claim it is.
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "through the broker",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(sent["stored"], false);
+    let mid: Uuid = sent["message_id"].as_str().unwrap().parse().unwrap();
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(receipts["receipts"][0]["stored_at"].is_null(), "{receipts}");
+
+    // A worker dies mid-publication: the outcome is unknown, and that is
+    // neither stored nor failed until reconciliation says so.
+    let lease = outbox::lease(&h.pool, "worker-dead")
+        .await
+        .unwrap()
+        .unwrap();
+    let settled = outbox::mark_uncertain(&h.pool, &lease, "the process died")
+        .await
+        .unwrap();
+    assert!(matches!(settled, outbox::Settled::Retrying { .. }));
+    let (state, uncertain): (String, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT publication_state, uncertain_at FROM conversation_messages WHERE id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "pending_publication");
+    assert!(
+        uncertain.is_some(),
+        "an unknown outcome is recorded as unknown"
+    );
+
+    // Reconciliation asks the broker under the same key instead of
+    // guessing: inside its dedup window that answers with the original
+    // sequence, outside it the body lands now. One logical message either
+    // way, and only now is it stored.
+    assert_eq!(
+        outbox::resolve_uncertain(&h.pool, &backend, team)
+            .await
+            .unwrap(),
+        1
+    );
+    let (uncertain,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT uncertain_at FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(
+        uncertain.is_none(),
+        "an answered question is no longer open"
+    );
+    let (state, locator): (String, Option<String>) = sqlx::query_as(
+        "SELECT publication_state, canonical_locator FROM conversation_messages WHERE id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "stored");
+    assert!(
+        locator.as_deref().unwrap().starts_with("jetstream:"),
+        "{locator:?}"
+    );
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        receipts["receipts"][0]["stored_at"].is_string(),
+        "stored once the PubAck arrived, not before: {receipts}"
+    );
+
+    // History reads through the ordinary tool, from the broker, with the
+    // body's standing stated rather than implied.
+    let history = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(history["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(history["messages"][0]["publication"], "stored");
+
+    // The temporary local copy is released, and history then reads from the
+    // broker by locator.
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, Some(cuuid), 0)
+            .await
+            .unwrap(),
+        1
+    );
+    let (local,): (String,) =
+        sqlx::query_as("SELECT body FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(local.is_empty(), "the body is the broker's now");
+    assert_eq!(
+        convo_store::body_of(&h.pool, &backend, mid).await.unwrap(),
+        "through the broker"
+    );
+
+    // One logical message, not two, and its body came from the broker.
+    let history = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(
+        history["messages"].as_array().unwrap().len(),
+        1,
+        "a retained body is one message, not a second copy: {history}"
+    );
+    assert_eq!(history["messages"][0]["body"], "through the broker");
+
+    // A pending publication is neither hidden nor reported as stored, and
+    // an earlier pending message does not let a reader walk past it.
+    let pending = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "still in flight",
+               "request_id": request_id()}),
+    )
+    .await;
+    let _later = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "sent after it",
+               "request_id": request_id()}),
+    )
+    .await;
+    let history = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let msgs = history["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+    assert_eq!(msgs[1]["publication"], "pending_publication");
+    assert_eq!(
+        msgs[1]["body"], "still in flight",
+        "the body is still local"
+    );
+    assert!(msgs[1]["seq"].as_i64().unwrap() < msgs[2]["seq"].as_i64().unwrap());
+
+    // Out-of-order completion: the later message is published first. The
+    // thread keeps its own order, which is the sequence, not the order the
+    // broker happened to confirm in.
+    let first = outbox::lease(&h.pool, "worker-a").await.unwrap().unwrap();
+    let second = outbox::lease(&h.pool, "worker-b").await.unwrap().unwrap();
+    assert_eq!(first.message_id.to_string(), pending["message_id"]);
+    assert_eq!(
+        outbox::publish_leased(&h.pool, &backend, &second)
+            .await
+            .unwrap(),
+        outbox::Settled::Stored
+    );
+    assert_eq!(
+        outbox::publish_leased(&h.pool, &backend, &first)
+            .await
+            .unwrap(),
+        outbox::Settled::Stored
+    );
+    outbox::release_published_bodies(&h.pool, Some(cuuid), 0)
+        .await
+        .unwrap();
+    let history = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let bodies: Vec<&str> = history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        ["through the broker", "still in flight", "sent after it"],
+        "confirmation order is not thread order"
+    );
+
+    // An ACL that changes while bodies are on the broker takes effect on
+    // the next read, not the next restart: a removed member stops reading.
+    call(
+        &owner,
+        "remove_conversation_member",
+        json!({"conversation_id": cid, "address": "dani/review"}),
+    )
+    .await;
+    let refused =
+        call_expect_error(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert!(refused.contains("no such conversation"), "{refused}");
+    let refused = call_expect_error(
+        &dani,
+        "get_conversation_message",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(refused.contains("no such conversation"), "{refused}");
+
+    // A body the backend no longer holds is an explained absence, and the
+    // message keeps its place, its recipients and its receipts.
+    outbox::tombstone(&h.pool, mid, "retention").await.unwrap();
+    let err = convo_store::body_of(&h.pool, &backend, mid)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no longer held"), "{err}");
+    assert!(err.contains("receipts remain"), "{err}");
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert_eq!(receipts["total"], 1, "the denominator survives a tombstone");
+    let history = call(&owner, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(history["messages"][0]["publication"], "tombstoned");
+    assert_eq!(history["messages"][0]["body"], "");
+    assert!(
+        history["messages"][0]["unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("no longer held"),
+        "a gap that is explained is not the same as a gap: {history}"
+    );
+    assert_eq!(
+        history["messages"].as_array().unwrap().len(),
+        3,
+        "a tombstoned body does not remove the message"
+    );
+
+    // The Postgres thread is untouched by any of this.
+    let plain = ai_crew_sync::store::backend::PostgresBackend::new(h.pool.clone());
+    let legacy_sent = call(
+        &before,
+        "send_conversation_message",
+        json!({"conversation_id": legacy["id"], "body": "still local",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(legacy_sent["stored"], true);
+    assert_eq!(
+        convo_store::body_of(
+            &h.pool,
+            &plain,
+            legacy_sent["message_id"].as_str().unwrap().parse().unwrap()
+        )
+        .await
+        .unwrap(),
+        "still local"
+    );
+
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    for c in [owner, dani, before] {
+        let _ = c.cancel().await;
+    }
     h.shutdown().await;
 }

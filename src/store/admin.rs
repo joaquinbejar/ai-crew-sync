@@ -303,6 +303,60 @@ pub async fn set_conversations(
     Ok(())
 }
 
+/// Route a team's **new** conversations to a backend.
+///
+/// Existing threads are not migrated and never will be by this call: their
+/// bodies are where they are, and `conversations.backend` keeps saying so.
+/// Refused while the team has publications in flight, because switching
+/// away from a backend with work still queued for it leaves messages nobody
+/// drains.
+pub async fn set_default_backend(
+    pool: &PgPool,
+    actor: Actor,
+    team_id: Uuid,
+    backend: &str,
+) -> BusResult<()> {
+    if !matches!(backend, "postgres" | "jetstream") {
+        return Err(crate::error::BusError::invalid(
+            "backend must be 'postgres' or 'jetstream'",
+        ));
+    }
+    let (inflight,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM conversation_outbox WHERE team_id = $1 AND state <> 'failed'",
+    )
+    .bind(team_id)
+    .fetch_one(pool)
+    .await?;
+    if inflight > 0 {
+        return Err(crate::error::BusError::conflict(format!(
+            "{inflight} message(s) of this team are still awaiting publication. Let them \
+             settle before changing the route; `team usage` shows when the queue is empty."
+        )));
+    }
+    let mut tx = pool.begin().await?;
+    let changed: Option<(String,)> = sqlx::query_as(
+        "UPDATE teams SET default_backend = $2
+          WHERE id = $1 AND default_backend <> $2 RETURNING slug",
+    )
+    .bind(team_id)
+    .bind(backend)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((slug,)) = changed {
+        audit(
+            &mut tx,
+            actor,
+            "team.backend",
+            Some(team_id),
+            Some(team_id),
+            serde_json::json!({ "slug": slug, "default_backend": backend }),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn list_teams(pool: &PgPool) -> BusResult<Vec<TeamRow>> {
     let rows: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
         "SELECT t.id, t.slug, t.name, (SELECT count(*) FROM agents a WHERE a.team_id = t.id)

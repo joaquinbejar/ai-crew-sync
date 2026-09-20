@@ -129,6 +129,26 @@ struct ServeArgs {
     /// random key is generated at startup, so sessions end at restart.
     #[arg(long, env = "BUS_DASHBOARD_SECRET")]
     dashboard_secret: Option<String>,
+
+    /// NATS/JetStream broker for teams routed off Postgres, e.g.
+    /// nats://127.0.0.1:4222. Unset on a default installation, which never
+    /// contacts a broker. Setting it routes nobody by itself: see
+    /// `team capability --backend`.
+    #[arg(long, env = "BUS_NATS_URL")]
+    nats_url: Option<String>,
+
+    /// NATS credentials file for the runtime: publish and fetch only.
+    /// Provisioning streams is a separate privilege this process does not
+    /// need and should not hold.
+    #[arg(long, env = "BUS_NATS_CREDENTIALS")]
+    nats_credentials: Option<String>,
+
+    /// Drain the publication outbox in this process. Turn it off on
+    /// replicas that only serve requests when you run dedicated drainers.
+    /// Without --nats-url there is nothing to drain either way.
+    #[arg(long, env = "BUS_PUBLICATION_WORKER", default_value_t = true,
+          action = clap::ArgAction::Set)]
+    publication_worker: bool,
 }
 
 #[derive(Subcommand)]
@@ -148,7 +168,30 @@ enum TeamCmd {
         /// Conversations: threads with explicit membership and per-recipient
         /// receipts. Off by default.
         #[arg(long, value_parser = ["on", "off"])]
-        conversations: String,
+        conversations: Option<String>,
+        /// Where this team's NEW conversations store their bodies. Existing
+        /// threads keep the backend they were created on, always: a thread
+        /// with half its history in each place is unreadable. Requires the
+        /// team's stream to exist (`team stream --provision`) and the server
+        /// to be started with --nats-url.
+        #[arg(long, value_parser = ["postgres", "jetstream"])]
+        backend: Option<String>,
+    },
+    /// Create or remove a team's JetStream stream. Operator action, run
+    /// with the provisioning credential — not the one the server holds.
+    Stream {
+        #[arg(long)]
+        team: String,
+        #[arg(long, env = "BUS_NATS_URL")]
+        nats_url: String,
+        /// Provisioning credentials file. Distinct from the runtime one by
+        /// design: the server cannot create or delete streams.
+        #[arg(long)]
+        nats_credentials: Option<String>,
+        /// Delete the stream and every body it holds. Refused while the
+        /// team still routes new conversations there.
+        #[arg(long)]
+        remove: bool,
     },
     /// Report what a team is storing (counts and bytes; never content).
     Usage {
@@ -684,6 +727,9 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
                     max_request_bytes: args.max_request_bytes,
                     rate_limit_per_minute: args.rate_limit_per_minute,
                     dashboard_secret,
+                    nats_url: args.nats_url,
+                    nats_credentials: args.nats_credentials,
+                    publication_worker: args.publication_worker,
                 },
             )
             .await?;
@@ -696,7 +742,27 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
             TeamCmd::Capability {
                 team,
                 conversations,
-            } => admin::team_capability(&pool, &team, conversations == "on").await?,
+                backend,
+            } => {
+                if conversations.is_none() && backend.is_none() {
+                    anyhow::bail!(
+                        "nothing to change: pass --conversations on|off, --backend \
+                         postgres|jetstream, or both"
+                    );
+                }
+                if let Some(conversations) = conversations {
+                    admin::team_capability(&pool, &team, conversations == "on").await?;
+                }
+                if let Some(backend) = backend {
+                    admin::team_backend(&pool, &team, &backend).await?;
+                }
+            }
+            TeamCmd::Stream {
+                team,
+                nats_url,
+                nats_credentials,
+                remove,
+            } => admin::team_stream(&pool, &team, &nats_url, nats_credentials, remove).await?,
             TeamCmd::Usage { team } => admin::team_usage(&pool, &team).await?,
             TeamCmd::Prune {
                 team,
