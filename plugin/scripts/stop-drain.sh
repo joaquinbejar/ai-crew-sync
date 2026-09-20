@@ -14,8 +14,16 @@
 # unreachable, or when the bus is not configured at all.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-[ -n "${BUS_URL:-}" ] && [ -n "${BUS_TOKEN:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
+
+# Configured in one of two ways, and neither is assumed: the authenticated
+# path needs the binary and a binding (resolved below, from the payload), the
+# legacy path needs BUS_URL and BUS_TOKEN. With neither, the hook is silent —
+# a window whose bus is not set up must not block on a question.
+if [ -z "${BUS_TOKEN:-}" ] && ! command -v ai-crew-sync >/dev/null 2>&1; then
+    exit 0
+fi
+[ -n "${BUS_TOKEN:-}" ] && [ -z "${BUS_URL:-}" ] && exit 0
 
 # Claude Code delivers the hook payload on stdin; session_id keys the loop
 # guard so two sessions in different repositories do not share one.

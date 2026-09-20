@@ -71,8 +71,11 @@ use crate::context::{self, Inputs, Resolved};
 /// Prefix of a session label the proxy mints. Opaque on purpose: the label
 /// is an address, `project`/`role` are the human-facing part.
 pub const SESSION_PREFIX: &str = "s-";
-/// Hex characters after the prefix: 48 bits, collision-free in any team.
-const SESSION_HEX: usize = 12;
+/// Hex characters after the prefix. 128 bits: the label is an address that
+/// partitions cursors, claims and locks, so two conversations colliding
+/// would merge them silently. The session-label limit is 64 bytes, which
+/// leaves room to spare.
+const SESSION_HEX: usize = 32;
 
 /// Presence lease the proxy keeps alive, and how often it renews it.
 const PRESENCE_TTL_SECS: i64 = 900;
@@ -119,6 +122,15 @@ pub struct ProxyOptions {
 /// unrelated to repository, role or pid. Shared with the resolver so a hook
 /// of the same conversation lands on the same session without coordinating.
 pub use crate::context::session_for_host as session_for;
+
+/// Validate a discovery label the way the bus does, so `configure_session`
+/// refuses what `heartbeat` would reject rather than storing it locally and
+/// reporting a success the server never saw. Empty clears.
+fn check_label(field: &str, raw: &str) -> Result<Option<String>, ErrorData> {
+    crate::store::presence::normalize_label(field, raw)
+        .map(|v| (!v.is_empty()).then_some(v))
+        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))
+}
 
 fn random_session() -> String {
     let raw = crate::auth::generate_token();
@@ -425,9 +437,29 @@ async fn establish(
     // First connection: the agent token, with the label in a header, exactly
     // as any direct client would.
     let remote = connect_remote(&resolved.mcp_url, &resolved.token, session, None).await?;
-    let me = call_remote(&remote, "whoami", json!({}))
-        .await
-        .context("the bus did not accept the credential")?;
+    let me = match call_remote(&remote, "whoami", json!({})).await {
+        Ok(me) => me,
+        Err(e) => {
+            let raw = e.to_string();
+            let _ = remote.cancel().await;
+            // The same wording a forwarded 401 gets, so a window started
+            // with a rotated token says what to do rather than "the bus did
+            // not accept the credential".
+            if raw.contains("Auth required") || raw.contains("401") {
+                anyhow::bail!(
+                    "the bus rejected this window's credential — it has been revoked or \
+                     rotated{}. Issue a new token (`ai-crew-sync admin token issue --save`) \
+                     or select another approved profile",
+                    resolved
+                        .profile
+                        .as_deref()
+                        .map(|p| format!(" (profile '{p}')"))
+                        .unwrap_or_default()
+                );
+            }
+            anyhow::bail!("the bus did not accept the credential: {raw}");
+        }
+    };
     let agent = me["agent"].as_str().unwrap_or_default().to_owned();
     let team = me["team"].as_str().unwrap_or_default().to_owned();
     if let Some((exp_team, exp_agent)) = &resolved.expected
@@ -791,21 +823,29 @@ impl Proxy {
     }
 
     async fn configure(&self, args: ConfigureArgs) -> anyhow::Result<ConfigureResult> {
+        // Labels first, before anything is committed anywhere.
         let mut previous = None;
-        // Metadata first: cheap, local, and valid whether or not a profile
-        // change follows.
-        {
-            let mut st = self.state.write().await;
-            if let Some(role) = args.role {
-                st.role = Some(role.trim().to_lowercase()).filter(|s| !s.is_empty());
+        // Validated like the server validates them, and staged rather than
+        // committed: a call that also switches profile must leave the
+        // previous context *entirely* intact when the switch fails, labels
+        // included.
+        let staged_role = match args.role {
+            Some(v) => Some(check_label("role", &v).map_err(|e| anyhow::anyhow!("{}", e.message))?),
+            None => None,
+        };
+        let staged_project = match args.project {
+            Some(v) => {
+                Some(check_label("project", &v).map_err(|e| anyhow::anyhow!("{}", e.message))?)
             }
-            if let Some(project) = args.project {
-                st.project = Some(project.trim().to_lowercase()).filter(|s| !s.is_empty());
+            None => None,
+        };
+        let staged_channel = match args.channel {
+            Some(v) => {
+                Some(check_label("channel", &v).map_err(|e| anyhow::anyhow!("{}", e.message))?)
             }
-            if let Some(channel) = args.channel {
-                st.channel = Some(channel.trim().to_lowercase()).filter(|s| !s.is_empty());
-            }
-        }
+            None => None,
+        };
+
         if let Some(profile) = args
             .profile
             .map(|p| p.trim().to_owned())
@@ -818,10 +858,22 @@ impl Proxy {
             inputs.explicit_token = None;
             inputs.explicit_url = None;
             previous = self.connect_with(&inputs, false).await?;
-        } else {
-            self.heartbeat("active").await;
-            self.write_binding().await;
         }
+        // Only now, with the switch (if any) verified and committed.
+        {
+            let mut st = self.state.write().await;
+            if let Some(role) = staged_role {
+                st.role = role;
+            }
+            if let Some(project) = staged_project {
+                st.project = project;
+            }
+            if let Some(channel) = staged_channel {
+                st.channel = channel;
+            }
+        }
+        self.heartbeat("active").await;
+        self.write_binding().await;
         Ok(ConfigureResult {
             status: self.status().await,
             previous,
@@ -867,6 +919,14 @@ impl Proxy {
     /// session and reconnect so every forwarded call, this one included,
     /// carries it.
     async fn rebind(&self, host_id: String) -> anyhow::Result<()> {
+        // Staged, not committed: if the new session cannot connect, the
+        // previous one must keep serving. Advertising the new identity over
+        // the old connection is how a window ends up reporting one session
+        // and writing as another.
+        let previous = {
+            let st = self.state.read().await;
+            (st.host_id.clone(), st.binding, st.session.clone())
+        };
         {
             let mut st = self.state.write().await;
             st.host_id = Some(host_id.clone());
@@ -887,7 +947,9 @@ impl Proxy {
         match self.connect_with(&inputs, true).await {
             Ok(_) => Ok(()),
             Err(e) => {
-                self.state.write().await.disconnected_reason = Some(format!("{e:#}"));
+                let mut st = self.state.write().await;
+                (st.host_id, st.binding, st.session) = previous;
+                st.disconnected_reason = Some(format!("{e:#}"));
                 Err(e)
             }
         }
@@ -983,6 +1045,13 @@ impl Proxy {
                     .unwrap_or_default()
             ));
         }
+    }
+
+    /// The channel this window posts to when a message names none: its own
+    /// `channel`, else the channel named after its project.
+    async fn default_channel(&self) -> Option<String> {
+        let st = self.state.read().await;
+        st.channel.clone().or_else(|| st.project.clone())
     }
 
     fn instructions(&self, st: &State) -> String {
@@ -1143,7 +1212,11 @@ async fn report_holdings(
         .and_then(|v| v["locks"].as_array().cloned())
         .unwrap_or_default()
         .iter()
-        .filter(|l| l["holder"] == agent)
+        // Agent AND session: locks are session-scoped, so a sibling window's
+        // lock is not this one's to report as left behind.
+        .filter(|l| {
+            l["holder"] == agent && l["holder_session"].as_str().unwrap_or_default() == session
+        })
         .filter_map(|l| l["name"].as_str().map(str::to_owned))
         .collect();
     PreviousIdentity {
@@ -1215,6 +1288,21 @@ impl ServerHandler for Proxy {
                     // rather than a protocol error.
                     Err(e) => Ok(tool_error(format!("{e:#}")).into()),
                 }
+            }
+            // A message with no channel and no recipient goes to this
+            // window's channel. The state was decorative until now: the
+            // instructions and session_status promised a default the bus
+            // never saw.
+            "post_message" => {
+                let mut request = request;
+                if let Some(channel) = self.default_channel().await {
+                    let args = request.arguments.get_or_insert_with(Default::default);
+                    let addressed = args.contains_key("channel") || args.contains_key("to");
+                    if !addressed {
+                        args.insert("channel".into(), Value::String(channel));
+                    }
+                }
+                Ok(self.forward(request, context.ct).await?.into())
             }
             _ => Ok(self.forward(request, context.ct).await?.into()),
         }

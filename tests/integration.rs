@@ -5662,6 +5662,43 @@ async fn proxy_switches_profiles_only_after_verification_and_never_across_teams(
     assert_eq!(switched["previous"]["agent"], "joaquin");
     assert_eq!(switched["previous"]["open_claims"], json!(["api#1"]));
     assert_eq!(switched["previous"]["held_locks"], json!(["api:deploy"]));
+
+    // The window's own channel is applied to a message that names none, so
+    // the default the instructions advertise is the one the bus sees.
+    call(&p, "create_channel", json!({"name": "api"})).await;
+    let posted = call(&p, "post_message", json!({"body": "from the window"})).await;
+    assert_eq!(posted["message"]["channel"], "api");
+    // An explicit channel and a direct message are untouched.
+    call(&p, "create_channel", json!({"name": "other"})).await;
+    let elsewhere = call(
+        &p,
+        "post_message",
+        json!({"channel": "other", "body": "explicit"}),
+    )
+    .await;
+    assert_eq!(elsewhere["message"]["channel"], "other");
+    let dm = call(
+        &p,
+        "post_message",
+        json!({"to": "joaquin", "body": "direct"}),
+    )
+    .await;
+    assert!(dm["message"]["channel"].is_null(), "{dm}");
+
+    // A label the bus would reject is refused here too, and changes nothing.
+    let before_role = call(&p, "session_status", json!({})).await["role"].clone();
+    let r = p
+        .call_tool(
+            CallToolRequestParams::new("configure_session")
+                .with_arguments(serde_json::from_value(json!({"role": "code review!"})).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.is_error, Some(true), "{r:?}");
+    assert_eq!(
+        call(&p, "session_status", json!({})).await["role"],
+        before_role
+    );
     assert_eq!(call(&p, "whoami", json!({})).await["agent"], "marta");
     // Ownership stayed with joaquin: marta holds neither the lease nor the
     // lock, so she can renew and release nothing of his.

@@ -31,13 +31,24 @@ fi
 # JSON or nothing at all; it never falls back to another identity, and the
 # credential never passes through this script.
 if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
-    case "$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)" in
+    STATE="$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)"
+    case "$STATE" in
         *'"authenticated"'*)
             ai-crew-sync context hook --binding "$HOST_SESSION" --event session_start \
                 --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true
             exit 0
             ;;
+        *'"no-credential"'*)
+            # This window WAS authenticated and its state is now unusable.
+            # Falling through would inject a digest read with the parent token
+            # under a guessed label, which is the unproven identity this whole
+            # path exists to avoid. Say so instead, and stay quiet on the bus.
+            printf '%s' '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"[ai-crew-sync] This conversation is bound to a bus session whose credential is gone (the window was closed, or its state file was removed). No bus context was loaded and nothing was published. Restart the conversation, or run `ai-crew-sync context hook --binding <session id> --event status` to see the binding."}}'
+            exit 0
+            ;;
     esac
+    # "missing" falls through: this conversation never had a proxy, so the
+    # legacy path below is the intended configuration, not a broken one.
 fi
 
 # Identity first: nothing is injected into the conversation until the bus has
