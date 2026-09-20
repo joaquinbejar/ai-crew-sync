@@ -310,6 +310,37 @@ pub async fn guard(tx: &mut sqlx::PgConnection, auth: &AuthCtx) -> BusResult<()>
     Ok(())
 }
 
+/// Refuse a call that wears a live window's label without its credential.
+///
+/// The label in a header is a name a caller chooses. When that name belongs
+/// to a registered window, only that window may act as it — otherwise the
+/// parent agent token could read that window's private references, confirm
+/// deliveries for it and speak in its threads, with none of the audit trail
+/// the documented recovery path carries.
+pub async fn require_window(pool: &PgPool, auth: &AuthCtx) -> BusResult<()> {
+    if auth.session.is_empty() || auth.session_id.is_some() {
+        return Ok(());
+    }
+    let (live,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM agent_sessions
+          WHERE agent_id = $1 AND label = $2 AND revoked_at IS NULL AND expires_at > now()",
+    )
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .fetch_one(pool)
+    .await?;
+    if live == 0 {
+        return Ok(());
+    }
+    Err(BusError::Forbidden(format!(
+        "'{}' is a registered window and this call carries an agent token, not that \
+         window's session credential. Ask that window to make the call, or use \
+         recover_conversation_history, which is the audited way for an agent to reach \
+         its own windows' threads.",
+        auth.session
+    )))
+}
+
 /// The identity a session credential proves, for `whoami`.
 pub async fn identity(pool: &PgPool, auth: &AuthCtx) -> BusResult<Option<SessionIdentity>> {
     let Some(session_id) = auth.session_id else {

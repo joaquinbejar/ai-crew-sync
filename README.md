@@ -58,7 +58,7 @@ Each agent — yours, each teammate's — connects with its own token and can:
 | **Generic locks** with TTL over resources ("deploy:staging") | `acquire_lock`, `release_lock`, `list_locks` |
 | Presence (who is on which repo/branch doing what), with each teammate's open sessions under their name; session discovery by project and role | `heartbeat`, `list_agents`, `list_sessions` |
 | Authenticated windows: a credential that proves which window is calling, derived from your agent token | `register_session`, `resume_session`, `renew_session`, `revoke_session` |
-| Conversations: addressed threads with explicit membership and per-recipient receipts (opt-in per team) | `create_conversation`, `send_conversation_message`, `read_conversation`, `ack_message`, `get_message_receipts`, … |
+| Conversations: addressed threads with explicit membership and per-recipient receipts (opt-in per team) | `create_conversation`, `send_conversation_message`, `read_conversation`, `ack_message`, `get_message_receipts`, `fetch_conversation_inbox`, … |
 | Shared team memory (notes with history) | `set_note`, `get_note`, `list_notes`, `search_notes`, `delete_note` |
 | **Activity digest** of the last N hours | `team_digest` |
 | **Sessions**: one token, one working context per repository | `X-Crew-Session` header (see below) |
@@ -1023,6 +1023,43 @@ Retries are safe: `send_conversation_message` takes a `request_id` UUID you
 generate, and repeating it returns the original message instead of posting
 twice. The same id with a different body is refused rather than silently
 keeping the first.
+
+### The inbox: what `delivered` is allowed to mean
+
+On a thread routed to a broker, every window has its own durable inbox of
+**references** — which messages exist for it, never their bodies. Two
+recipients cannot take each other's, and one acknowledgement drains nobody
+else's.
+
+```
+fetch_conversation_inbox {}
+→ {"references": [{"delivery_id": "…", "message_id": "…", "seq": 7,
+                   "from_address": "joaquin/impl", "kind": "message",
+                   "redelivered": false, "source": "broker"}],
+   "from_broker": 1, "more": false}
+confirm_inbox_delivery {"delivery_ids": ["…"]}
+```
+
+Taking a reference is not receiving it. `delivered_at` is written only when
+the holder says, in a separate call, that it is still holding the reference
+after a restart — and `ai-crew-sync mcp proxy` makes that true by writing
+the references to a 0600 file and **fsyncing before it confirms**. A crash
+in between costs a redelivery, which is idempotent; confirming first would
+cost the reference itself.
+
+Delivered stays a different fact from presented, acknowledged and resolved.
+Nothing here wakes an idle window: no host we support lets a third party
+push into a model that is not in a turn, and a broker does not change that.
+
+`conversation_inbox_status` reports both sides separately, because they
+answer different questions:
+
+| Field | What it is |
+|---|---|
+| `undelivered` | The authority: messages addressed to this window that nobody has confirmed holding. |
+| `handed_out_unconfirmed` | References given to a process that never confirmed. After a crash this is expected; they are offered again. |
+| `broker_pending` / `broker_awaiting_ack` | A cache. It may lag. |
+| `broker_consumer_present` | `false` means the durable consumer is gone — expired, or removed. **That is not an empty inbox**: the bus rebuilds the references from its own records. |
 
 ## Remote administration
 

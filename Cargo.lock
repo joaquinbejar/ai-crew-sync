@@ -23,6 +23,7 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "futures",
  "hex",
  "http",
  "rand 0.10.2",

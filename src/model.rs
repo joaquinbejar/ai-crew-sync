@@ -623,6 +623,74 @@ pub struct ConversationRead {
     pub history_from_seq: Option<i64>,
 }
 
+/// One reference to a message, as a recipient's inbox hands it over. It
+/// carries no body: the body is read separately, with a current access
+/// check at that moment.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct InboxReference {
+    /// Pass this to `confirm_inbox_delivery` once you hold the reference
+    /// durably. Until you do, nothing has been marked delivered.
+    pub delivery_id: String,
+    pub message_id: String,
+    pub conversation_id: String,
+    pub seq: i64,
+    pub from: String,
+    /// `agent/session` of the sender, for an exact reply.
+    pub from_address: String,
+    pub created_at: String,
+    /// True when this reference has been offered before: an earlier
+    /// confirmation was lost, or the process holding it went away. Handling
+    /// it twice must change nothing.
+    pub redelivered: bool,
+    /// `broker` when it came from the durable inbox, `bus` when it was
+    /// rebuilt from the bus's own records after an expiry, a deleted
+    /// consumer, or a team that is not routed to a broker at all.
+    pub source: String,
+    /// `message` — this message was addressed to you — or `receipt`: a
+    /// message *you sent* has a receipt worth reading again. A receipt
+    /// reference never means someone read anything; `get_message_receipts`
+    /// says what actually happened.
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct InboxBatch {
+    pub references: Vec<InboxReference>,
+    /// How many of them the broker supplied. The rest were rebuilt from the
+    /// bus's own records, which are the authority.
+    pub from_broker: i64,
+    /// True when the batch filled: call again.
+    pub more: bool,
+    /// Present when something is worth saying about where these came from —
+    /// an unreachable broker, a missing consumer, a team on Postgres.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
+}
+
+/// What one window's inbox holds. The two sides are reported separately on
+/// purpose: they answer different questions, and averaging them would hide
+/// exactly the case worth seeing.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct InboxState {
+    pub address: String,
+    /// Messages addressed to this window that it has never confirmed
+    /// holding. The authoritative number.
+    pub undelivered: i64,
+    /// References handed to a process that has not confirmed them. A
+    /// non-zero number here after a crash is expected: they are offered
+    /// again.
+    pub handed_out_unconfirmed: i64,
+    /// What the broker still holds for this window, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub broker_pending: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub broker_awaiting_ack: Option<i64>,
+    /// False means the durable consumer is gone (expired, or removed).
+    /// That is not an empty inbox: the bus's own records still have it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub broker_consumer_present: Option<bool>,
+}
+
 /// Five independent observations. An absent timestamp means *not observed*,
 /// never "assumed": a cursor moving is not a person reading, and a host that
 /// cannot confirm injection leaves `presented_at` null.

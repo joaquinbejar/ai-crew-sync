@@ -82,8 +82,10 @@ base64 = "0.23"
 # this client move together, and the integration fixture pins the server to
 # match. Nothing uses it unless a team is explicitly routed to JetStream.
 async-nats = "0.50"
-# Shared with async-nats: payloads cross that boundary as Bytes.
+# Shared with async-nats: payloads cross that boundary as Bytes, and a
+# fetched batch arrives as a Stream.
 bytes = "1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
 # Outgoing webhooks. Kept on the same major as the reqwest rmcp resolves,
 # so the binary carries one HTTP client and one TLS stack, not two.

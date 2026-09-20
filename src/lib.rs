@@ -30,6 +30,7 @@ pub mod model;
 pub mod proxy;
 pub mod ratelimit;
 pub mod serve;
+pub mod spool;
 pub mod store;
 pub mod tools;
 pub mod webhooks;

@@ -135,6 +135,10 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// PubAck is served locally; short enough that the duplication is temporary.
 const BODY_RELEASE_GRACE_SECS: i64 = 300;
 const BODY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// How often queued inbox references are published, and how many per pass.
+/// Bounded so one team with a backlog cannot starve the others.
+const REFERENCE_INTERVAL: Duration = Duration::from_millis(500);
+const REFERENCES_PER_PASS: i64 = 200;
 
 /// Drain the publication outbox for the teams routed off Postgres.
 ///
@@ -148,6 +152,7 @@ async fn run_outbox_worker(
     let worker = format!("serve-{}", uuid::Uuid::new_v4().simple());
     let mut next_reconcile = tokio::time::Instant::now();
     let mut next_sweep = tokio::time::Instant::now();
+    let mut next_references = tokio::time::Instant::now();
     loop {
         if ct.is_cancelled() {
             return;
@@ -170,6 +175,11 @@ async fn run_outbox_worker(
                 Ok(n) => tracing::debug!(released = n, "dropped bodies their backend now holds"),
                 Err(e) => tracing::warn!(error = %e, "could not release published bodies"),
             }
+        }
+
+        if now >= next_references {
+            next_references = now + REFERENCE_INTERVAL;
+            publish_references(&pool, &backends).await;
         }
 
         let leased = match crate::store::outbox::lease(&pool, &worker).await {
@@ -220,6 +230,32 @@ async fn run_outbox_worker(
                     tracing::warn!(error = %e, "could not record an uncertain publication");
                 }
             }
+        }
+    }
+}
+
+/// Publish the per-recipient references queued by publication and by
+/// receipt changes. Only for teams routed to a broker: a Postgres team's
+/// readers are woken by the event hub, as they always were.
+async fn publish_references(pool: &PgPool, backends: &crate::store::routing::Backends) {
+    let teams = match backends.routed_teams(pool).await {
+        Ok(teams) => teams,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list routed teams");
+            return;
+        }
+    };
+    for team in teams {
+        let Ok(crate::store::routing::AnyBackend::JetStream(backend)) =
+            backends.for_team(pool, team).await
+        else {
+            continue;
+        };
+        match crate::store::inbox::publish_pending(pool, &backend, team, REFERENCES_PER_PASS).await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(%team, published = n, "inbox references published"),
+            Err(e) => tracing::warn!(error = %e, %team, "could not publish inbox references"),
         }
     }
 }

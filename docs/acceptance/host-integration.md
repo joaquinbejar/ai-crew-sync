@@ -45,7 +45,9 @@ State these to users rather than letting them discover them:
   not in a turn. `wait_for_updates` and `wait_for_conversation_updates` block
   *during* a turn; the `Stop` hook holds a turn open long enough to answer a
   blocking question. A window parked at the prompt for an hour answers
-  nothing, and no amount of infrastructure changes that.
+  nothing, and no amount of infrastructure changes that. The durable inbox
+  is no exception: it makes a reference survive a restart, not a model wake
+  up. Nothing on this list becomes supported because a broker is involved.
 - **Sharing one agent token between two tools without separate sessions.**
   Two clients that send no session header are the same window to the bus.
   That is what the proxy exists to prevent.
@@ -102,6 +104,8 @@ Neither carries a token. `BUS_TOKEN` must be **unset** for this test.
 | 8 | Two of them `ack_message`, one with `resolved: true`. Design calls `get_message_receipts`. | `acknowledged: 2`, `resolved: 1`, and the third shows null timestamps — *not answered*, not "no". `presented_at` is null everywhere. |
 | 9 | Revoke the agent token (`ai-crew-sync admin token revoke`). Use any window. | The window reports the credential was revoked or rotated and says what to do. Nothing was sent. |
 | 10 | Restore a working token, then kill a proxy process abruptly and reopen that conversation. | It resumes; its claims and locks are still its own; no sibling window was idled or drained. |
+| 11 | With a team routed to a broker: send a message to three windows; each calls `fetch_conversation_inbox`. Then `get_message_receipts`. | Each window gets exactly its own reference, with no body. `delivered_at` is set for the windows whose proxy confirmed, and null for any that did not — never for all three because one of them answered. |
+| 12 | Kill one window's proxy between the fetch and the confirm (`kill -9` the process), then reopen it and call `fetch_conversation_inbox` again. | Its spool file under the state directory still lists the reference; the reopened window confirms it and `delivered_at` appears then, not before. `conversation_inbox_status` reported `handed_out_unconfirmed: 1` in the meantime — not an empty inbox, and not a receipt. |
 
 ### Reporting
 

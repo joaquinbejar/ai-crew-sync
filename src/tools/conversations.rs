@@ -20,11 +20,28 @@ use uuid::Uuid;
 use super::{Bus, auth_of};
 use crate::{
     model::{
-        ConversationInfo, ConversationList, ConversationRead, ConversationUpdates, MessageReceipts,
-        ProjectInfo, ProjectList, ReceiptInfo, SentMessage, TransferResult,
+        ConversationInfo, ConversationList, ConversationRead, ConversationUpdates, InboxBatch,
+        InboxState, MessageReceipts, ProjectInfo, ProjectList, ReceiptInfo, SentMessage,
+        TransferResult,
     },
-    store::conversations as store,
+    store::{conversations as store, inbox},
 };
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InboxFetchArgs {
+    /// How many references to take at most. Default 20, ceiling 50.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InboxConfirmArgs {
+    /// The `delivery_id` of every reference you are now holding durably.
+    pub delivery_ids: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct EmptyInboxArgs {}
 
 fn uuid_arg(field: &str, raw: &str) -> Result<Uuid, ErrorData> {
     raw.trim().parse::<Uuid>().map_err(|_| {
@@ -447,6 +464,61 @@ impl Bus {
         let auth = auth_of(&ctx)?;
         let message_id = uuid_arg("message_id", &args.message_id)?;
         Ok(Json(store::receipts(&self.db, &auth, message_id).await?))
+    }
+
+    #[tool(
+        description = "Take the references waiting for THIS window: which messages exist \
+                       for you, not their bodies. Nothing is marked delivered here — you \
+                       confirm that separately with confirm_inbox_delivery once you are \
+                       holding them, so a crash in between costs a redelivery and not a \
+                       message. A reference may arrive twice (`redelivered`); handling it \
+                       twice must change nothing. Read the body with \
+                       get_conversation_message, which checks your access at that moment."
+    )]
+    async fn fetch_conversation_inbox(
+        &self,
+        ctx: RequestContext<rmcp::RoleServer>,
+        Parameters(args): Parameters<InboxFetchArgs>,
+    ) -> Result<Json<InboxBatch>, ErrorData> {
+        let auth = auth_of(&ctx)?;
+        Ok(Json(
+            inbox::fetch(&self.db, &self.backends, &auth, args.limit).await?,
+        ))
+    }
+
+    #[tool(
+        description = "Say that you are now holding these references durably. THIS is what \
+                       records delivered — the reference reached your process, which is not \
+                       the same as a model having seen it (presented), read it \
+                       (acknowledged) or acted on it (resolved). Confirming twice is \
+                       harmless. Confirm only what you can still find after a restart."
+    )]
+    async fn confirm_inbox_delivery(
+        &self,
+        ctx: RequestContext<rmcp::RoleServer>,
+        Parameters(args): Parameters<InboxConfirmArgs>,
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let auth = auth_of(&ctx)?;
+        let confirmed = inbox::confirm(&self.db, &self.backends, &auth, &args.delivery_ids).await?;
+        Ok(Json(serde_json::json!({
+            "confirmed": confirmed,
+            "of": args.delivery_ids.len(),
+        })))
+    }
+
+    #[tool(
+        description = "What is waiting for this window, and where. `undelivered` is the \
+                       authoritative count from the bus's own records; the broker numbers \
+                       are a cache and may lag or be missing. A missing consumer is not an \
+                       empty inbox."
+    )]
+    async fn conversation_inbox_status(
+        &self,
+        ctx: RequestContext<rmcp::RoleServer>,
+        Parameters(_args): Parameters<EmptyInboxArgs>,
+    ) -> Result<Json<InboxState>, ErrorData> {
+        let auth = auth_of(&ctx)?;
+        Ok(Json(inbox::state(&self.db, &self.backends, &auth).await?))
     }
 
     #[tool(

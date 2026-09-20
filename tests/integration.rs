@@ -150,6 +150,12 @@ async fn setup_with_broker(schema: &str) -> Option<Harness> {
 }
 
 async fn setup_with(schema: &str, nats: Option<String>) -> Option<Harness> {
+    // Silent unless RUST_LOG asks. A failing test that hides the server's
+    // own explanation of why it failed wastes the run.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let url = db_url()?;
     let pool = PgPoolOptions::new()
         .max_connections(8)
@@ -540,6 +546,9 @@ async fn tools_are_advertised_with_schemas() {
         "get_conversation_message",
         "ack_message",
         "get_message_receipts",
+        "fetch_conversation_inbox",
+        "confirm_inbox_delivery",
+        "conversation_inbox_status",
         "wait_for_conversation_updates",
         "create_project",
         "list_projects",
@@ -8042,6 +8051,405 @@ async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
 
     JetStreamBackend::deprovision(&config, team).await.unwrap();
     for c in [owner, dani, before] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Phase 6: every recipient has its own durable inbox. One acknowledgement
+/// drains nobody else's, a process that dies between taking a reference and
+/// confirming it gets an honest state rather than a fabricated receipt, and
+/// a broker that has lost the references does not make the inbox look empty.
+#[tokio::test]
+async fn each_recipient_holds_its_own_durable_inbox() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::{inbox, outbox};
+
+    let h = require_db_broker!("t_inbox_delivery");
+    let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    let marta_token = seed_agent(&h.pool, "acme", "marta").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    JetStreamBackend::provision_inbox(&config, team)
+        .await
+        .unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    let owner = connect_with_session(&h.base, &owner_token, "impl").await;
+    let design = connect_with_session(&h.base, &dani_token, "design").await;
+    let marta = connect_with_session(&h.base, &marta_token, "review").await;
+    // One of the three is a registered window, so the inbox is exercised
+    // with a real session credential and not only with a header label.
+    let dani_agent = connect(&h.base, &dani_token).await;
+    let review_cred = call(
+        &dani_agent,
+        "register_session",
+        json!({"session": "review"}),
+    )
+    .await;
+    let review = connect(&h.base, review_cred["session_token"].as_str().unwrap()).await;
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "three inboxes", "private": true,
+               "invite": ["dani/review", "dani/design", "marta/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    for client in [&review, &design, &marta] {
+        call(client, "join_conversation", json!({"conversation_id": cid})).await;
+    }
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "three of you, three inboxes",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(sent["recipients"].as_array().unwrap().len(), 3);
+
+    // Nothing is notified before the body is canonical: a reference to a
+    // message nobody stored would be a promise of something unreadable.
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        0,
+        "no references before the body is stored"
+    );
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        3,
+        "one reference per recipient, and no more"
+    );
+
+    // Each window takes its own, and only its own.
+    let first = call(&review, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(first["references"].as_array().unwrap().len(), 1);
+    assert_eq!(first["from_broker"], 1);
+    assert_eq!(first["references"][0]["message_id"], sent["message_id"]);
+    assert_eq!(first["references"][0]["kind"], "message");
+    assert_eq!(first["references"][0]["redelivered"], false);
+    assert!(
+        first["references"][0].get("body").is_none(),
+        "a reference carries no body: {first}"
+    );
+
+    // Taking it is not receiving it. Until the holder says it has it
+    // durably, nothing is delivered.
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        receipts["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["delivered_at"].is_null()),
+        "{receipts}"
+    );
+
+    call(
+        &review,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [first["references"][0]["delivery_id"]]}),
+    )
+    .await;
+    let delivered = |receipts: &Value, address: &str| -> bool {
+        receipts["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["address"] == address)
+            .map(|r| r["delivered_at"].is_string())
+            .unwrap_or(false)
+    };
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(delivered(&receipts, "dani/review"), "{receipts}");
+    assert!(!delivered(&receipts, "dani/design"), "{receipts}");
+    assert!(!delivered(&receipts, "marta/review"), "{receipts}");
+
+    // One window's acknowledgement is its own. The other two are not
+    // "assumed yes" and not "no": they have not answered.
+    call(
+        &review,
+        "ack_message",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert_eq!(receipts["acknowledged"], 1);
+    assert_eq!(receipts["resolved"], 0);
+    assert_eq!(receipts["total"], 3);
+
+    // The parent agent token cannot read its own window's inbox, or record
+    // a delivery on its behalf. The label in the header is a name.
+    let impostor = connect_with_session(&h.base, &dani_token, "review").await;
+    let err = call_expect_error(&impostor, "fetch_conversation_inbox", json!({})).await;
+    assert!(err.contains("registered window"), "{err}");
+    let err = call_expect_error(
+        &impostor,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [first["references"][0]["delivery_id"]]}),
+    )
+    .await;
+    assert!(err.contains("registered window"), "{err}");
+    let err = call_expect_error(&impostor, "conversation_inbox_status", json!({})).await;
+    assert!(err.contains("registered window"), "{err}");
+
+    // A later observation on the same message is a new notification. The
+    // sender is told to look again when the recipient resolves it, not only
+    // the first time it acknowledged.
+    inbox::publish_pending(&h.pool, &backend, team, 100)
+        .await
+        .unwrap();
+    call(
+        &review,
+        "ack_message",
+        json!({"message_id": sent["message_id"], "resolved": true, "note": "and done"}),
+    )
+    .await;
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        1,
+        "resolving after acknowledging is a second thing to tell the sender"
+    );
+    let (events,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM inbox_events WHERE kind = 'receipt' AND message_id = $1",
+    )
+    .bind(
+        sent["message_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap(),
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        events, 2,
+        "acknowledged and resolved are two observations, not one coalesced row"
+    );
+
+    // A process that takes a reference and dies before confirming: the
+    // reference is not lost and no receipt is invented. A second fetch does
+    // not hand it over twice while the first hand-out is still in flight,
+    // and the state says exactly that.
+    let taken = call(&design, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(taken["references"].as_array().unwrap().len(), 1);
+    let again = call(&design, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(
+        again["references"].as_array().unwrap().len(),
+        0,
+        "it is already in flight to this window: {again}"
+    );
+    let state = call(&design, "conversation_inbox_status", json!({})).await;
+    assert_eq!(state["address"], "dani/design");
+    assert_eq!(state["undelivered"], 1, "the authority still says one");
+    assert_eq!(state["handed_out_unconfirmed"], 1);
+
+    // Offered again once that hand-out has gone stale, it is the same
+    // reference under the same delivery id. A second row for the same
+    // reference used to violate the unique index and fail the whole fetch.
+    sqlx::query("UPDATE inbox_deliveries SET handed_at = now() - interval '10 minutes'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let redelivered = call(&design, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(redelivered["references"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        redelivered["references"][0]["delivery_id"], taken["references"][0]["delivery_id"],
+        "a redelivery finds the hand-out that is already open: {redelivered}"
+    );
+    // The confirmation arrives after the restart, with the reference the
+    // spool kept. Confirming twice changes nothing.
+    let id = taken["references"][0]["delivery_id"].clone();
+    let confirmed = call(
+        &design,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [id]}),
+    )
+    .await;
+    assert_eq!(confirmed["confirmed"], 1);
+    let repeat = call(
+        &design,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [id]}),
+    )
+    .await;
+    assert_eq!(repeat["confirmed"], 0, "confirming twice is harmless");
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(delivered(&receipts, "dani/design"), "{receipts}");
+    assert!(!delivered(&receipts, "marta/review"));
+
+    // A confirmation from a window that has since been resumed away writes
+    // nothing: the reference stays offered to whoever holds the window now.
+    // This needs a registered window, because that is what an epoch is.
+    let cred = call(&marta, "register_session", json!({"session": "review"})).await;
+    let marta_window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'marta'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "marta".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: "review".into(),
+        session_id: sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM agent_sessions WHERE label = 'review' AND agent_id =
+                 (SELECT id FROM agents WHERE name = 'marta')",
+        )
+        .fetch_optional(&h.pool)
+        .await
+        .unwrap(),
+        // The epoch a connection that has since been replaced was admitted
+        // with.
+        session_epoch: Some(99),
+        token_id: None,
+    };
+    assert!(stale.session_id.is_some(), "the window must be registered");
+    let backends =
+        ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone());
+    let marta_batch = call(&marta_window, "fetch_conversation_inbox", json!({})).await;
+    let marta_id = marta_batch["references"][0]["delivery_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let err = inbox::confirm(&h.pool, &backends, &stale, std::slice::from_ref(&marta_id))
+        .await
+        .expect_err("a replaced connection must not confirm")
+        .to_string();
+    assert!(err.contains("stale"), "{err}");
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        !delivered(&receipts, "marta/review"),
+        "a fenced confirmation must not write a receipt: {receipts}"
+    );
+
+    // The broker loses everything — an expiry, an operator, a deleted
+    // consumer. The inbox is not empty: the bus's own records are the
+    // authority, and the reference comes back from there.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    // Immediately after a hand-out the reference is in flight to this
+    // window, and a fetch does not hand it over a second time. The state is
+    // the honest answer, and it is not "your inbox is empty".
+    let inflight = call(&marta_window, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(inflight["references"].as_array().unwrap().len(), 0);
+    let state = call(&marta_window, "conversation_inbox_status", json!({})).await;
+    assert_eq!(state["undelivered"], 1);
+    assert_eq!(state["handed_out_unconfirmed"], 1);
+    assert_eq!(
+        state["broker_consumer_present"], false,
+        "a missing consumer is a fact, not an empty inbox: {state}"
+    );
+
+    // Once that hand-out has gone stale — the process holding it never came
+    // back — the reference is offered again, from the records that are the
+    // authority.
+    sqlx::query("UPDATE inbox_deliveries SET handed_at = now() - interval '10 minutes'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let rebuilt = call(
+        &marta_window,
+        "fetch_conversation_inbox",
+        json!({"limit": 5}),
+    )
+    .await;
+    let refs = rebuilt["references"].as_array().unwrap();
+    assert_eq!(refs.len(), 1, "{rebuilt}");
+    assert_eq!(refs[0]["source"], "bus");
+    assert_eq!(rebuilt["from_broker"], 0);
+    assert!(
+        rebuilt["note"].as_str().unwrap().contains("authority"),
+        "{rebuilt}"
+    );
+    call(
+        &marta_window,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [refs[0]["delivery_id"]]}),
+    )
+    .await;
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(delivered(&receipts, "marta/review"), "{receipts}");
+    assert_eq!(
+        receipts["acknowledged"], 1,
+        "delivery is not acknowledgement, on any path"
+    );
+
+    // Legacy traffic is untouched by all of this.
+    call(&owner, "create_channel", json!({"name": "general"})).await;
+    call(
+        &owner,
+        "post_message",
+        json!({"channel": "general", "body": "still here"}),
+    )
+    .await;
+    let read = call(
+        &marta_window,
+        "read_messages",
+        json!({"channel": "general"}),
+    )
+    .await;
+    assert_eq!(read["messages"].as_array().unwrap().len(), 1);
+
+    for c in [
+        owner,
+        review,
+        design,
+        marta,
+        marta_window,
+        dani_agent,
+        impostor,
+    ] {
         let _ = c.cancel().await;
     }
     h.shutdown().await;
