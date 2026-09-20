@@ -35,8 +35,11 @@ pub struct WhoAmI {
     /// task claims and locks are not separated from your other sessions.
     pub session: Option<String>,
     /// Discovery labels this session last published with `heartbeat`
-    /// (`project`, `role`). `null` until set.
+    /// (`project`, `role`). Absent until set, so a client that never labels
+    /// its windows sees exactly the response it saw before.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub role: Option<String>,
     /// Channel this session posts to when `post_message` is called with
     /// neither `channel` nor `to` — the one named after your session, if the

@@ -1,0 +1,34 @@
+# Production overlay. Combine with the base file:
+#
+#   docker stack deploy -c Docker/docker-compose.yml -c Docker/docker-compose.prod.yml crew
+#   make deploy            # does exactly that, after a preflight check
+#
+# Where the base file has a working default so `make up` boots on a laptop,
+# this one has NO default: `${VAR:?message}` makes compose refuse to render
+# until the value is set. A production stack should fail on the operator's
+# terminal, not silently come up wide open.
+services:
+  db:
+    environment:
+      # No fallback. The base file's `change-me` is for a laptop.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a real POSTGRES_PASSWORD for a production deploy}
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEMORY_LIMIT:-2g}
+
+  bus:
+    # An immutable tag, never the moving `latest`: a rolling restart must not
+    # silently change the version that is running.
+    image: ghcr.io/joaquinbejar/ai-crew-sync:${BUS_VERSION:?pin an immutable BUS_VERSION (e.g. 0.4.1 or a digest), not latest}
+    environment:
+      DATABASE_URL: postgres://bus:${POSTGRES_PASSWORD:?set a real POSTGRES_PASSWORD for a production deploy}@db:5432/bus
+      # Anti DNS-rebinding. "*" is fine behind a proxy that validates Host —
+      # if that is your setup, set BUS_ALLOWED_HOSTS=* explicitly and own it.
+      BUS_ALLOWED_HOSTS: ${BUS_ALLOWED_HOSTS:?set BUS_ALLOWED_HOSTS to your real hostname, or * if a proxy already validates Host}
+      # Shared so a dashboard session works on whichever replica serves it.
+      BUS_DASHBOARD_SECRET: ${BUS_DASHBOARD_SECRET:?set BUS_DASHBOARD_SECRET so dashboard sessions survive restarts and work across replicas}
+    deploy:
+      resources:
+        limits:
+          memory: ${BUS_MEMORY_LIMIT:-512m}

@@ -5123,6 +5123,13 @@ async fn sessions_are_discoverable_by_project_and_role_and_addressed_exactly() {
     let me = call(&clients[1], "whoami", json!({})).await;
     assert_eq!(me["project"], "market-data");
     assert_eq!(me["role"], "design");
+    // A window that never labelled itself gets the response it always got:
+    // the keys are absent, not null.
+    let unlabelled = connect_with_session(&h.base, &token, "s-nolabels").await;
+    let plain = call(&unlabelled, "whoami", json!({})).await;
+    assert!(plain.get("project").is_none(), "{plain}");
+    assert!(plain.get("role").is_none(), "{plain}");
+    let _ = unlabelled.cancel().await;
     let roster = call(&clients[0], "list_agents", json!({})).await;
     let joaquin = roster["agents"]
         .as_array()
