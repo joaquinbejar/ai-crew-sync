@@ -116,6 +116,12 @@ pub struct AdminRow {
     pub revoked: bool,
 }
 
+/// Active tokens one agent may hold. A ceiling on what a leaked or looping
+/// administrative credential can mint, and a nudge to revoke what is no
+/// longer used: one token per repository is the intended shape, not one per
+/// session start.
+pub const MAX_ACTIVE_TOKENS_PER_AGENT: i64 = 100;
+
 /// Longest name, slug or label accepted. These are identifiers people type,
 /// not documents.
 pub const MAX_NAME_BYTES: usize = 64;
@@ -143,30 +149,40 @@ fn check_name(field: &str, raw: &str) -> BusResult<String> {
     Ok(value)
 }
 
-fn check_label(label: Option<String>) -> BusResult<Option<String>> {
-    let Some(label) = label else {
+/// Free text people read back: a label, a display name, a team name. Trimmed,
+/// bounded, and free of control characters — it ends up in terminals, in
+/// listings and in the audit log.
+fn check_display(field: &str, value: Option<String>) -> BusResult<Option<String>> {
+    let Some(value) = value else {
         return Ok(None);
     };
-    let label = label.trim().to_owned();
-    if label.is_empty() {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
         return Ok(None);
     }
-    if label.len() > MAX_LABEL_BYTES {
+    if value.len() > MAX_LABEL_BYTES {
         return Err(BusError::invalid(format!(
-            "label is {} bytes; the limit is {MAX_LABEL_BYTES}",
-            label.len()
+            "{field} is {} bytes; the limit is {MAX_LABEL_BYTES}",
+            value.len()
         )));
     }
-    if label.chars().any(char::is_control) {
-        return Err(BusError::invalid(
-            "label must not contain control characters",
-        ));
+    if value.chars().any(char::is_control) {
+        return Err(BusError::invalid(format!(
+            "{field} must not contain control characters"
+        )));
     }
-    Ok(Some(label))
+    Ok(Some(value))
 }
 
+fn check_label(label: Option<String>) -> BusResult<Option<String>> {
+    check_display("label", label)
+}
+
+/// One audit row, on the same transaction as the mutation it records: the
+/// two commit together or not at all, so a mutation can never outlive a lost
+/// audit write.
 async fn audit(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     actor: Actor,
     action: &str,
     team_id: Option<Uuid>,
@@ -184,7 +200,7 @@ async fn audit(
     .bind(team_id)
     .bind(subject_id)
     .bind(detail)
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(())
 }
@@ -209,27 +225,19 @@ pub async fn create_team(
     name: Option<String>,
 ) -> BusResult<TeamRow> {
     let slug = check_name("team slug", slug)?;
-    let name = match name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()) {
-        Some(n) if n.len() > MAX_LABEL_BYTES => {
-            return Err(BusError::invalid(format!(
-                "team name is {} bytes; the limit is {MAX_LABEL_BYTES}",
-                n.len()
-            )));
-        }
-        Some(n) => n,
-        None => slug.clone(),
-    };
+    let name = check_display("team name", name)?.unwrap_or_else(|| slug.clone());
+    let mut tx = pool.begin().await?;
     let created: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO teams (slug, name) VALUES ($1, $2)
          ON CONFLICT (slug) DO NOTHING RETURNING id",
     )
     .bind(&slug)
     .bind(&name)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some((id,)) = created {
         audit(
-            pool,
+            &mut tx,
             actor,
             "team.create",
             Some(id),
@@ -238,14 +246,23 @@ pub async fn create_team(
         )
         .await?;
     }
+    tx.commit().await?;
     let id = team_id_by_slug(pool, &slug).await?;
-    let (name, agents): (String, i64) = sqlx::query_as(
-        "SELECT t.name, (SELECT count(*) FROM agents a WHERE a.team_id = t.id)
+    team_by_id(pool, id).await
+}
+
+/// One team as the listings show it.
+pub async fn team_by_id(pool: &PgPool, id: Uuid) -> BusResult<TeamRow> {
+    let row: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT t.slug, t.name, (SELECT count(*) FROM agents a WHERE a.team_id = t.id)
          FROM teams t WHERE t.id = $1",
     )
     .bind(id)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
+    let Some((slug, name, agents)) = row else {
+        return Err(BusError::not_found("no such team"));
+    };
     Ok(TeamRow {
         id,
         slug,
@@ -276,7 +293,9 @@ pub async fn list_teams(pool: &PgPool) -> BusResult<Vec<TeamRow>> {
 
 /// Create an agent, or re-enable an existing one of that name. A repeated
 /// `create` is how an operator brings back a disabled teammate, so it is not
-/// an error.
+/// an error. Audited as `agent.create` on creation and `agent.enable` on a
+/// re-enable; a repeat on an active agent changes nothing and logs nothing
+/// (a display-name tweak is cosmetic, not a security event).
 pub async fn create_agent(
     pool: &PgPool,
     actor: Actor,
@@ -285,31 +304,64 @@ pub async fn create_agent(
     display_name: Option<String>,
 ) -> BusResult<AgentRow> {
     let name = check_name("agent name", name)?;
-    let display_name = check_label(display_name)?;
-    let (id,): (Uuid,) = sqlx::query_as(
-        r#"
-        INSERT INTO agents (team_id, name, display_name)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (team_id, name) DO UPDATE
-            SET display_name = COALESCE(EXCLUDED.display_name, agents.display_name),
-                disabled_at = NULL
-        RETURNING id
-        "#,
+    let display_name = check_display("display name", display_name)?;
+    let mut tx = pool.begin().await?;
+    // Locked so two concurrent creates of the same name serialise on the
+    // row (the unique index serialises the inserts themselves).
+    let existing: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT id, (disabled_at IS NOT NULL) FROM agents
+         WHERE team_id = $1 AND name = $2 FOR UPDATE",
     )
     .bind(team_id)
     .bind(&name)
-    .bind(&display_name)
-    .fetch_one(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    audit(
-        pool,
-        actor,
-        "agent.create",
-        Some(team_id),
-        Some(id),
-        serde_json::json!({ "name": name, "display_name": display_name }),
-    )
-    .await?;
+    let id = match existing {
+        None => {
+            let (id,): (Uuid,) = sqlx::query_as(
+                "INSERT INTO agents (team_id, name, display_name) VALUES ($1, $2, $3)
+                 RETURNING id",
+            )
+            .bind(team_id)
+            .bind(&name)
+            .bind(&display_name)
+            .fetch_one(&mut *tx)
+            .await?;
+            audit(
+                &mut tx,
+                actor,
+                "agent.create",
+                Some(team_id),
+                Some(id),
+                serde_json::json!({ "name": name, "display_name": display_name }),
+            )
+            .await?;
+            id
+        }
+        Some((id, disabled)) => {
+            sqlx::query(
+                "UPDATE agents SET display_name = COALESCE($2, display_name), disabled_at = NULL
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(&display_name)
+            .execute(&mut *tx)
+            .await?;
+            if disabled {
+                audit(
+                    &mut tx,
+                    actor,
+                    "agent.enable",
+                    Some(team_id),
+                    Some(id),
+                    serde_json::json!({ "name": name }),
+                )
+                .await?;
+            }
+            id
+        }
+    };
+    tx.commit().await?;
     let rows = list_agents(pool, team_id).await?;
     rows.into_iter()
         .find(|a| a.id == id)
@@ -350,27 +402,43 @@ pub async fn disable_agent(
     name: &str,
 ) -> BusResult<()> {
     let name = name.trim().to_lowercase();
+    let mut tx = pool.begin().await?;
+    // Only a real transition is audited; disabling twice is a quiet no-op.
     let row: Option<(Uuid,)> = sqlx::query_as(
-        "UPDATE agents SET disabled_at = now() WHERE team_id = $1 AND name = $2 RETURNING id",
+        "UPDATE agents SET disabled_at = now()
+         WHERE team_id = $1 AND name = $2 AND disabled_at IS NULL RETURNING id",
     )
     .bind(team_id)
     .bind(&name)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    let Some((id,)) = row else {
-        return Err(BusError::not_found(format!(
-            "no agent '{name}' in this team"
-        )));
-    };
-    audit(
-        pool,
-        actor,
-        "agent.disable",
-        Some(team_id),
-        Some(id),
-        serde_json::json!({ "name": name }),
-    )
-    .await?;
+    match row {
+        Some((id,)) => {
+            audit(
+                &mut tx,
+                actor,
+                "agent.disable",
+                Some(team_id),
+                Some(id),
+                serde_json::json!({ "name": name }),
+            )
+            .await?;
+        }
+        None => {
+            let exists: Option<(Uuid,)> =
+                sqlx::query_as("SELECT id FROM agents WHERE team_id = $1 AND name = $2")
+                    .bind(team_id)
+                    .bind(&name)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if exists.is_none() {
+                return Err(BusError::not_found(format!(
+                    "no agent '{name}' in this team"
+                )));
+            }
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -387,14 +455,18 @@ pub async fn issue_token(
 ) -> BusResult<IssuedToken> {
     let agent = agent.trim().to_lowercase();
     let label = check_label(label)?;
+    let mut tx = pool.begin().await?;
+    // The agent row is locked for the rest of the transaction, so the
+    // active-token count below cannot be raced past the cap by a concurrent
+    // issue for the same agent.
     let row: Option<(Uuid, String, bool)> = sqlx::query_as(
         "SELECT a.id, t.slug, (a.disabled_at IS NOT NULL)
          FROM agents a JOIN teams t ON t.id = a.team_id
-         WHERE a.team_id = $1 AND a.name = $2",
+         WHERE a.team_id = $1 AND a.name = $2 FOR UPDATE OF a",
     )
     .bind(team_id)
     .bind(&agent)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some((agent_id, team_slug, disabled)) = row else {
         return Err(BusError::not_found(format!(
@@ -404,6 +476,18 @@ pub async fn issue_token(
     if disabled {
         return Err(BusError::conflict(format!(
             "agent '{agent}' is disabled; re-create it to enable it before issuing a token"
+        )));
+    }
+    let (active,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM api_tokens WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(agent_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active >= MAX_ACTIVE_TOKENS_PER_AGENT {
+        return Err(BusError::conflict(format!(
+            "agent '{agent}' already has {active} active tokens; the limit is \
+             {MAX_ACTIVE_TOKENS_PER_AGENT}. Revoke the ones no longer in use first"
         )));
     }
 
@@ -419,10 +503,10 @@ pub async fn issue_token(
     .bind(&prefix)
     .bind(&label)
     .bind(issued_by)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     audit(
-        pool,
+        &mut tx,
         actor,
         "token.issue",
         Some(team_id),
@@ -430,6 +514,7 @@ pub async fn issue_token(
         serde_json::json!({ "agent": agent, "label": label, "prefix": prefix }),
     )
     .await?;
+    tx.commit().await?;
     Ok(IssuedToken {
         id,
         token: raw,
@@ -480,41 +565,54 @@ pub async fn list_tokens(pool: &PgPool, team_id: Uuid) -> BusResult<Vec<TokenRow
 
 /// Revoke an agent token. With `team_id` set, a token outside that team is
 /// reported as not found — a team administrator learns nothing about other
-/// teams' ids. Revoking an already revoked token is a no-op that succeeds.
+/// teams' ids. Revoking an already revoked token is a no-op that succeeds
+/// and logs nothing: the UPDATE is conditional on the token being active, so
+/// two concurrent revocations produce exactly one transition and one row.
 pub async fn revoke_token(
     pool: &PgPool,
     actor: Actor,
     team_id: Option<Uuid>,
     id: Uuid,
 ) -> BusResult<()> {
-    let row: Option<(Uuid, String, String, bool)> = sqlx::query_as(
-        "SELECT a.team_id, a.name, t.prefix, (t.revoked_at IS NOT NULL)
-         FROM api_tokens t JOIN agents a ON a.id = t.agent_id
-         WHERE t.id = $1 AND ($2::uuid IS NULL OR a.team_id = $2)",
+    let mut tx = pool.begin().await?;
+    let revoked: Option<(Uuid, String, String)> = sqlx::query_as(
+        "UPDATE api_tokens t SET revoked_at = now()
+         FROM agents a
+         WHERE t.id = $1 AND t.agent_id = a.id AND t.revoked_at IS NULL
+           AND ($2::uuid IS NULL OR a.team_id = $2)
+         RETURNING a.team_id, a.name, t.prefix",
     )
     .bind(id)
     .bind(team_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    let Some((owner_team, agent, prefix, already)) = row else {
-        return Err(BusError::not_found(format!("no token with id {id}")));
-    };
-    if already {
-        return Ok(());
+    match revoked {
+        Some((owner_team, agent, prefix)) => {
+            audit(
+                &mut tx,
+                actor,
+                "token.revoke",
+                Some(owner_team),
+                Some(id),
+                serde_json::json!({ "agent": agent, "prefix": prefix }),
+            )
+            .await?;
+        }
+        None => {
+            let exists: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id
+                 WHERE t.id = $1 AND ($2::uuid IS NULL OR a.team_id = $2)",
+            )
+            .bind(id)
+            .bind(team_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if exists.is_none() {
+                return Err(BusError::not_found(format!("no token with id {id}")));
+            }
+        }
     }
-    sqlx::query("UPDATE api_tokens SET revoked_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
-    audit(
-        pool,
-        actor,
-        "token.revoke",
-        Some(owner_team),
-        Some(id),
-        serde_json::json!({ "agent": agent, "prefix": prefix }),
-    )
-    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -546,6 +644,7 @@ pub async fn grant_admin(
     let (_, issued_by) = actor.columns();
     let raw = generate_admin_token();
     let prefix = token_prefix(&raw);
+    let mut tx = pool.begin().await?;
     let (id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO admin_tokens (team_id, token_hash, prefix, label, issued_by)
          VALUES ($1, $2, $3, $4, $5) RETURNING id",
@@ -555,10 +654,10 @@ pub async fn grant_admin(
     .bind(&prefix)
     .bind(&label)
     .bind(issued_by)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     audit(
-        pool,
+        &mut tx,
         actor,
         "admin.grant",
         team_id,
@@ -570,6 +669,7 @@ pub async fn grant_admin(
         }),
     )
     .await?;
+    tx.commit().await?;
     Ok(IssuedAdmin {
         id,
         token: raw,
@@ -620,42 +720,53 @@ pub async fn list_admins(pool: &PgPool, team_id: Option<Uuid>) -> BusResult<Vec<
 }
 
 /// Revoke an administrative credential. With `scope` set, a credential that
-/// is global or belongs to another team is reported as not found.
+/// is global or belongs to another team is reported as not found. Same
+/// atomic shape as [`revoke_token`]: one transition, one audit row.
 pub async fn revoke_admin(
     pool: &PgPool,
     actor: Actor,
     scope: Option<Uuid>,
     id: Uuid,
 ) -> BusResult<()> {
-    let row: Option<(Option<Uuid>, String, bool)> = sqlx::query_as(
-        "SELECT team_id, prefix, (revoked_at IS NOT NULL) FROM admin_tokens
-         WHERE id = $1 AND ($2::uuid IS NULL OR team_id = $2)",
+    let mut tx = pool.begin().await?;
+    let revoked: Option<(Option<Uuid>, String)> = sqlx::query_as(
+        "UPDATE admin_tokens SET revoked_at = now()
+         WHERE id = $1 AND revoked_at IS NULL AND ($2::uuid IS NULL OR team_id = $2)
+         RETURNING team_id, prefix",
     )
     .bind(id)
     .bind(scope)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    let Some((team_id, prefix, already)) = row else {
-        return Err(BusError::not_found(format!(
-            "no administrative credential with id {id}"
-        )));
-    };
-    if already {
-        return Ok(());
+    match revoked {
+        Some((team_id, prefix)) => {
+            audit(
+                &mut tx,
+                actor,
+                "admin.revoke",
+                team_id,
+                Some(id),
+                serde_json::json!({ "prefix": prefix }),
+            )
+            .await?;
+        }
+        None => {
+            let exists: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT id FROM admin_tokens
+                 WHERE id = $1 AND ($2::uuid IS NULL OR team_id = $2)",
+            )
+            .bind(id)
+            .bind(scope)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if exists.is_none() {
+                return Err(BusError::not_found(format!(
+                    "no administrative credential with id {id}"
+                )));
+            }
+        }
     }
-    sqlx::query("UPDATE admin_tokens SET revoked_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
-    audit(
-        pool,
-        actor,
-        "admin.revoke",
-        team_id,
-        Some(id),
-        serde_json::json!({ "prefix": prefix }),
-    )
-    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -714,5 +825,6 @@ mod tests {
         );
         assert!(check_label(Some("x".repeat(MAX_LABEL_BYTES + 1))).is_err());
         assert!(check_label(Some("a\nb".into())).is_err());
+        assert!(check_display("team name", Some("Acme\x1b[31m".into())).is_err());
     }
 }

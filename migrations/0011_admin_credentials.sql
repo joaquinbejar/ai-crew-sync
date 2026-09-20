@@ -61,7 +61,7 @@ CREATE TABLE admin_audit (
     -- is revoked, so history survives a rotation.
     actor_admin_id   UUID REFERENCES admin_tokens(id) ON DELETE SET NULL,
     action           TEXT NOT NULL CHECK (action IN (
-                        'team.create', 'agent.create', 'agent.disable',
+                        'team.create', 'agent.create', 'agent.enable', 'agent.disable',
                         'token.issue', 'token.revoke',
                         'admin.grant', 'admin.revoke')),
     -- The team the action concerned; NULL for team-less actions such as

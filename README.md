@@ -176,7 +176,9 @@ Later management: `agent list`, `agent disable`, `token issue`, `token list`,
 
 These commands need `DATABASE_URL`: they run next to Postgres, typically
 inside the bus container. Do this **once** there to mint a global
-administrative credential, so the rest can be done from your own machine:
+administrative credential — the foundation for administering the bus from
+your own machine (the remote API and the `admin` client commands that use it
+land in the follow-up changes, #81 and #82):
 
 ```bash
 ai-crew-sync admin bootstrap --label "joaquin laptop"   # prints acsa_… once

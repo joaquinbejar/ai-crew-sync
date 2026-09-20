@@ -3874,6 +3874,29 @@ async fn administrative_credentials_are_a_separate_class_with_an_audit_trail() {
     store::create_agent(&h.pool, Actor::Cli, team.id, "Backend", None)
         .await
         .unwrap();
+    // A repeat on an active agent is a no-op and logs nothing; a disable and
+    // a re-create are real transitions and log one row each.
+    store::create_agent(
+        &h.pool,
+        Actor::Cli,
+        team.id,
+        "backend",
+        Some("Backend".into()),
+    )
+    .await
+    .unwrap();
+    store::disable_agent(&h.pool, Actor::Cli, team.id, "backend")
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, team.id, "backend", None)
+        .await
+        .unwrap();
+    assert!(
+        store::create_team(&h.pool, Actor::Cli, "evil", Some("Acme\x1b[31m".into()))
+            .await
+            .is_err(),
+        "a team name is display text: no control characters"
+    );
     let issued = store::issue_token(
         &h.pool,
         Actor::Cli,
@@ -4005,6 +4028,8 @@ async fn administrative_credentials_are_a_separate_class_with_an_audit_trail() {
             "admin.grant",
             "team.create",
             "agent.create",
+            "agent.disable",
+            "agent.enable",
             "token.issue",
             "admin.grant",
             "team.create",
@@ -4013,7 +4038,7 @@ async fn administrative_credentials_are_a_separate_class_with_an_audit_trail() {
             "token.revoke",
             "admin.revoke",
         ],
-        "one row per mutation, none for the idempotent repeats"
+        "one row per real transition, none for the idempotent repeats"
     );
     let by_http: Vec<&(String, Option<Uuid>, String, Value)> =
         rows.iter().filter(|r| r.0 == "http").collect();
@@ -4043,6 +4068,52 @@ async fn administrative_credentials_are_a_separate_class_with_an_audit_trail() {
         dump.contains(&issued.prefix),
         "the display prefix is what the log keeps"
     );
+
+    h.shutdown().await;
+}
+
+/// Revocation is one transition however many callers race for it: the
+/// UPDATE is conditional on the row being active, so exactly one caller
+/// performs it and exactly one audit row is written; the others succeed as
+/// no-ops.
+#[tokio::test]
+async fn concurrent_revocations_produce_one_transition_and_one_audit_row() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_admin_revoke_race");
+    let team = store::create_team(&h.pool, Actor::Cli, "acme", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, team.id, "bot", None)
+        .await
+        .unwrap();
+    let issued = store::issue_token(&h.pool, Actor::Cli, team.id, "bot", None)
+        .await
+        .unwrap();
+    let admin = store::grant_admin(&h.pool, Actor::Cli, Some(team.id), None)
+        .await
+        .unwrap();
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let pool = h.pool.clone();
+        let (tid, token_id, admin_id) = (team.id, issued.id, admin.id);
+        tasks.push(tokio::spawn(async move {
+            let a = store::revoke_token(&pool, Actor::Admin(admin_id), Some(tid), token_id).await;
+            let b = store::revoke_admin(&pool, Actor::Admin(admin_id), Some(tid), admin_id).await;
+            (a.is_ok(), b.is_ok())
+        }));
+    }
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), (true, true), "every racer succeeds");
+    }
+    let (revokes,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM admin_audit WHERE action IN ('token.revoke', 'admin.revoke')",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(revokes, 2, "one row per transition, not per caller");
 
     h.shutdown().await;
 }

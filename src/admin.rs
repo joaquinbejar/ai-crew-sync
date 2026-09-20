@@ -188,10 +188,7 @@ pub async fn token_issue(
     };
 
     println!();
-    println!(
-        "Token for {}@{} — shown once, store it now:",
-        issued.agent, issued.team
-    );
+    println!("Token for {agent}@{team} — shown once, store it now:");
     println!();
     println!("  {}", issued.token);
     println!();

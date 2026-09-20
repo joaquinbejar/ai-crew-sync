@@ -181,7 +181,9 @@ Gestión posterior: `agent list`, `agent disable`, `token issue`, `token list`,
 
 Estos comandos necesitan `DATABASE_URL`: se ejecutan junto a Postgres, casi
 siempre dentro del contenedor del bus. Hazlo allí **una sola vez** para emitir
-una credencial administrativa global; el resto puede hacerse desde tu máquina:
+una credencial administrativa global: la base para administrar el bus desde
+tu propia máquina (la API remota y los comandos `admin` que la usan llegan en
+los cambios siguientes, #81 y #82):
 
 ```bash
 ai-crew-sync admin bootstrap --label "portátil de joaquin"   # imprime acsa_… una vez
