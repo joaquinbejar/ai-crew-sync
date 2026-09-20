@@ -1122,15 +1122,32 @@ pub async fn send(
     // two retries of one request_id serialize here instead of racing to the
     // unique index, and the authorization below is re-read while it cannot
     // change underneath.
-    let (archived_now,): (Option<chrono::DateTime<chrono::Utc>>,) =
-        sqlx::query_as("SELECT archived_at FROM conversations WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let (archived_now, paused): (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = sqlx::query_as(
+        "SELECT archived_at, write_paused_at FROM conversations WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
     if archived_now.is_some() {
         return Err(BusError::conflict(
             "this conversation is archived; its history stays readable",
         ));
+    }
+    // A supervised backend move holds this one thread still while it copies
+    // the tail. Read under the same lock the move takes: checked outside the
+    // transaction, a request that passed a moment earlier lands after the
+    // tail was copied and is left behind. Seconds, not minutes, and only
+    // this thread.
+    if let Some(since) = paused {
+        let secs = (chrono::Utc::now() - since).num_seconds().max(0);
+        return Err(BusError::conflict(format!(
+            "this conversation's storage is being moved by an operator and writes are \
+             paused (for {secs}s so far). Reading still works. Try again in a moment; \
+             nothing you have sent was lost."
+        )));
     }
     // Membership as it is *now*. It was checked before this transaction
     // opened, and a removal that committed in between must take effect on
@@ -1230,8 +1247,10 @@ pub async fn send(
     let (message_id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO conversation_messages
             (conversation_id, seq, sender_agent, sender_session, body, reply_to, metadata,
-             request_id, body_sha256)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+             request_id, body_sha256, backend)
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, c.backend
+           FROM conversations c WHERE c.id = $1
+         RETURNING id",
     )
     .bind(id)
     .bind(seq)
@@ -1350,6 +1369,9 @@ struct BodyRow {
     body: String,
     state: String,
     locator: Option<String>,
+    /// Where THIS body is authoritative, which during a supervised move is
+    /// not necessarily where the conversation is.
+    backend: String,
     tombstoned: bool,
     tombstone_reason: Option<String>,
 }
@@ -1361,8 +1383,8 @@ struct BodyRow {
 /// is how you get the right one.
 async fn resolve_body(
     pool: &PgPool,
-    backend: &impl crate::store::backend::MessagingBackend,
-    conv_backend: &str,
+    backends: &crate::store::routing::Backends,
+    team_id: Uuid,
     message_id: Uuid,
     row: BodyRow,
 ) -> BusResult<BodyState> {
@@ -1378,7 +1400,7 @@ async fn resolve_body(
     }
     // Still in the local row: either Postgres is the backend, or the
     // publication has not been confirmed and the temporary copy released.
-    if conv_backend == crate::store::backend::PostgresBackend::NAME || !row.body.is_empty() {
+    if row.backend == crate::store::backend::PostgresBackend::NAME || !row.body.is_empty() {
         return Ok(BodyState::Present(row.body));
     }
     match row.state.as_str() {
@@ -1405,6 +1427,7 @@ async fn resolve_body(
                     ),
                 });
             };
+            let backend = backends.for_message(&row.backend, team_id).await?;
             match backend
                 .fetch(&crate::store::backend::Locator(locator), message_id)
                 .await?
@@ -1435,7 +1458,7 @@ async fn resolve_body(
 /// not policy.
 pub async fn body_of(
     pool: &PgPool,
-    backend: &impl crate::store::backend::MessagingBackend,
+    backends: &crate::store::routing::Backends,
     message_id: Uuid,
 ) -> BusResult<String> {
     let row: Option<(
@@ -1443,10 +1466,11 @@ pub async fn body_of(
         String,
         Option<String>,
         String,
+        Uuid,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<String>,
     )> = sqlx::query_as(
-        "SELECT m.body, m.publication_state, m.canonical_locator, c.backend,
+        "SELECT m.body, m.publication_state, m.canonical_locator, m.backend, c.team_id,
                 m.tombstoned_at, m.tombstone_reason
            FROM conversation_messages m
            JOIN conversations c ON c.id = m.conversation_id
@@ -1455,18 +1479,19 @@ pub async fn body_of(
     .bind(message_id)
     .fetch_optional(pool)
     .await?;
-    let Some((body, state, locator, conv_backend, tombstoned, tombstone_reason)) = row else {
+    let Some((body, state, locator, backend, team_id, tombstoned, tombstone_reason)) = row else {
         return Err(BusError::not_found("no such message"));
     };
     let resolved = resolve_body(
         pool,
-        backend,
-        &conv_backend,
+        backends,
+        team_id,
         message_id,
         BodyRow {
             body,
             state,
             locator,
+            backend,
             tombstoned: tombstoned.is_some(),
             tombstone_reason,
         },
@@ -1530,6 +1555,7 @@ pub async fn read(
         Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<String>,
+        String,
     )> = sqlx::query_as(
         // Messages awaiting publication are returned, not hidden. Hiding
         // them let a reader believe the thread ended there; showing each
@@ -1537,7 +1563,7 @@ pub async fn read(
         // cursor from walking over a gap it never knew about.
         "SELECT m.id, m.seq, ag.name, m.sender_session, m.body, m.reply_to, m.metadata,
                 m.created_at, m.publication_state, m.canonical_locator, m.tombstoned_at,
-                m.tombstone_reason
+                m.tombstone_reason, m.backend
            FROM conversation_messages m
            JOIN agents ag ON ag.id = m.sender_agent
           WHERE m.conversation_id = $1 AND m.seq > $2 AND m.deleted_at IS NULL
@@ -1550,10 +1576,6 @@ pub async fn read(
     .fetch_all(pool)
     .await?;
 
-    // The backend this thread's bodies are on. Resolved once per page, and
-    // on the default installation it is Postgres and costs nothing.
-    let backend = backends.for_conversation(pool, id).await?;
-    let conv_backend = backend.name().to_owned();
     // The membership that may see these bodies is rechecked *here*, after
     // the rows are in hand and immediately before any body is served: an
     // ACL that changed while a publication was in flight takes effect on
@@ -1586,19 +1608,21 @@ pub async fn read(
         locator,
         tombstoned,
         tombstone_reason,
+        message_backend,
     ) in rows
     {
         let my_receipt = mine.remove(&mid);
         let publication = state.clone();
         let resolved = resolve_body(
             pool,
-            &backend,
-            &conv_backend,
+            backends,
+            auth.team_id,
             mid,
             BodyRow {
                 body,
                 state,
                 locator,
+                backend: message_backend,
                 tombstoned: tombstoned.is_some(),
                 tombstone_reason,
             },
@@ -1767,10 +1791,11 @@ pub async fn get_message(
         Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<String>,
+        String,
     )> = sqlx::query_as(
         "SELECT m.conversation_id, m.seq, ag.name, m.sender_session, m.body, m.reply_to,
                     m.metadata, m.created_at, m.publication_state, m.canonical_locator,
-                    m.tombstoned_at, m.tombstone_reason
+                    m.tombstoned_at, m.tombstone_reason, m.backend
                FROM conversation_messages m
                JOIN agents ag ON ag.id = m.sender_agent
               WHERE m.id = $1 AND m.deleted_at IS NULL",
@@ -1791,6 +1816,7 @@ pub async fn get_message(
         locator,
         tombstoned,
         tombstone_reason,
+        message_backend,
     )) = row
     else {
         return Err(BusError::not_found("no such message"));
@@ -1812,18 +1838,18 @@ pub async fn get_message(
         None => None,
     };
     // The body is fetched only after that recheck passed, and from the
-    // backend this thread actually uses.
-    let backend = backends.for_conversation(pool, conversation_id).await?;
+    // backend this message's body is actually on.
     let publication = state.clone();
     let (body, publication, unavailable) = match resolve_body(
         pool,
-        &backend,
-        backend.name(),
+        backends,
+        auth.team_id,
         message_id,
         BodyRow {
             body,
             state,
             locator,
+            backend: message_backend,
             tombstoned: tombstoned.is_some(),
             tombstone_reason,
         },
@@ -2307,17 +2333,19 @@ pub async fn recover_history(
     // Bodies are resolved after the commit, never inside it: the backend
     // may be a broker, and a network round trip does not belong in a
     // transaction that holds session rows.
-    let backend = backends.for_conversation(pool, id).await?;
     let mut messages = Vec::with_capacity(rows.len());
     for (mid, seq, from, from_session, body, reply_to, metadata, created_at) in rows {
+        #[allow(clippy::type_complexity)]
         let state: (
             String,
             Option<String>,
             Option<chrono::DateTime<chrono::Utc>>,
             Option<String>,
+            String,
         ) = sqlx::query_as(
-            "SELECT publication_state, canonical_locator, tombstoned_at, tombstone_reason
-                   FROM conversation_messages WHERE id = $1",
+            "SELECT publication_state, canonical_locator, tombstoned_at, tombstone_reason,
+                    backend
+               FROM conversation_messages WHERE id = $1",
         )
         .bind(mid)
         .fetch_one(pool)
@@ -2325,13 +2353,14 @@ pub async fn recover_history(
         let publication = state.0.clone();
         let (body, publication, unavailable) = match resolve_body(
             pool,
-            &backend,
-            backend.name(),
+            backends,
+            auth.team_id,
             mid,
             BodyRow {
                 body,
                 state: state.0,
                 locator: state.1,
+                backend: state.4,
                 tombstoned: state.2.is_some(),
                 tombstone_reason: state.3,
             },

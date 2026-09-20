@@ -52,25 +52,67 @@ pub struct ServeOptions {
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 600;
 
+#[derive(Clone)]
+struct HealthState {
+    pool: PgPool,
+    backends: crate::store::routing::Backends,
+}
+
+/// Health, aware of what this deployment actually runs.
+///
+/// The database decides the status code, because without it this process
+/// can serve nothing. A broker that is down does **not**: messages are
+/// accepted and queue in the outbox, which is the whole point of having
+/// one. It is reported, with the backlog, so an operator sees it — a probe
+/// that fails the whole service over a full-but-working queue would take
+/// the bus down to fix nothing.
+///
+/// `?broker=check` opens a connection to the broker. Left out of the
+/// default path deliberately: probes run often, and a connection per probe
+/// is a cost with no reader.
 async fn health(
-    State(pool): State<PgPool>,
+    State(state): State<HealthState>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
-    match sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&pool)
+    let db = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await;
+    if let Err(e) = db {
+        tracing::error!(error = %e, "health check failed");
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "status": "degraded", "database": "down" })),
+        );
+    }
+    let mut body = serde_json::json!({ "status": "ok", "database": "up" });
+    if state.backends.jetstream_configured() {
+        body["broker"] = serde_json::json!("configured");
+        if query.get("broker").is_some_and(|v| v == "check") {
+            body["broker"] = match state.backends.broker_reachable().await {
+                Some(true) => serde_json::json!("up"),
+                _ => serde_json::json!("unreachable"),
+            };
+        }
+        // Cheap, and the number an operator actually pages on: a backlog
+        // that stops draining.
+        if let Ok(row) = sqlx::query_as::<_, (i64, i64, Option<i64>)>(
+            "SELECT count(*) FILTER (WHERE state <> 'failed'),
+                    count(*) FILTER (WHERE state = 'failed'),
+                    extract(epoch FROM now() - min(created_at)
+                            FILTER (WHERE state <> 'failed'))::bigint
+               FROM conversation_outbox",
+        )
+        .fetch_one(&state.pool)
         .await
-    {
-        Ok(_) => (
-            axum::http::StatusCode::OK,
-            axum::Json(serde_json::json!({ "status": "ok", "database": "up" })),
-        ),
-        Err(e) => {
-            tracing::error!(error = %e, "health check failed");
-            (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(serde_json::json!({ "status": "degraded", "database": "down" })),
-            )
+        {
+            body["publication"] = serde_json::json!({
+                "pending": row.0,
+                "failed": row.1,
+                "oldest_pending_seconds": row.2,
+            });
         }
     }
+    (axum::http::StatusCode::OK, axum::Json(body))
 }
 
 /// `DefaultBodyLimit` answers with a bare 413. The caller here is a language
@@ -393,8 +435,15 @@ pub fn build_router(pool: PgPool, opts: &ServeOptions, ct: CancellationToken) ->
         .route("/dashboard/login", post(dashboard::login))
         .with_state(dashboard_state);
 
-    Router::new()
+    let health_routes = Router::new()
         .route("/health", get(health))
+        .with_state(HealthState {
+            pool: pool.clone(),
+            backends: backends.clone(),
+        });
+
+    Router::new()
+        .merge(health_routes)
         .merge(dashboard_routes)
         .merge(mcp_routes)
         // Administration is its own surface with its own credential class,

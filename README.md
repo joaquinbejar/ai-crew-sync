@@ -881,11 +881,31 @@ ai-crew-sync serve --nats-url nats://broker:4222 \
                    --nats-credentials /etc/ai-crew-sync/runtime.creds
 ```
 
-**Existing threads are never migrated.** A conversation records the backend
-it was created on and keeps it for life: a thread with half its history in
-each place is the one shape nobody can read. Routing back to Postgres
-affects new conversations only, and is refused while anything is still
-awaiting publication.
+**Routing never migrates anything by itself.** A conversation records the
+backend it was created on, and every message records where *its* body is;
+routing back to Postgres affects new conversations only, and is refused
+while anything is still awaiting publication.
+
+Moving an existing thread is a separate, supervised operation:
+
+```bash
+ai-crew-sync conversations migrate --team acme --to jetstream \
+    --conversation <id> --nats-url nats://broker:4222          # dry run
+```
+
+It copies every body, pauses writes **on that one thread** while it takes
+the tail, reads every body back from the target and compares checksums, and
+only then cuts over — in one transaction. A failure cuts nothing over and
+lifts the pause; an interrupted run resumes without copying twice. Ids,
+authorship, memberships and every observed receipt are untouched, and no
+acknowledgement is ever invented. The rollback is the same command with
+`--to postgres`, and the source bodies stay until you explicitly run
+`conversations cleanup`.
+
+**`docs/operations/jetstream.md`** has the production topology, the
+credentials, the quotas and sizing, the alerts, the restore and node-loss
+drills, and the limits — including the one worth knowing first: a body on
+the broker is not in any Postgres index, so this build does not search it.
 
 A team routed to JetStream on a server started without `--nats-url` does not
 silently fall back — that would split the history. Reads of those threads

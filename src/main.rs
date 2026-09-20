@@ -37,6 +37,10 @@ enum Command {
     /// Manage outgoing webhooks (Slack/Discord/generic).
     #[command(subcommand)]
     Webhook(WebhookCmd),
+    /// Supervised moves of conversation bodies between backends, and the
+    /// cleanup that follows one. Operator commands, next to Postgres.
+    #[command(subcommand)]
+    Conversations(ConversationsCmd),
     /// Administrative credentials: bootstrap the first one next to Postgres,
     /// then administer the bus remotely with it.
     #[command(subcommand)]
@@ -149,6 +153,46 @@ struct ServeArgs {
     #[arg(long, env = "BUS_PUBLICATION_WORKER", default_value_t = true,
           action = clap::ArgAction::Set)]
     publication_worker: bool,
+}
+
+#[derive(Subcommand)]
+enum ConversationsCmd {
+    /// Move a team's conversation bodies to another backend. Reports what
+    /// it would do and changes nothing unless --apply is passed.
+    Migrate {
+        #[arg(long)]
+        team: String,
+        /// Where the bodies should end up.
+        #[arg(long, value_parser = ["jetstream", "postgres"])]
+        to: String,
+        /// Move only these conversations. Repeatable. Omit for the whole
+        /// team, which is rarely what you want on the first run.
+        #[arg(long = "conversation")]
+        conversations: Vec<String>,
+        /// Broker URL. Required for either direction: a move to Postgres
+        /// has to read the bodies off the broker first.
+        #[arg(long, env = "BUS_NATS_URL")]
+        nats_url: String,
+        #[arg(long)]
+        nats_credentials: Option<String>,
+        /// Actually move. Without this the command only reports.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Drop source bodies a completed move no longer needs. Separate and
+    /// explicit on purpose: until this runs, a rollback has something to
+    /// roll back to.
+    Cleanup {
+        #[arg(long)]
+        team: String,
+        /// How long a completed move must have been finished before its
+        /// source bodies may be dropped.
+        #[arg(long, default_value_t = 168)]
+        rollback_window_hours: i64,
+        /// Actually delete. Without this the command only reports.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -769,6 +813,33 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
                 older_than_days,
                 apply,
             } => admin::team_prune(&pool, &team, older_than_days, apply).await?,
+        },
+
+        Command::Conversations(cmd) => match cmd {
+            ConversationsCmd::Migrate {
+                team,
+                to,
+                conversations,
+                nats_url,
+                nats_credentials,
+                apply,
+            } => {
+                admin::conversations_migrate(
+                    &pool,
+                    &team,
+                    &to,
+                    &conversations,
+                    &nats_url,
+                    nats_credentials,
+                    apply,
+                )
+                .await?
+            }
+            ConversationsCmd::Cleanup {
+                team,
+                rollback_window_hours,
+                apply,
+            } => admin::conversations_cleanup(&pool, &team, rollback_window_hours, apply).await?,
         },
 
         Command::Agent(cmd) => match cmd {

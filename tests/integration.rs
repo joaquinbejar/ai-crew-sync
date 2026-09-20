@@ -1663,11 +1663,17 @@ async fn the_digest_cost_does_not_grow_with_channel_count() {
     // runs at 2.0-2.1 here — real growth, 360 rows against 12 — and a query
     // per channel at 4.2-4.3. Three sits between them with room on both
     // sides.
-    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    // The bound has an absolute term as well as a ratio. Two channels can
+    // measure well under a millisecond, and the ratio of two sub-millisecond
+    // durations on a shared CI runner is mostly scheduler noise — which is
+    // how this assertion failed on runs where nothing was wrong. A query per
+    // channel costs tens of milliseconds at sixty channels, so the slack
+    // does not hide the shape it is here to catch.
+    let allowed = small.mul_f64(3.0) + std::time::Duration::from_millis(5);
     assert!(
-        ratio < 3.0,
+        large < allowed,
         "digest over 60 channels took {large:?} against {small:?} over 2 \
-         (ratio {ratio:.2}): the cost is scaling with channel count"
+         (allowed {allowed:?}): the cost is scaling with channel count"
     );
 
     let _ = client.cancel().await;
@@ -7751,6 +7757,10 @@ async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
     let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
     JetStreamBackend::provision(&config, team).await.unwrap();
     let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    // The same view of the backends the server has, for the reads this test
+    // makes directly against the store.
+    let backends =
+        ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone());
 
     let owner = connect_with_session(&h.base, &token, "impl").await;
     let dani = connect_with_session(&h.base, &dani_token, "review").await;
@@ -7889,7 +7899,7 @@ async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
             .unwrap();
     assert!(local.is_empty(), "the body is the broker's now");
     assert_eq!(
-        convo_store::body_of(&h.pool, &backend, mid).await.unwrap(),
+        convo_store::body_of(&h.pool, &backends, mid).await.unwrap(),
         "through the broker"
     );
 
@@ -7999,7 +8009,7 @@ async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
     // A body the backend no longer holds is an explained absence, and the
     // message keeps its place, its recipients and its receipts.
     outbox::tombstone(&h.pool, mid, "retention").await.unwrap();
-    let err = convo_store::body_of(&h.pool, &backend, mid)
+    let err = convo_store::body_of(&h.pool, &backends, mid)
         .await
         .unwrap_err()
         .to_string();
@@ -8029,7 +8039,6 @@ async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
     );
 
     // The Postgres thread is untouched by any of this.
-    let plain = ai_crew_sync::store::backend::PostgresBackend::new(h.pool.clone());
     let legacy_sent = call(
         &before,
         "send_conversation_message",
@@ -8041,7 +8050,7 @@ async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
     assert_eq!(
         convo_store::body_of(
             &h.pool,
-            &plain,
+            &backends,
             legacy_sent["message_id"].as_str().unwrap().parse().unwrap()
         )
         .await
@@ -8450,6 +8459,312 @@ async fn each_recipient_holds_its_own_durable_inbox() {
         dani_agent,
         impostor,
     ] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Phase 7: a supervised move, a rollback, and an interrupted run that
+/// resumes. Bodies, ids, authorship, access and every observed receipt come
+/// through unchanged, and nothing is cut over until every body has been read
+/// back from the target and matched.
+#[tokio::test]
+async fn a_conversation_moves_between_backends_and_back_without_losing_anything() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::migrate::{self, Direction};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db_broker!("t_conversation_migration");
+    let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    JetStreamBackend::provision_inbox(&config, team)
+        .await
+        .unwrap();
+    let jetstream = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    // A thread that lives entirely in Postgres, with real receipts on it.
+    let owner = connect_with_session(&h.base, &owner_token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "moved thread", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let cuuid: Uuid = cid.parse().unwrap();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    let mut sent = Vec::new();
+    for body in ["the first one", "the second one", "the third one"] {
+        sent.push(
+            call(
+                &owner,
+                "send_conversation_message",
+                json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+            )
+            .await,
+        );
+    }
+    call(
+        &dani,
+        "ack_message",
+        json!({"message_id": sent[1]["message_id"], "resolved": true, "note": "done"}),
+    )
+    .await;
+    let before = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let receipts_before = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent[1]["message_id"]}),
+    )
+    .await;
+
+    // A plan changes nothing and says what it would cost.
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].messages, 3);
+    assert_eq!(plans[0].current_backend, "postgres");
+    assert!(plans[0].blocked.is_none());
+    assert!(plans[0].bytes > 0);
+    let unchanged = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(
+        unchanged["messages"], before["messages"],
+        "a plan is a read"
+    );
+
+    // The move itself.
+    let outcome = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToJetStream)
+        .await
+        .unwrap();
+    assert_eq!(outcome.copied, 3);
+    assert_eq!(outcome.state, "cut_over");
+
+    // Writes are open again, and the thread reads exactly as it did — same
+    // ids, same order, same bodies, same authors.
+    let after = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(
+        after["messages"], before["messages"],
+        "the thread is the thread"
+    );
+    let receipts_after = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent[1]["message_id"]}),
+    )
+    .await;
+    assert_eq!(
+        receipts_after, receipts_before,
+        "a move observes nothing and invents nothing"
+    );
+    let (backend, locators): (String, i64) = sqlx::query_as(
+        "SELECT (SELECT backend FROM conversations WHERE id = $1),
+                count(*) FILTER (WHERE canonical_locator IS NOT NULL)
+           FROM conversation_messages WHERE conversation_id = $1",
+    )
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!((backend.as_str(), locators), ("jetstream", 3));
+
+    // The source bodies are still there: until cleanup runs, a rollback has
+    // something to roll back to.
+    let (still_local,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM conversation_messages WHERE conversation_id = $1 AND body <> ''",
+    )
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(still_local, 3);
+    let (would_drop, _bytes) = migrate::cleanup(&h.pool, team, 168, false).await.unwrap();
+    assert_eq!(
+        would_drop, 0,
+        "nothing is dropped inside the rollback window"
+    );
+    assert!(
+        migrate::cleanup(&h.pool, team, -1, false).await.is_err(),
+        "a negative window would point into the future"
+    );
+
+    // And the ordinary publication sweep leaves them alone. It releases
+    // bodies the outbox staged; a migration source copy is the rollback,
+    // and only `conversations cleanup` may drop it.
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, None, 0)
+            .await
+            .unwrap(),
+        0,
+        "the five minute sweep must not eat the rollback source"
+    );
+    let (still_local,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM conversation_messages WHERE conversation_id = $1 AND body <> ''",
+    )
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(still_local, 3);
+
+    // An interrupted run resumes through the same command. The process
+    // died holding the pause, and the plan says so instead of skipping the
+    // thread and reporting success.
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'copying')",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert!(plans[0].blocked.is_none(), "{:?}", plans[0].blocked);
+    assert!(plans[0].resuming, "an open run is resumed, not refused");
+    let resumed = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToJetStream)
+        .await
+        .unwrap();
+    assert_eq!(resumed.state, "cut_over");
+    let (paused,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT write_paused_at FROM conversations WHERE id = $1")
+            .bind(cuuid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(paused.is_none(), "resuming finishes and reopens the thread");
+
+    // New messages go where the thread now lives, and are published like
+    // any other: acceptance is not storage.
+    let fresh = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "written after the move",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(fresh["stored"], false);
+    assert_eq!(
+        outbox::run_once(&h.pool, &jetstream, "worker")
+            .await
+            .unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+
+    // An interrupted run resumes instead of copying twice. Half the
+    // evidence is thrown away and the same move is run again.
+    outbox::release_published_bodies(&h.pool, Some(cuuid), 0)
+        .await
+        .unwrap();
+    let back = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToPostgres)
+        .await
+        .unwrap();
+    assert_eq!(back.copied, 4, "every body came back off the broker");
+    let (backend,): (String,) = sqlx::query_as("SELECT backend FROM conversations WHERE id = $1")
+        .bind(cuuid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(backend, "postgres");
+    let rolled = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let bodies: Vec<&str> = rolled["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        [
+            "the first one",
+            "the second one",
+            "the third one",
+            "written after the move"
+        ],
+        "a rollback is a copy back, and it keeps what was written meanwhile"
+    );
+    let receipts_rolled = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent[1]["message_id"]}),
+    )
+    .await;
+    assert_eq!(
+        receipts_rolled, receipts_before,
+        "receipts survive both ways"
+    );
+
+    // A second move, interrupted after two messages and resumed: the run
+    // picks up its own evidence rather than starting over.
+    let migration = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToJetStream)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE conversation_migrations SET state = 'copying', finished_at = NULL WHERE id = $1",
+    )
+    .bind(migration.migration_id)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM conversation_migration_items
+          WHERE migration_id = $1 AND message_id IN (
+              SELECT id FROM conversation_messages WHERE conversation_id = $2
+               ORDER BY seq LIMIT 2)",
+    )
+    .bind(migration.migration_id)
+    .bind(cuuid)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE conversation_messages SET backend = 'postgres'
+          WHERE conversation_id = $1 AND seq <= 2",
+    )
+    .bind(cuuid)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let resumed = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToJetStream)
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.migration_id, migration.migration_id,
+        "the same run continued"
+    );
+    assert_eq!(resumed.copied, 2, "only what was missing was copied again");
+    assert_eq!(resumed.skipped, 2, "what was verified was left alone");
+    let final_read = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(
+        final_read["messages"].as_array().unwrap().len(),
+        4,
+        "one logical message each, however many times they were copied"
+    );
+
+    // Writes are never left paused, whichever way it went.
+    let (paused,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT write_paused_at FROM conversations WHERE id = $1")
+            .bind(cuuid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(paused.is_none());
+
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    for c in [owner, dani] {
         let _ = c.cancel().await;
     }
     h.shutdown().await;

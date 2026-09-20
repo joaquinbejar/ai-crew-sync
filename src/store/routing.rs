@@ -165,6 +165,16 @@ impl Backends {
         self.named(&name, team_id).await
     }
 
+    /// Where one message's body is authoritative.
+    ///
+    /// Per message, not per conversation: during a supervised move, and
+    /// after a rollback that had to leave a tombstoned body behind, a
+    /// thread's bodies are not all in the same place. The message row says
+    /// where each one is, and that is what a read follows.
+    pub async fn for_message(&self, backend: &str, team_id: Uuid) -> BusResult<AnyBackend> {
+        self.named(backend, team_id).await
+    }
+
     /// Where a team's new conversations will be created.
     pub async fn for_team(&self, pool: &PgPool, team_id: Uuid) -> BusResult<AnyBackend> {
         let (name,): (String,) = sqlx::query_as("SELECT default_backend FROM teams WHERE id = $1")
@@ -174,13 +184,28 @@ impl Backends {
         self.named(&name, team_id).await
     }
 
+    /// Whether the broker answers. `None` when none is configured, which
+    /// is not a fault: it is the default installation.
+    pub async fn broker_reachable(&self) -> Option<bool> {
+        let config = self.nats.as_ref()?;
+        Some(JetStreamBackend::reachable(config).await)
+    }
+
     /// Every team whose conversations are routed off Postgres. The worker
     /// reconciles these on startup; nobody else has anything to reconcile.
     pub async fn routed_teams(&self, pool: &PgPool) -> BusResult<Vec<Uuid>> {
-        let rows: Vec<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM teams WHERE default_backend <> 'postgres'")
-                .fetch_all(pool)
-                .await?;
+        // Not only the teams whose *default* is a broker. A team routed
+        // back to Postgres still has threads whose bodies are on the
+        // broker; skipping it would stop publishing their inbox references
+        // and stop reconciling their uncertain publications.
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM teams t
+              WHERE t.default_backend <> 'postgres'
+                 OR EXISTS (SELECT 1 FROM conversations c
+                             WHERE c.team_id = t.id AND c.backend <> 'postgres')",
+        )
+        .fetch_all(pool)
+        .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 }
