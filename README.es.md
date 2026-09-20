@@ -119,7 +119,7 @@ una release lo publique.
 ## Arranque rápido (docker-compose)
 
 ```bash
-make up      # = docker compose -f Docker/docker-compose.yml up -d (imagen de GHCR)
+make up      # = docker compose -f Docker/docker-compose.yml up -d --no-build (imagen de GHCR)
 ```
 
 Todas las variables tienen default razonable; se sobrescriben por entorno o
@@ -149,8 +149,9 @@ El servidor migra la base de datos al arrancar y expone:
 
 ### Desplegar en producción
 
-El compose base trae un default que funciona para todo, para que `make up`
-arranque en un portátil. Producción usa un overlay que **no** tiene defaults:
+Hay un único fichero compose, y trae un default que funciona para todo, para
+que `make up` arranque en un portátil. Lo que protege producción es el
+preflight que `make deploy` ejecuta antes de tocar el clúster:
 
 ```bash
 export POSTGRES_PASSWORD=…        # no el valor de ejemplo
@@ -160,9 +161,14 @@ export BUS_DASHBOARD_SECRET=…     # compartido, para que la sesión valga en c
 make deploy                       # preflight y después docker stack deploy
 ```
 
-`make deploy` se niega antes de tocar el clúster si falta alguno, si sigue la
-contraseña de ejemplo o si el tag es móvil — y el propio compose ni siquiera
-renderiza el overlay sin ellos. `make deploy-check` ejecuta solo el preflight.
+`make deploy` se niega si falta alguno, si sigue la contraseña de ejemplo o
+si el tag es móvil. `make deploy-check` ejecuta solo el preflight.
+
+Detrás de un proxy Traefik v3 (`--providers.swarm`) que ya termina TLS, pon
+`TRAEFIK_ENABLE=true` y `BUS_PUBLIC_HOST=crew.tu-empresa.com` (más
+`TRAEFIK_NETWORK`/`TRAEFIK_ENTRYPOINT`/`TRAEFIK_CERTRESOLVER` si difieren de
+`edge`/`websecure`/`le`): el bus lleva las labels del router y se une a la red
+del proxy, que el stack del proxy debe haber creado como overlay attachable.
 
 ## Dar de alta al equipo
 
@@ -380,6 +386,59 @@ un repositorio clonado no puede enviar tu token a ningún sitio. Dos ventanas en
 el mismo repositorio eligen perfil de forma independiente (`--profile`) sin
 compartir nada mutable. Las escrituras al almacén de perfiles se serializan
 con un lock y aterrizan de forma atómica con permisos `0600`.
+
+### Una sesión por conversación: el proxy stdio
+
+Las sesiones separan ventanas, pero una cabecera escrita una vez en la
+configuración del cliente es la misma en todas sus ventanas.
+`ai-crew-sync mcp proxy` es un servidor MCP local que el cliente arranca **una
+vez por conversación** (la norma para servidores stdio), así que el proceso es
+la unidad de aislamiento: acuña la sesión, la manda en cada llamada reenviada
+y guarda el proyecto y el rol de esa ventana. Funciona con cualquier cliente
+MCP; lo que ofrezca un host concreto se aprovecha, nunca se exige.
+
+```json
+{
+  "mcpServers": {
+    "ai-crew-sync": {
+      "command": "ai-crew-sync",
+      "args": ["mcp", "proxy", "--role", "implementation"]
+    }
+  }
+}
+```
+
+Sin token ni URL en la configuración del cliente: las credenciales salen de tu
+perfil local y del `.acs.toml` del proyecto (más arriba). Aparecen todos los
+tools remotos y dos que nunca llegan al bus:
+
+- `session_status` — agente y equipo verificados, id de sesión, **dirección**
+  (`agente/sesión`), proyecto, rol y canal. Nunca credenciales.
+- `configure_session({role?, project?, channel?, profile?})` — solo esta
+  ventana. Rol y proyecto son metadatos: el id de sesión, los cursores, los
+  claims y los locks no se tocan. `profile` cambia a otra credencial aprobada
+  localmente **del mismo equipo**, verificada con `whoami` antes de cambiar
+  nada; si la verificación falla el contexto anterior sigue intacto, las
+  llamadas en vuelo de la identidad anterior se cancelan en vez de
+  reintentarse, y lo que esa identidad aún sostiene (claims, locks) se informa,
+  nunca se transfiere. Otro equipo exige una conversación nueva: cambiar de
+  credencial no puede borrar lo que esta conversación ya ha visto.
+
+**Identidad de la conversación**, por orden: `--host-session` /
+`BUS_HOST_SESSION` (cualquier host que pueda fijar una variable por ventana),
+`CLAUDE_CODE_SESSION_ID` (Claude Code la exporta a los procesos MCP), el
+`_meta.threadId` que Codex adjunta a cada llamada, y si no el propio proceso.
+Con un id de conversación la etiqueta de sesión es **estable**: una
+conversación reanudada vuelve a la misma sesión y una bifurcada recibe otra;
+sin él, la sesión dura lo que el proceso. Si dos conversaciones llegaran a
+compartir un proceso, el proxy rechaza la segunda en vez de mezclarlas.
+
+El contexto de arranque viaja en el campo `instructions` del `initialize`, que
+todo cliente MCP entrega al modelo: no hacen falta hooks. La presencia la
+mantiene el propio proxy: heartbeat al conectar con repo y rama del directorio
+del proyecto, keep-alive cada cinco minutos e `idle` al salir. Nada se empuja
+a un turno inactivo: los mensajes entrantes se leen con `read_messages` o se
+esperan con `wait_for_updates`, igual que con una conexión directa.
 
 ### Sesiones: una persona, varios repos
 
@@ -824,7 +883,7 @@ El despachador corre dentro de `serve`; no hay nada más que desplegar.
 ## Desarrollo
 
 ```bash
-make check    # gate pre-push: rustfmt, clippy -D warnings, compose renderiza
+make check    # gate pre-push: rustfmt, clippy -D warnings, el compose renderiza
 make test     # suite E2E contra un Postgres 18 desechable (necesita docker)
 make up-dev   # stack local construido desde este checkout
 make help     # todo lo demás
@@ -883,7 +942,7 @@ plugin/          plugin de Claude Code (MCP + hooks + comandos + skill)
   scripts/       bus-call.sh, heartbeat.sh, session-start.sh (curl + python3)
   commands/      /ai-crew-sync:standup|catchup|announce|ask
   skills/        convenciones de coordinación
-Docker/          Dockerfile + compose (imagen publicada, apto Swarm) + override dev
+Docker/          Dockerfile + el único compose (imagen publicada, build local, apto Swarm)
 Makefile         check / test / up / up-dev / deploy — `make help` lista todo
 .claude-plugin/marketplace.json   este repo funciona como marketplace
 ```

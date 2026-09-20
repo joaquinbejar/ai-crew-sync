@@ -1,4 +1,4 @@
-use ai_crew_sync::{MIGRATOR, admin, admin_cli, client, context, serve, webhooks};
+use ai_crew_sync::{MIGRATOR, admin, admin_cli, client, context, proxy, serve, webhooks};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
@@ -45,6 +45,9 @@ enum Command {
     /// defaults (.acs.toml), so clients need no BUS_TOKEN export.
     #[command(subcommand)]
     Context(ContextCmd),
+    /// Local MCP transports.
+    #[command(subcommand)]
+    Mcp(McpCmd),
     /// Talk to a running bus from the console, as an agent. Everything the MCP
     /// tools can do: send/read messages, claim tasks, notes, presence.
     Client(client::ClientArgs),
@@ -240,6 +243,33 @@ enum AdminCmd {
     /// Agent tokens of a team.
     #[command(subcommand)]
     Token(AdminTokenCmd),
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Serve MCP over stdio for ONE conversation, forwarding every tool to
+    /// the bus as one agent in one session. Start it from your MCP client's
+    /// config (command: ai-crew-sync, args: [mcp, proxy]); credentials come
+    /// from local profiles, never from the client config.
+    Proxy {
+        #[command(flatten)]
+        select: ContextSelect,
+        /// Initial project label (defaults to the project's .acs.toml).
+        #[arg(long)]
+        project: Option<String>,
+        /// Initial role label: implementation, design, review, …
+        #[arg(long)]
+        role: Option<String>,
+        /// Initial default channel (defaults to the project's .acs.toml).
+        #[arg(long)]
+        channel: Option<String>,
+        /// Conversation id this process serves, for hosts that can set one
+        /// per window. Derives a stable session: the same id reconnects to
+        /// the same session. Otherwise CLAUDE_CODE_SESSION_ID or the request
+        /// metadata is used, else this process is the conversation.
+        #[arg(long, env = "BUS_HOST_SESSION")]
+        host_session: Option<String>,
+    },
 }
 
 /// Selection flags shared by the `context` commands: the same inputs the
@@ -470,14 +500,20 @@ fn split_csv(s: &str) -> Vec<String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ai_crew_sync=info,tower_http=info,warn".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // The stdio proxy owns stdout for MCP framing; its logs go to stderr.
+    // Everything else keeps logging to stdout as before.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "ai_crew_sync=info,tower_http=info,warn".into());
+    if matches!(cli.command, Command::Mcp(_)) {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     // Commands that talk to the bus over HTTP (or to nothing at all) do not
     // need a database connection.
@@ -493,6 +529,25 @@ async fn main() -> anyhow::Result<()> {
         Command::Client(args) => return client::run(args).await,
         Command::Admin(cmd) if !admin_needs_database(&cmd) => return run_admin_remote(cmd).await,
         Command::Context(cmd) => return run_context(cmd).await,
+        Command::Mcp(McpCmd::Proxy {
+            select,
+            project,
+            role,
+            channel,
+            host_session,
+        }) => {
+            let inputs = select.inputs()?;
+            let state_dir = inputs.config_dir.clone();
+            return proxy::run(proxy::ProxyOptions {
+                inputs,
+                project,
+                role,
+                channel,
+                host_session,
+                state_dir,
+            })
+            .await;
+        }
         _ => {}
     }
 
@@ -518,7 +573,7 @@ async fn main() -> anyhow::Result<()> {
 async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
     match command {
         // `main` routes these before opening a pool; they cannot arrive here.
-        Command::McpConfig { .. } | Command::Client(_) | Command::Context(_) => {
+        Command::McpConfig { .. } | Command::Client(_) | Command::Context(_) | Command::Mcp(_) => {
             unreachable!("handled in main")
         }
 
