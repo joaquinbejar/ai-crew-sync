@@ -11,6 +11,13 @@ use uuid::Uuid;
 
 pub const TOKEN_PREFIX: &str = "acs_";
 
+/// Prefix of an administrative credential. Deliberately not an extension of
+/// [`TOKEN_PREFIX`]: `acsa_` does not start with `acs_`, so an administrative
+/// credential presented to `/mcp` fails the prefix check before any lookup,
+/// and an agent token presented to `/admin` does the same. The two classes
+/// live in different tables and never resolve as each other.
+pub const ADMIN_TOKEN_PREFIX: &str = "acsa_";
+
 /// Header carrying the working context of the caller — in practice one per
 /// repository. Set once in an MCP client's configuration, it then rides on
 /// every request, which is the only option available: the transport is
@@ -114,6 +121,14 @@ pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     format!("{TOKEN_PREFIX}{}", hex::encode(bytes))
+}
+
+/// Generate a fresh administrative credential. Same entropy and hashing as
+/// an agent token; only the prefix differs.
+pub fn generate_admin_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    format!("{ADMIN_TOKEN_PREFIX}{}", hex::encode(bytes))
 }
 
 pub fn hash_token(raw: &str) -> Vec<u8> {

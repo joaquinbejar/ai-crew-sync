@@ -3835,3 +3835,285 @@ async fn a_stringified_metadata_object_is_stored_as_an_object() {
     }
     h.shutdown().await;
 }
+
+// -------------------------------------------------- administrative credentials --
+
+/// The operator CLI path (bootstrap, agent add, token issue) through the store,
+/// exactly as `ai-crew-sync admin bootstrap` / `agent add` / `token issue` run
+/// it: credentials resolve, revocation is immediate, the two credential
+/// classes never resolve as each other, and the audit trail carries no secret.
+#[tokio::test]
+async fn administrative_credentials_are_a_separate_class_with_an_audit_trail() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_admin_store");
+
+    // Bootstrap: a global credential minted with no prior credential.
+    let global = store::grant_admin(&h.pool, Actor::Cli, None, Some("laptop".into()))
+        .await
+        .unwrap();
+    assert!(global.token.starts_with("acsa_"), "admin prefix");
+    assert!(global.team.is_none(), "bootstrap mints a global credential");
+    let ctx = store::resolve_admin(&h.pool, &global.token)
+        .await
+        .unwrap()
+        .expect("fresh credential resolves");
+    assert!(ctx.is_global());
+    assert_eq!(ctx.id, global.id);
+
+    // The existing operator commands keep working and mint tokens that
+    // authenticate on /mcp as exactly the requested agent and team.
+    let team = store::create_team(&h.pool, Actor::Cli, "acme", Some("Acme".into()))
+        .await
+        .unwrap();
+    let again = store::create_team(&h.pool, Actor::Cli, "ACME", None)
+        .await
+        .unwrap();
+    assert_eq!(again.id, team.id, "create is idempotent on the slug");
+    assert_eq!(again.name, "Acme", "a repeat never renames");
+    store::create_agent(&h.pool, Actor::Cli, team.id, "Backend", None)
+        .await
+        .unwrap();
+    // A repeat on an active agent is a no-op and logs nothing; a disable and
+    // a re-create are real transitions and log one row each.
+    store::create_agent(
+        &h.pool,
+        Actor::Cli,
+        team.id,
+        "backend",
+        Some("Backend".into()),
+    )
+    .await
+    .unwrap();
+    store::disable_agent(&h.pool, Actor::Cli, team.id, "backend")
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, team.id, "backend", None)
+        .await
+        .unwrap();
+    assert!(
+        store::create_team(&h.pool, Actor::Cli, "evil", Some("Acme\x1b[31m".into()))
+            .await
+            .is_err(),
+        "a team name is display text: no control characters"
+    );
+    let issued = store::issue_token(
+        &h.pool,
+        Actor::Cli,
+        team.id,
+        "backend",
+        Some("sesion backend".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (issued.agent.as_str(), issued.team.as_str()),
+        ("backend", "acme")
+    );
+    let client = connect(&h.base, &issued.token).await;
+    let me = call(&client, "whoami", json!({})).await;
+    assert_eq!(me["agent"], "backend");
+    assert_eq!(me["team"], "acme");
+    let _ = client.cancel().await;
+
+    // A team credential lists only its team; the global listing sees both.
+    let team_admin = store::grant_admin(&h.pool, Actor::Admin(global.id), Some(team.id), None)
+        .await
+        .unwrap();
+    assert_eq!(team_admin.team.as_deref(), Some("acme"));
+    let mine = store::list_admins(&h.pool, Some(team.id)).await.unwrap();
+    assert_eq!(
+        mine.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![team_admin.id]
+    );
+    assert_eq!(store::list_admins(&h.pool, None).await.unwrap().len(), 2);
+
+    // Neither class resolves as the other: same hashing, different tables.
+    assert!(
+        store::resolve_admin(&h.pool, &issued.token)
+            .await
+            .unwrap()
+            .is_none(),
+        "an agent token is not an administrative credential"
+    );
+    assert!(
+        ai_crew_sync::auth::resolve_token(&h.pool, &global.token)
+            .await
+            .is_err(),
+        "an administrative credential is not an agent token"
+    );
+
+    // Scoped revocation: a team scope cannot reach a global credential or a
+    // token from another team, and reports them as not found.
+    let other = store::create_team(&h.pool, Actor::Cli, "other", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, other.id, "x", None)
+        .await
+        .unwrap();
+    let foreign = store::issue_token(&h.pool, Actor::Cli, other.id, "x", None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store::revoke_token(
+            &h.pool,
+            Actor::Admin(team_admin.id),
+            Some(team.id),
+            foreign.id
+        )
+        .await,
+        Err(ai_crew_sync::error::BusError::NotFound(_))
+    ));
+    assert!(matches!(
+        store::revoke_admin(
+            &h.pool,
+            Actor::Admin(team_admin.id),
+            Some(team.id),
+            global.id
+        )
+        .await,
+        Err(ai_crew_sync::error::BusError::NotFound(_))
+    ));
+    assert!(
+        store::resolve_admin(&h.pool, &global.token)
+            .await
+            .unwrap()
+            .is_some(),
+        "a failed scoped revoke changes nothing"
+    );
+
+    // Revocation is immediate for both classes, and idempotent.
+    store::revoke_token(
+        &h.pool,
+        Actor::Admin(team_admin.id),
+        Some(team.id),
+        issued.id,
+    )
+    .await
+    .unwrap();
+    store::revoke_token(
+        &h.pool,
+        Actor::Admin(team_admin.id),
+        Some(team.id),
+        issued.id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        ai_crew_sync::auth::resolve_token(&h.pool, &issued.token)
+            .await
+            .is_err()
+    );
+    store::revoke_admin(&h.pool, Actor::Cli, None, global.id)
+        .await
+        .unwrap();
+    assert!(
+        store::resolve_admin(&h.pool, &global.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Audit: every mutation logged with its actor, and no secret anywhere.
+    let rows: Vec<(String, Option<Uuid>, String, Value)> = sqlx::query_as(
+        "SELECT actor_source, actor_admin_id, action, detail FROM admin_audit ORDER BY id",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    let actions: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec![
+            "admin.grant",
+            "team.create",
+            "agent.create",
+            "agent.disable",
+            "agent.enable",
+            "token.issue",
+            "admin.grant",
+            "team.create",
+            "agent.create",
+            "token.issue",
+            "token.revoke",
+            "admin.revoke",
+        ],
+        "one row per real transition, none for the idempotent repeats"
+    );
+    let by_http: Vec<&(String, Option<Uuid>, String, Value)> =
+        rows.iter().filter(|r| r.0 == "http").collect();
+    assert_eq!(by_http.len(), 2, "the two actions taken with a credential");
+    assert!(
+        by_http.iter().all(|r| r.1.is_some()),
+        "http rows name their credential"
+    );
+    assert!(rows.iter().filter(|r| r.0 == "cli").all(|r| r.1.is_none()));
+    let dump = serde_json::to_string(&rows.iter().map(|r| &r.3).collect::<Vec<_>>()).unwrap();
+    for secret in [
+        &global.token,
+        &team_admin.token,
+        &issued.token,
+        &foreign.token,
+    ] {
+        assert!(
+            !dump.contains(secret.as_str()),
+            "audit detail carries a secret"
+        );
+        assert!(
+            !dump.contains(&secret[5..]),
+            "audit detail carries a secret's body"
+        );
+    }
+    assert!(
+        dump.contains(&issued.prefix),
+        "the display prefix is what the log keeps"
+    );
+
+    h.shutdown().await;
+}
+
+/// Revocation is one transition however many callers race for it: the
+/// UPDATE is conditional on the row being active, so exactly one caller
+/// performs it and exactly one audit row is written; the others succeed as
+/// no-ops.
+#[tokio::test]
+async fn concurrent_revocations_produce_one_transition_and_one_audit_row() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_admin_revoke_race");
+    let team = store::create_team(&h.pool, Actor::Cli, "acme", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, team.id, "bot", None)
+        .await
+        .unwrap();
+    let issued = store::issue_token(&h.pool, Actor::Cli, team.id, "bot", None)
+        .await
+        .unwrap();
+    let admin = store::grant_admin(&h.pool, Actor::Cli, Some(team.id), None)
+        .await
+        .unwrap();
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let pool = h.pool.clone();
+        let (tid, token_id, admin_id) = (team.id, issued.id, admin.id);
+        tasks.push(tokio::spawn(async move {
+            let a = store::revoke_token(&pool, Actor::Admin(admin_id), Some(tid), token_id).await;
+            let b = store::revoke_admin(&pool, Actor::Admin(admin_id), Some(tid), admin_id).await;
+            (a.is_ok(), b.is_ok())
+        }));
+    }
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), (true, true), "every racer succeeds");
+    }
+    let (revokes,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM admin_audit WHERE action IN ('token.revoke', 'admin.revoke')",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(revokes, 2, "one row per transition, not per caller");
+
+    h.shutdown().await;
+}
