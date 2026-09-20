@@ -7057,6 +7057,36 @@ async fn a_private_thread_answers_only_to_the_windows_that_are_in_it() {
     .await;
     assert_eq!(read["messages"][0]["body"], "the private body");
 
+    // Inviting an already active member again does not unbind the seat.
+    // The state is preserved, so the binding must be too, or a repeated
+    // invitation would quietly hand the label back to the parent token.
+    call(
+        &owner,
+        "invite_to_conversation",
+        json!({"conversation_id": cid, "address": "dani/review"}),
+    )
+    .await;
+    let err = call_expect_error(
+        &impostor,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(
+        err.contains("no such conversation"),
+        "a repeated invitation must not downgrade a protected seat: {err}"
+    );
+    let read = call(
+        &window,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert_eq!(
+        read["messages"][0]["body"], "the private body",
+        "and the window still reads it"
+    );
+
     // Private and project are exclusive, and asking for both is refused
     // rather than quietly resolved one way.
     call(&owner, "create_project", json!({"project": "market-data"})).await;
@@ -7139,6 +7169,26 @@ async fn a_private_thread_answers_only_to_the_windows_that_are_in_it() {
     )
     .await;
     assert_eq!(receipts["acknowledged"], 1);
+
+    // Revoking the window does not hand its label back. Revocation is a way
+    // out, not a way in: the parent token is still refused afterwards, and
+    // the audited recovery path is what an agent has instead.
+    call(&window, "revoke_session", json!({})).await;
+    let err = call_expect_error(
+        &impostor,
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("no such conversation"), "{err}");
+    let err = call_expect_error(
+        &impostor,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("registered window"), "{err}");
+    assert!(err.contains("does not hand the label back"), "{err}");
 
     for c in [owner, window, agent, impostor, marta] {
         let _ = c.cancel().await;
@@ -8272,6 +8322,20 @@ async fn each_recipient_holds_its_own_durable_inbox() {
         "acknowledged and resolved are two observations, not one coalesced row"
     );
 
+    // And revoking the window does not open its inbox either. The label was
+    // registered once, which is enough: revocation must not turn a
+    // protected window into a legacy identity.
+    call(&review, "revoke_session", json!({})).await;
+    let err = call_expect_error(&impostor, "fetch_conversation_inbox", json!({})).await;
+    assert!(err.contains("does not hand the label back"), "{err}");
+    let err = call_expect_error(
+        &impostor,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [first["references"][0]["delivery_id"]]}),
+    )
+    .await;
+    assert!(err.contains("registered window"), "{err}");
+
     // A process that takes a reference and dies before confirming: the
     // reference is not lost and no receipt is invented. A second fetch does
     // not hand it over twice while the first hand-out is still in flight,
@@ -8764,6 +8828,152 @@ async fn a_conversation_moves_between_backends_and_back_without_losing_anything(
     assert!(paused.is_none());
 
     JetStreamBackend::deprovision(&config, team).await.unwrap();
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The worker path's last attempt. A backend that keeps the body and never
+/// confirms it must not end as `failed`: "we did not hear back" and "it is
+/// not there" are different facts, and only one of them is a gap.
+#[tokio::test]
+async fn a_lost_confirmation_is_not_a_failure_when_the_backend_kept_it() {
+    use ai_crew_sync::store::backend::{Faults, MessagingBackend, PostgresBackend};
+    use ai_crew_sync::store::outbox::{self, Settled};
+
+    let h = require_db!("t_lost_confirmations");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "kept but unconfirmed", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    let cuuid: Uuid = cid.parse().unwrap();
+    outbox::set_publication(&h.pool, cuuid, true).await.unwrap();
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "written, never acknowledged",
+               "request_id": request_id()}),
+    )
+    .await;
+    let mid: Uuid = sent["message_id"].as_str().unwrap().parse().unwrap();
+
+    // Every attempt writes the body and reports that it did not.
+    let losing = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            lose_confirmation: true,
+            ..Default::default()
+        },
+    );
+    let mut last = None;
+    for attempt in 1..=outbox::MAX_ATTEMPTS {
+        sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        last = outbox::run_once(&h.pool, &losing, "worker").await.unwrap();
+        if attempt < outbox::MAX_ATTEMPTS {
+            assert!(
+                matches!(last, Some(Settled::Retrying { .. })),
+                "attempt {attempt} retries: {last:?}"
+            );
+        }
+    }
+
+    // The last attempt asks instead of assuming. The backend has it, so the
+    // message is stored and the receipts say when.
+    assert_eq!(
+        last,
+        Some(Settled::Stored),
+        "the backend kept the body; giving up would have recorded a gap that is not there"
+    );
+    let (state, locator): (String, Option<String>) = sqlx::query_as(
+        "SELECT publication_state, canonical_locator FROM conversation_messages WHERE id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "stored");
+    let plain = PostgresBackend::new(h.pool.clone());
+    assert_eq!(
+        plain
+            .fetch(
+                &ai_crew_sync::store::backend::Locator(locator.clone().unwrap()),
+                mid
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("written, never acknowledged"),
+        "and it is the body that was sent"
+    );
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        receipts["receipts"][0]["stored_at"].is_string(),
+        "stored once it was established, not before: {receipts}"
+    );
+
+    // A backend that genuinely does not have it still fails, visibly. The
+    // fix must not turn every give-up into a success.
+    let gone = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "never written anywhere",
+               "request_id": request_id()}),
+    )
+    .await;
+    let unreachable = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            retryable: outbox::MAX_ATTEMPTS as usize + 1,
+            ..Default::default()
+        },
+    );
+    let mut last = None;
+    for _ in 1..=outbox::MAX_ATTEMPTS {
+        sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        last = outbox::run_once(&h.pool, &unreachable, "worker")
+            .await
+            .unwrap();
+    }
+    assert_eq!(last, Some(Settled::Failed));
+    let (state,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(
+                gone["message_id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<Uuid>()
+                    .unwrap(),
+            )
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "failed",
+        "a body nobody has is a gap, and it is shown"
+    );
+
     for c in [owner, dani] {
         let _ = c.cancel().await;
     }

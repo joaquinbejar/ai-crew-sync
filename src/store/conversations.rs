@@ -890,9 +890,14 @@ pub async fn invite(
             history_from_seq = CASE WHEN conversation_memberships.state = 'removed'
                                     THEN EXCLUDED.history_from_seq
                                     ELSE conversation_memberships.history_from_seq END,
-            -- A seat that is being re-offered is not the seat the old window
-            -- held: whoever accepts has to prove it is them again.
-            session_id = NULL,
+            -- A seat that is actually being re-offered is not the seat the
+            -- old window held, so whoever accepts proves it is them again.
+            -- A seat that stays active keeps its binding: clearing it on a
+            -- repeated invitation would quietly downgrade a protected
+            -- window to a legacy one, and the parent agent token would be
+            -- back in the room.
+            session_id = CASE WHEN conversation_memberships.state IN ('left', 'removed')
+                              THEN NULL ELSE conversation_memberships.session_id END,
             invited_by = EXCLUDED.invited_by,
             invited_at = now(),
             ended_at = NULL",
@@ -2139,7 +2144,11 @@ pub async fn transfer_membership(
                          THEN 'invited' ELSE conversation_memberships.state END,
             history_from_seq = EXCLUDED.history_from_seq,
             transfer_from = EXCLUDED.transfer_from,
-            session_id = NULL,
+            -- Same rule as an invitation: a seat that is being offered
+            -- again is unbound, one that is already active keeps the
+            -- window it belongs to.
+            session_id = CASE WHEN conversation_memberships.state IN ('left', 'removed')
+                              THEN NULL ELSE conversation_memberships.session_id END,
             invited_at = now(),
             ended_at = NULL
          RETURNING id",
