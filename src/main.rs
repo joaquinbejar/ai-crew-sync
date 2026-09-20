@@ -1,4 +1,4 @@
-use ai_crew_sync::{MIGRATOR, admin, client, serve, webhooks};
+use ai_crew_sync::{MIGRATOR, admin, admin_cli, client, serve, webhooks};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
@@ -198,20 +198,122 @@ enum AdminCmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Store an administrative credential for this machine. The credential is
+    /// read from a hidden prompt (or stdin with --token-stdin), verified
+    /// against the bus, and saved with mode 0600.
+    Login {
+        /// Base URL of the bus, e.g. https://bus.example.com:8443
+        #[arg(long)]
+        url: String,
+        /// Read the credential from stdin instead of prompting (for scripts).
+        #[arg(long)]
+        token_stdin: bool,
+    },
+    /// Forget the stored credential (it stays valid on the bus; revoke it
+    /// with `admin credential revoke` if it should not).
+    Logout,
+    /// Which credential is stored, and what it may administer.
+    Whoami,
+    /// Teams (global credential only).
+    #[command(subcommand)]
+    Team(AdminTeamCmd),
+    /// Mint an administrative credential for a team, or another global one
+    /// with --global. Global credential only.
+    Grant {
+        #[arg(long, conflicts_with = "global")]
+        team: Option<String>,
+        #[arg(long)]
+        global: bool,
+        #[arg(long)]
+        label: Option<String>,
+    },
     /// Administrative credentials (not agent tokens — those are `token …`).
     #[command(subcommand)]
     Credential(AdminCredentialCmd),
+    /// Agents of a team.
+    #[command(subcommand)]
+    Agent(AdminAgentCmd),
+    /// Agent tokens of a team.
+    #[command(subcommand)]
+    Token(AdminTokenCmd),
+}
+
+#[derive(Subcommand)]
+enum AdminTeamCmd {
+    Add {
+        #[arg(long)]
+        slug: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    List,
 }
 
 #[derive(Subcommand)]
 enum AdminCredentialCmd {
-    /// List administrative credentials; every team's unless --team is given.
+    /// List administrative credentials: every team's for a global
+    /// credential, its own team's for a team credential.
     List {
+        /// Only this team's credentials (global ones are never included).
         #[arg(long)]
         team: Option<String>,
+        /// Talk to Postgres (DATABASE_URL) instead of the bus. For emergencies.
+        #[arg(long)]
+        local: bool,
     },
     /// Revoke an administrative credential. It stops authorising immediately.
     Revoke {
+        #[arg(long)]
+        id: Uuid,
+        /// Talk to Postgres (DATABASE_URL) instead of the bus. For emergencies.
+        #[arg(long)]
+        local: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminAgentCmd {
+    Add {
+        #[arg(long)]
+        team: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        team: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminTokenCmd {
+    /// Mint a token for an agent, verify it authenticates as that agent, and
+    /// print it once — or write it to ~/.config/ai-crew-sync/tokens-<team>
+    /// with --save --repo <name> (then it is never printed).
+    Issue {
+        #[arg(long)]
+        team: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        label: Option<String>,
+        /// Save the token as `<repo>=<token>` in tokens-<team> instead of
+        /// printing it.
+        #[arg(long, requires = "repo")]
+        save: bool,
+        /// Entry name in tokens-<team>; usually the repository name.
+        #[arg(long, requires = "save")]
+        repo: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        team: String,
+    },
+    Revoke {
+        #[arg(long)]
+        team: String,
         #[arg(long)]
         id: Uuid,
     },
@@ -271,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Command::Client(args) => return client::run(args).await,
+        Command::Admin(cmd) if !admin_needs_database(&cmd) => return run_admin_remote(cmd).await,
         _ => {}
     }
 
@@ -372,14 +475,17 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
 
         Command::Admin(cmd) => match cmd {
             AdminCmd::Bootstrap { label } => admin::admin_bootstrap(&pool, label).await?,
-            AdminCmd::Credential(cmd) => match cmd {
-                AdminCredentialCmd::List { team } => {
-                    admin::admin_credential_list(&pool, team.as_deref()).await?
-                }
-                AdminCredentialCmd::Revoke { id } => {
-                    admin::admin_credential_revoke(&pool, id).await?
-                }
-            },
+            AdminCmd::Credential(AdminCredentialCmd::List { team, .. }) => {
+                admin::admin_credential_list(&pool, team.as_deref()).await?
+            }
+            AdminCmd::Credential(AdminCredentialCmd::Revoke { id, .. }) => {
+                admin::admin_credential_revoke(&pool, id).await?
+            }
+            // `main` routes every remote admin command before opening a pool.
+            other => unreachable!(
+                "remote admin command reached dispatch: {}",
+                admin_name(&other)
+            ),
         },
 
         Command::Webhook(cmd) => match cmd {
@@ -395,5 +501,270 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
         },
     }
 
+    Ok(())
+}
+
+/// Which `admin` commands run next to Postgres: bootstrap always, and the
+/// credential commands only when asked with --local.
+fn admin_needs_database(cmd: &AdminCmd) -> bool {
+    match cmd {
+        AdminCmd::Bootstrap { .. } => true,
+        AdminCmd::Credential(AdminCredentialCmd::List { local, .. })
+        | AdminCmd::Credential(AdminCredentialCmd::Revoke { local, .. }) => *local,
+        _ => false,
+    }
+}
+
+fn admin_name(cmd: &AdminCmd) -> &'static str {
+    match cmd {
+        AdminCmd::Bootstrap { .. } => "bootstrap",
+        AdminCmd::Login { .. } => "login",
+        AdminCmd::Logout => "logout",
+        AdminCmd::Whoami => "whoami",
+        AdminCmd::Team(_) => "team",
+        AdminCmd::Grant { .. } => "grant",
+        AdminCmd::Credential(_) => "credential",
+        AdminCmd::Agent(_) => "agent",
+        AdminCmd::Token(_) => "token",
+    }
+}
+
+fn rfc3339(v: &serde_json::Value) -> String {
+    v.as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "never".into())
+}
+
+/// The remote `admin …` commands: everything except bootstrap and --local.
+async fn run_admin_remote(cmd: AdminCmd) -> anyhow::Result<()> {
+    let dir = admin_cli::config_dir()?;
+
+    // Login and logout are the two that do not need a stored credential.
+    match cmd {
+        AdminCmd::Login { url, token_stdin } => {
+            let token = admin_cli::read_credential(token_stdin)?;
+            let (me, path) = admin_cli::login(&dir, &url, token).await?;
+            println!(
+                "logged in as a {} administrator{}; credential stored in {}",
+                me["scope"].as_str().unwrap_or("?"),
+                me["team"]
+                    .as_str()
+                    .map(|t| format!(" of team '{t}'"))
+                    .unwrap_or_default(),
+                path.display()
+            );
+            return Ok(());
+        }
+        AdminCmd::Logout => {
+            if admin_cli::remove_config(&dir)? {
+                println!(
+                    "credential forgotten (it is still valid on the bus; revoke it with `admin credential revoke` if it should not be)"
+                );
+            } else {
+                println!("not logged in");
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let api = admin_cli::Api::new(admin_cli::load_config(&dir)?);
+    match cmd {
+        AdminCmd::Bootstrap { .. } | AdminCmd::Login { .. } | AdminCmd::Logout => {
+            unreachable!("handled above")
+        }
+        AdminCmd::Whoami => {
+            let me = api.whoami().await?;
+            println!(
+                "{} administrator{} ({}) at {}",
+                me["scope"].as_str().unwrap_or("?"),
+                me["team"]
+                    .as_str()
+                    .map(|t| format!(" of team '{t}'"))
+                    .unwrap_or_default(),
+                me["credential_id"].as_str().unwrap_or("?"),
+                api.config().url
+            );
+        }
+        AdminCmd::Team(AdminTeamCmd::Add { slug, name }) => {
+            let v = api.create_team(&slug, name.as_deref()).await?;
+            println!(
+                "team '{}' ready",
+                v["team"]["slug"].as_str().unwrap_or(&slug)
+            );
+        }
+        AdminCmd::Team(AdminTeamCmd::List) => {
+            let v = api.list_teams().await?;
+            for t in v["teams"].as_array().into_iter().flatten() {
+                println!(
+                    "{:<20} {:<30} {} agent(s)",
+                    t["slug"].as_str().unwrap_or_default(),
+                    t["name"].as_str().unwrap_or_default(),
+                    t["agents"]
+                );
+            }
+        }
+        AdminCmd::Grant {
+            team,
+            global,
+            label,
+        } => {
+            if team.is_none() && !global {
+                anyhow::bail!("say which credential to mint: --team <slug> or --global");
+            }
+            let v = api
+                .grant_credential(team.as_deref(), label.as_deref())
+                .await?;
+            let c = &v["credential"];
+            println!();
+            match c["team"].as_str() {
+                Some(t) => {
+                    println!("Administrative credential for team '{t}' — shown once, store it now:")
+                }
+                None => println!("Global administrative credential — shown once, store it now:"),
+            }
+            println!();
+            println!("  {}", c["token"].as_str().unwrap_or_default());
+            println!();
+            println!(
+                "Its holder stores it with `ai-crew-sync admin login --url {}`.",
+                api.config().url
+            );
+        }
+        AdminCmd::Credential(AdminCredentialCmd::List { team, .. }) => {
+            let v = api.list_credentials().await?;
+            // The server already scopes the listing to the credential; --team
+            // narrows a global listing further (a team credential's is its
+            // own team whatever the flag says, so the flag is checked).
+            let wanted = team.as_deref().map(|t| t.trim().to_lowercase());
+            let rows: Vec<serde_json::Value> = v["credentials"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| match &wanted {
+                    Some(t) => c["team"].as_str() == Some(t.as_str()),
+                    None => true,
+                })
+                .collect();
+            if rows.is_empty() {
+                match wanted {
+                    Some(t) => println!(
+                        "(no administrative credentials for team '{t}' visible to this credential)"
+                    ),
+                    None => println!("(no administrative credentials)"),
+                }
+            }
+            for c in rows {
+                let flag = if c["revoked"] == true {
+                    " [revoked]"
+                } else {
+                    ""
+                };
+                println!(
+                    "{}  {:<20} {}…  last used {}  {}{flag}",
+                    c["id"].as_str().unwrap_or_default(),
+                    c["team"].as_str().unwrap_or("(global)"),
+                    c["prefix"].as_str().unwrap_or_default(),
+                    rfc3339(&c["last_used_at"]),
+                    c["label"].as_str().unwrap_or_default()
+                );
+            }
+        }
+        AdminCmd::Credential(AdminCredentialCmd::Revoke { id, .. }) => {
+            api.revoke_credential(id).await?;
+            println!("administrative credential {id} revoked");
+        }
+        AdminCmd::Agent(AdminAgentCmd::Add {
+            team,
+            name,
+            display_name,
+        }) => {
+            let v = api
+                .create_agent(&team, &name, display_name.as_deref())
+                .await?;
+            println!(
+                "agent '{}' ready in team '{team}'",
+                v["agent"]["name"].as_str().unwrap_or(&name)
+            );
+        }
+        AdminCmd::Agent(AdminAgentCmd::List { team }) => {
+            let v = api.list_agents(&team).await?;
+            for a in v["agents"].as_array().into_iter().flatten() {
+                let flag = if a["disabled"] == true {
+                    " [disabled]"
+                } else {
+                    ""
+                };
+                println!(
+                    "{:<24} {:<28} {} active token(s){flag}",
+                    a["name"].as_str().unwrap_or_default(),
+                    a["display_name"].as_str().unwrap_or_default(),
+                    a["active_tokens"]
+                );
+            }
+        }
+        AdminCmd::Token(AdminTokenCmd::Issue {
+            team,
+            agent,
+            label,
+            save,
+            repo,
+        }) => {
+            let target = match (save, repo) {
+                (true, Some(repo)) => Some(admin_cli::SaveTarget {
+                    dir: dir.clone(),
+                    repo: admin_cli::validate_repo_name(&repo)?,
+                }),
+                _ => None,
+            };
+            let issued = api.issue_token(&team, &agent, label.as_deref()).await?;
+            let saved =
+                admin_cli::finish_issue(&api, &issued, &agent, &team, target.as_ref()).await?;
+            match (saved, target) {
+                (Some(path), Some(t)) => println!(
+                    "token for {}@{} verified and saved to {} as {}=…  (id {})",
+                    issued.agent,
+                    issued.team,
+                    path.display(),
+                    t.repo,
+                    issued.id
+                ),
+                _ => {
+                    println!();
+                    println!(
+                        "Token for {}@{} — verified, shown once, store it now (id {}):",
+                        issued.agent, issued.team, issued.id
+                    );
+                    println!();
+                    println!("  {}", issued.token);
+                    println!();
+                }
+            }
+        }
+        AdminCmd::Token(AdminTokenCmd::List { team }) => {
+            let v = api.list_tokens(&team).await?;
+            for t in v["tokens"].as_array().into_iter().flatten() {
+                let flag = if t["revoked"] == true {
+                    " [revoked]"
+                } else {
+                    ""
+                };
+                println!(
+                    "{}  {:<20} {}…  last used {}  {}{flag}",
+                    t["id"].as_str().unwrap_or_default(),
+                    t["agent"].as_str().unwrap_or_default(),
+                    t["prefix"].as_str().unwrap_or_default(),
+                    rfc3339(&t["last_used_at"]),
+                    t["label"].as_str().unwrap_or_default()
+                );
+            }
+        }
+        AdminCmd::Token(AdminTokenCmd::Revoke { team, id }) => {
+            api.revoke_token(&team, id).await?;
+            println!("token {id} revoked");
+        }
+    }
     Ok(())
 }

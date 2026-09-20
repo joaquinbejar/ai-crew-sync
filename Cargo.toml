@@ -64,6 +64,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 
+# Hidden prompt for `admin login`: the credential never touches argv.
+rpassword = "7.5"
 sha2 = "0.11"
 rand = "0.10"
 hex = "0.4"

@@ -6,7 +6,8 @@
 //! - [`tools`] is a thin MCP layer over it,
 //! - [`serve`] wires the transport, authentication and axum together,
 //! - [`admin`] is the operator CLI (teams, agents, tokens),
-//! - [`admin_api`] is the remote administration surface at `/admin/*`.
+//! - [`admin_api`] is the remote administration surface at `/admin/*`,
+//! - [`admin_cli`] drives it from the operator's machine (`admin …`).
 
 // Row tuples for `sqlx::query_as` are spelled out next to the SELECT that
 // produces them; naming each one would only add indirection.
@@ -14,6 +15,7 @@
 
 pub mod admin;
 pub mod admin_api;
+pub mod admin_cli;
 pub mod auth;
 pub mod client;
 pub mod dashboard;

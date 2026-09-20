@@ -586,11 +586,83 @@ ai-crew-sync client call get_task --args '{"key":"refactor-auth"}'   # escape ha
 
 All subcommands accept `--json` for raw output (pipeable to `jq`).
 
-## Remote administration (`/admin/*`)
+## Remote administration
 
 Once a global credential exists (`admin bootstrap`, above), everything else
-is a JSON API on the bus itself — no SSH, no `docker exec`, no database
-connection. It is deliberately **not** MCP: administration never shows up in
+happens from your own machine — no SSH, no `docker exec`, no database
+connection.
+
+### Agent, token, label, session
+
+Four words that are easy to conflate, and the bus treats very differently:
+
+| | What it is | Where it comes from |
+|---|---|---|
+| **agent** | An identity on the bus: who posts, claims, holds locks. One per coding tool per person (`joaquin`, `joaquin-codex`, `backend`). | `admin agent add` |
+| **token** | A credential that *is* one agent. Several tokens can belong to the same agent; revoking one leaves the others working. | `admin token issue` |
+| **label** | A note on a token for humans (`"backend repo"`, `"dani laptop"`). Display only: it never decides who the token is. | `--label` |
+| **session** | Which of an agent's windows is calling, from the `X-Crew-Session` header. Partitions presence, claims and locks; never identity. | `BUS_SESSION` / `--session` |
+
+One token per repository is the shape everything below assumes: the token
+says *who*, the session says *where*.
+
+### Daily administration: `ai-crew-sync admin`
+
+```bash
+ai-crew-sync admin login --url https://bus.your-company.com:8443   # prompts for acsa_… (hidden)
+ai-crew-sync admin whoami
+
+ai-crew-sync admin team add --slug roundcrew --name "RoundCrew"    # global only
+ai-crew-sync admin agent add --team roundcrew --name backend
+ai-crew-sync admin token issue --team roundcrew --agent backend --label "sesion backend"
+ai-crew-sync admin token list --team roundcrew
+ai-crew-sync admin token revoke --team roundcrew --id <uuid>
+
+ai-crew-sync admin grant --team roundcrew --label dani    # a credential for roundcrew's admin
+ai-crew-sync admin credential list
+ai-crew-sync admin credential revoke --id <uuid>
+ai-crew-sync admin logout
+```
+
+`login` never takes the secret as an argument: it prompts with echo off, or
+reads it from stdin with `--token-stdin` for scripts. It calls the bus first
+and stores the endpoint and credential only if that succeeds, in
+`~/.config/ai-crew-sync/admin` with mode `0600` (`BUS_CONFIG_DIR` moves the
+directory; `BUS_ADMIN_URL` + `BUS_ADMIN_TOKEN` bypass the file for CI).
+
+**Every minted token is verified before you see it.** `token issue` presents
+the new token to `/mcp`, calls `whoami`, and requires the answer to be exactly
+the agent and team you asked for. On any mismatch the token is revoked and
+nothing is printed or saved — the label plays no part in this: identity is
+what the server says, never what the request said.
+
+The everyday form writes the token straight into the per-team file and never
+prints it:
+
+```bash
+ai-crew-sync admin token issue --team roundcrew --agent backend \
+    --label "sesion backend" --save --repo backend
+# token for backend@roundcrew verified and saved to ~/.config/ai-crew-sync/tokens-roundcrew as backend=…
+```
+
+`tokens-<team>` is one `name=token` line per repository (no quotes, no
+spaces), plus `_base=` for the org root. `--save` replaces only the `backend=`
+line: every other line survives, `_base` included, the write is atomic and
+`0600`, a duplicate `backend=` left by a hand edit collapses into one, and the
+previous token for that entry is **not** revoked (revoke it yourself when the
+old window is gone). `--repo` is one safe word; the file path comes from the
+team slug, never from the flag. A shell function that exports `BUS_TOKEN`
+from that file per directory is all the plumbing a machine needs.
+
+`bootstrap` is the only `admin` command that talks to Postgres. `credential
+list --local` / `credential revoke --local` do too, for the day the last
+global credential is lost; the classic `team`/`agent`/`token` commands stay
+as they were.
+
+### The API underneath (`/admin/*`)
+
+The CLI is a thin client over a JSON API on the bus itself, usable with a
+bare `curl`. It is deliberately **not** MCP: administration never shows up in
 an agent's tool catalogue, and an agent token presented here is refused with
 a message saying what to use instead.
 
