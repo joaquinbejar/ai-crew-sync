@@ -793,6 +793,41 @@ ai-crew-sync client call get_task --args '{"key":"refactor-auth"}'   # escape ha
 
 Todos los subcomandos aceptan `--json` para salida cruda (pipeable a `jq`).
 
+## Publicación asíncrona (opt-in, por conversación)
+
+Lo normal es síncrono: el cuerpo de un mensaje de conversación, sus
+destinatarios y sus receipts hacen commit en una transacción de Postgres, así
+que `stored: true` significa que esa transacción hizo commit y no hay nada
+que reconciliar. Nada de lo de abajo ralentiza ni cambia eso.
+
+Una conversación puede optar por un **outbox**, que es la forma que introduce
+cualquier almacén externo: aceptación y persistencia pasan a ser dos eventos,
+y el segundo puede fallar, agotar su tiempo, o salir bien sin que quien llamó
+se entere.
+
+```
+stored                el backend confirmó, con un locator canónico
+pending_publication   aceptado, aún no confirmado — y se dice así
+failed                no se confirmará; el hueco se queda, explícito
+```
+
+Un envío por ese camino devuelve `stored: false`, y los receipts no llevan
+`stored_at` hasta que el backend confirma. Los huecos se arriendan (60 s), se
+vencen por generación para que un worker que vuelve tras caducar su lease no
+escriba nada, se reintentan con backoff hasta ocho veces, y tienen tope de
+tamaño. El trabajo de red ocurre fuera de toda transacción: una publicación
+que tarda un minuto cuesta un lease, no un lock.
+
+Una finalización incierta (la escritura llegó y la confirmación se perdió) se
+resuelve preguntando al backend qué tiene de verdad para esa clave, no
+adivinando. Los reintentos presentan la misma clave, así que una escritura
+física duplicada acaba en un único locator canónico y no en dos mensajes.
+
+Postgres es el único backend. La frontera existe para poder construir y
+probar el manejo de fallos antes de tener algo externo a lo que culpar;
+volver una conversación a modo síncrono se rechaza mientras quede trabajo
+pendiente, porque si no el hilo se queda con un hueco que nadie cierra.
+
 ## Un ejemplo completo: diseño, implementación, revisión
 
 Cinco conversaciones en un repositorio, un solo token de agente, sin exportar

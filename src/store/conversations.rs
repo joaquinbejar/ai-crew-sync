@@ -1220,15 +1220,39 @@ pub async fn send(
     .execute(&mut *tx)
     .await?;
 
-    // One receipt row per recipient, with `stored_at` set by this commit and
-    // everything else left null: nothing else has been observed yet.
+    // Which path this conversation is on. `sync` is the default and the
+    // only one with a body that is durable the moment this commits.
+    let (publication,): (String,) =
+        sqlx::query_as("SELECT publication FROM conversations WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let asynchronous = publication == "outbox";
+
+    // One receipt row per recipient. `stored_at` is set here only when the
+    // body is durable here: on the outbox path it stays null until the
+    // backend confirms, because saying stored before that would be a claim
+    // nobody could check.
     sqlx::query(
         "INSERT INTO message_receipts (message_id, membership_id, stored_at)
-         SELECT message_id, membership_id, now() FROM message_recipients WHERE message_id = $1",
+         SELECT message_id, membership_id,
+                CASE WHEN $2 THEN NULL ELSE now() END
+           FROM message_recipients WHERE message_id = $1",
     )
     .bind(message_id)
+    .bind(asynchronous)
     .execute(&mut *tx)
     .await?;
+
+    if asynchronous {
+        let (backend,): (String,) =
+            sqlx::query_as("SELECT backend FROM conversations WHERE id = $1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        crate::store::outbox::enqueue(&mut tx, message_id, id, auth.team_id, &backend, &body)
+            .await?;
+    }
 
     audit(
         &mut tx,
@@ -1252,7 +1276,10 @@ pub async fn send(
         message_id: message_id.to_string(),
         conversation_id: id.to_string(),
         seq,
-        stored: true,
+        // Accepted is not stored. On the synchronous path they coincide
+        // because this commit *is* the persistence; on the outbox path the
+        // caller is told the truth and can watch it settle.
+        stored: !asynchronous,
         recipients,
         created_at: ts(created_at.0),
     })

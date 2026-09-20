@@ -7064,3 +7064,273 @@ async fn a_private_thread_answers_only_to_the_windows_that_are_in_it() {
     }
     h.shutdown().await;
 }
+
+// -------------------------------------------------- backend and the outbox --
+
+/// The failure shape every external store introduces, exercised with
+/// Postgres as the only backend: acceptance and persistence are two events,
+/// the second can fail, time out, or succeed without the caller hearing.
+/// Leases, fencing, bounded retries, idempotency and reconciliation, with no
+/// broker installed.
+#[tokio::test]
+async fn the_outbox_survives_failures_between_acceptance_and_confirmation() {
+    use ai_crew_sync::store::backend::{Faults, MessagingBackend, PostgresBackend, Published};
+    use ai_crew_sync::store::outbox::{self, Settled};
+
+    let h = require_db!("t_backend_outbox");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "async thread", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+
+    // Opt this conversation into asynchronous publication. The default is
+    // synchronous and untouched.
+    let cuuid: Uuid = cid.parse().unwrap();
+    outbox::set_publication(&h.pool, cuuid, true).await.unwrap();
+
+    // Acceptance is not storage, and the caller is told so.
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "published later", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(sent["stored"], false, "accepted, not yet stored: {sent}");
+    let mid: Uuid = sent["message_id"].as_str().unwrap().parse().unwrap();
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        receipts["receipts"][0]["stored_at"].is_null(),
+        "stored is not claimed before the backend confirmed: {receipts}"
+    );
+    let status = outbox::status(&h.pool, team_id(&h.pool, "acme").await)
+        .await
+        .unwrap();
+    assert_eq!(status.pending, 1);
+    assert!(status.pending_bytes > 0);
+
+    // A retryable failure backs off and keeps the slot.
+    let flaky = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            retryable: 1,
+            ..Default::default()
+        },
+    );
+    let outcome = outbox::run_once(&h.pool, &flaky, "worker-a").await.unwrap();
+    assert!(
+        matches!(outcome, Some(Settled::Retrying { .. })),
+        "{outcome:?}"
+    );
+    let (state,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "pending_publication",
+        "a retry does not fabricate stored"
+    );
+
+    // Fencing: a worker whose lease expired settles nothing. Take a lease,
+    // let another worker take it over, then try to settle the stale one.
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let stale = outbox::lease(&h.pool, "worker-stale")
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE conversation_outbox SET lease_expires_at = now() - interval '1 minute'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let fresh = outbox::lease(&h.pool, "worker-b").await.unwrap().unwrap();
+    assert!(fresh.generation > stale.generation);
+    let fenced = outbox::settle(
+        &h.pool,
+        &stale,
+        Published::Confirmed(ai_crew_sync::store::backend::Locator(mid.to_string())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fenced, Settled::Fenced, "a stale worker must write nothing");
+    let (state,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "pending_publication");
+
+    // Uncertain completion: the body was written and the confirmation lost.
+    // Reconciliation asks the backend what it actually holds and settles.
+    let losing = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            lose_confirmation: true,
+            ..Default::default()
+        },
+    );
+    let outcome = losing
+        .publish(ai_crew_sync::store::backend::Envelope {
+            message_id: fresh.message_id,
+            conversation_id: fresh.conversation_id,
+            team_id: fresh.team_id,
+            body: fresh.payload.clone(),
+            publish_key: fresh.publish_key,
+        })
+        .await;
+    assert!(matches!(outcome, Published::Retryable(_)));
+    let plain = PostgresBackend::new(h.pool.clone());
+    let settled = outbox::reconcile(&h.pool, &plain, &fresh).await.unwrap();
+    assert_eq!(
+        settled,
+        Settled::Stored,
+        "the write did land; reconcile found it"
+    );
+
+    // Now it is stored, once, and the receipts say when.
+    let (state, locator): (String, Option<String>) = sqlx::query_as(
+        "SELECT publication_state, canonical_locator FROM conversation_messages WHERE id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "stored");
+    assert_eq!(locator.as_deref(), Some(mid.to_string().as_str()));
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert!(
+        receipts["receipts"][0]["stored_at"].is_string(),
+        "{receipts}"
+    );
+    assert!(
+        outbox::lease(&h.pool, "worker-c").await.unwrap().is_none(),
+        "the slot is gone"
+    );
+
+    // Idempotency holds across the async path too: the same request id
+    // returns the original message rather than queueing a second.
+    let rid = request_id();
+    let a = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "twice", "request_id": rid}),
+    )
+    .await;
+    let b = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "twice", "request_id": rid}),
+    )
+    .await;
+    assert_eq!(a["message_id"], b["message_id"]);
+    assert_eq!(a["seq"], b["seq"]);
+    let (slots,): (i64,) = sqlx::query_as("SELECT count(*) FROM conversation_outbox")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(slots, 1, "one logical message, one slot");
+
+    // A fatal failure is explicit and keeps the slot visible, rather than
+    // retrying for ever or pretending it stored.
+    let doomed = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fatal: true,
+            ..Default::default()
+        },
+    );
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let outcome = outbox::run_once(&h.pool, &doomed, "worker-d")
+        .await
+        .unwrap();
+    assert_eq!(outcome, Some(Settled::Failed));
+    let team = team_id(&h.pool, "acme").await;
+    let status = outbox::status(&h.pool, team).await.unwrap();
+    assert_eq!(status.failed, 1);
+    assert_eq!(status.pending, 0);
+    let mid2: Uuid = a["message_id"].as_str().unwrap().parse().unwrap();
+    let (state,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(mid2)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed", "an explicit failed slot, not a silent gap");
+
+    // Returning to synchronous mode is refused while work is *outstanding*,
+    // because a thread would keep a gap nobody drains. A failed slot is
+    // settled — explicit, visible, not coming back — so it does not block.
+    let pending = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "still queued", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(pending["stored"], false);
+    let err = outbox::set_publication(&h.pool, cuuid, false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("still awaiting publication"), "{err}");
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now() WHERE state = 'pending'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox::run_once(&h.pool, &plain, "worker-e").await.unwrap(),
+        Some(Settled::Stored)
+    );
+    // The failed slot is still there and still does not block the switch.
+    assert_eq!(outbox::status(&h.pool, team).await.unwrap().failed, 1);
+    outbox::set_publication(&h.pool, cuuid, false)
+        .await
+        .unwrap();
+    let sync_sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "back to sync", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(sync_sent["stored"], true, "the default path is unchanged");
+
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The team id, for the store-level calls above.
+async fn team_id(pool: &PgPool, slug: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM teams WHERE slug = $1")
+        .bind(slug)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
