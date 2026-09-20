@@ -38,7 +38,8 @@ pub struct ClientArgs {
     pub token: Option<String>,
 
     /// Connect with this local profile (from `context profile add`).
-    /// Ignored when --token is given.
+    /// Passing it together with --token is a contradiction and is refused,
+    /// so it is always clear which identity a window uses.
     #[arg(long, env = "BUS_PROFILE")]
     pub profile: Option<String>,
 
@@ -295,7 +296,7 @@ pub enum NoteCmd {
 pub mod mapping;
 pub mod render;
 
-use mapping::to_call;
+use mapping::{Defaults, to_call_with};
 use render::render;
 
 pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
@@ -332,7 +333,10 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
         .await
         .context("could not connect to the bus (check --url and --token)")?;
 
-    let outcome = run_command(&client, &args).await;
+    let defaults = Defaults {
+        channel: resolved.channel.clone(),
+    };
+    let outcome = run_command(&client, &args, &defaults).await;
     let _ = client.cancel().await;
     outcome
 }
@@ -340,6 +344,7 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
 async fn run_command(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>,
     args: &ClientArgs,
+    defaults: &Defaults,
 ) -> anyhow::Result<()> {
     // `tools` is the one command that is not a tool call.
     if matches!(args.command, ClientCmd::Tools) {
@@ -371,7 +376,7 @@ async fn run_command(
             // `tools` is handled above and is the only command that maps to
             // nothing; anything else reaching here without a mapping is a
             // missing match arm, and says so instead of panicking.
-            let Some((tool, call_args)) = to_call(other)? else {
+            let Some((tool, call_args)) = to_call_with(other, defaults)? else {
                 bail!("this subcommand has no MCP tool mapping yet");
             };
             (tool.to_string(), call_args)

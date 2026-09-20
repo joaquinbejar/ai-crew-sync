@@ -1014,7 +1014,12 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                     let url = admin_cli::normalize_base_url(&url)?;
                     let team = context::validate_name("team", &team)?;
                     let agent = context::validate_name("agent", &agent)?;
-                    let tokens = tokens.unwrap_or_else(|| format!("tokens-{team}"));
+                    // Validated before it is written, not only when it is
+                    // read back: a stored profile that `load_profiles` will
+                    // reject is a trap for the next command.
+                    let tokens = context::validate_tokens_ref(
+                        &tokens.unwrap_or_else(|| format!("tokens-{team}")),
+                    )?;
                     let key = key
                         .map(|k| context::validate_name("token key", &k))
                         .transpose()?;

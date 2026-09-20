@@ -4947,6 +4947,42 @@ async fn local_profiles_resolve_and_verify_against_the_bus() {
     let v = context::verify(&r).await.unwrap();
     assert_eq!(v.agent, "marta");
 
+    // The project's channel is not decoration: a message with neither
+    // --channel nor --to goes there.
+    let defaults = ai_crew_sync::client::mapping::Defaults {
+        channel: r.channel.clone(),
+    };
+    let (tool, args) = ai_crew_sync::client::mapping::to_call_with(
+        &ai_crew_sync::client::ClientCmd::Send {
+            channel: None,
+            to: None,
+            body: "from the project".into(),
+            announce: false,
+            reply_to: None,
+            file: vec![],
+        },
+        &defaults,
+    )
+    .unwrap()
+    .expect("send maps to a tool");
+    assert_eq!(tool, "post_message");
+    assert_eq!(args["channel"], "api", "the .acs.toml channel is used");
+    // A direct message stays direct, and an explicit channel still wins.
+    let (_, args) = ai_crew_sync::client::mapping::to_call_with(
+        &ai_crew_sync::client::ClientCmd::Send {
+            channel: None,
+            to: Some("marta".into()),
+            body: "hi".into(),
+            announce: false,
+            reply_to: None,
+            file: vec![],
+        },
+        &defaults,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(args["channel"].is_null(), "a DM is not redirected: {args}");
+
     // The secret never appears in the redacted view.
     let shown = serde_json::to_string(&r.redacted()).unwrap();
     assert!(!shown.contains(&fresh.token[5..]));

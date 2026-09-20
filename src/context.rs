@@ -107,7 +107,7 @@ pub fn validate_name(what: &str, raw: &str) -> anyhow::Result<String> {
 
 /// A tokens file reference stays inside the configuration directory: a bare
 /// name, no separators, no traversal.
-fn validate_tokens_ref(raw: &str) -> anyhow::Result<String> {
+pub fn validate_tokens_ref(raw: &str) -> anyhow::Result<String> {
     let name = raw.trim();
     if name.is_empty()
         || name.contains(['/', '\\'])
@@ -183,7 +183,12 @@ pub fn update_profiles(
 
 /// What a repository may say about itself. Names only: it references an
 /// approved profile, it never defines one.
+/// `deny_unknown_fields` on purpose: this file comes from a repository, so
+/// an unrecognised key is a claim we do not understand, not a comment. A
+/// tolerated `token_file =` that silently did nothing would be indistinguishable
+/// from one that worked.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     /// Locally approved profile to connect with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,9 +223,13 @@ pub fn parse_project_file(text: &str, path: &Path) -> anyhow::Result<ProjectConf
             );
         }
     }
-    let cfg: ProjectConfig = table
-        .try_into()
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let cfg: ProjectConfig = table.try_into().with_context(|| {
+        format!(
+            "{} has a key this version does not accept. A project file may only set \
+             profile, project, channel and key — never an endpoint or a credential",
+            path.display()
+        )
+    })?;
     if let Some(p) = &cfg.profile {
         validate_name("profile name", p)?;
     }
@@ -795,10 +804,18 @@ mod tests {
             "profile = \"acme\"\nurl = \"https://evil.example\"\n",
             "profile = \"acme\"\ntoken = \"acs_stolen\"\n",
             "profile = \"acme\"\ntokens = \"../../etc/passwd\"\n",
+            // Not on the forbidden list, and still refused: an unknown key
+            // is a claim this version does not understand, and tolerating
+            // it would make a credential-shaped one look accepted.
+            "profile = \"acme\"\ntoken_file = \"~/.ssh/id_rsa\"\n",
+            "profile = \"acme\"\nmcp_url = \"https://evil.example/mcp\"\n",
         ] {
             std::fs::write(repo.join(PROJECT_FILE), evil).unwrap();
-            let err = resolve(&inputs(&dir, &repo)).unwrap_err().to_string();
-            assert!(err.contains("may not do"), "{evil}: {err}");
+            let err = format!("{:#}", resolve(&inputs(&dir, &repo)).unwrap_err());
+            assert!(
+                err.contains("may not do") || err.contains("does not accept"),
+                "{evil}: {err}"
+            );
         }
         // A profile whose tokens reference escapes the directory is refused
         // at load time.
