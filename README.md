@@ -783,6 +783,40 @@ ai-crew-sync client call get_task --args '{"key":"refactor-auth"}'   # escape ha
 
 All subcommands accept `--json` for raw output (pipeable to `jq`).
 
+## Asynchronous publication (opt-in, per conversation)
+
+The default is synchronous: a conversation message's body, recipients and
+receipts commit in one Postgres transaction, so `stored: true` means that
+transaction committed and there is nothing to reconcile. Nothing below slows
+that down or changes it.
+
+A conversation can opt into an **outbox** instead, which is the shape any
+external store introduces: acceptance and persistence become two events, and
+the second can fail, time out, or succeed without the caller hearing.
+
+```
+stored                the backend confirmed, with a canonical locator
+pending_publication   accepted, not yet confirmed — and reported as such
+failed                it will not be confirmed; the slot stays, explicit
+```
+
+A send on that path returns `stored: false`, and the receipts carry no
+`stored_at` until the backend confirms. Slots are leased (60 s), fenced by a
+generation so a worker that comes back after its lease expired writes
+nothing, retried with backoff up to eight attempts, and bounded in payload
+size. Network-like work happens outside every database transaction: a
+publish that takes a minute costs a lease, not a lock.
+
+An uncertain completion — the write landed and the confirmation was lost —
+is resolved by asking the backend what it actually holds for the publish key,
+not by guessing. Retries present the same key, so a duplicate physical write
+resolves to one canonical locator rather than two messages.
+
+Postgres is the only backend. The boundary exists so the failure handling can
+be built and tested before there is anything external to blame for it;
+returning a conversation to synchronous mode is refused while work is still
+outstanding, because a thread would otherwise keep a gap nobody drains.
+
 ## A worked example: design, implementation, review
 
 Five conversations in one repository, one agent token, nothing exported.
