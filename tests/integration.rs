@@ -4309,6 +4309,35 @@ async fn admin_api_global_credential_runs_the_whole_onboarding_remotely() {
         .post("/teams/roundcrew/agents", json!({"name": "has space"}))
         .await;
     assert_eq!(status, 400, "{body}");
+    // Extractor rejections wear the same JSON shape as every other error.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/admin/teams/roundcrew/agents", h.base))
+        .header("Authorization", format!("Bearer {}", bootstrap.token))
+        .header("Content-Type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.expect("a JSON error body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON body"),
+        "{body}"
+    );
+    let (status, body) = admin.delete("/teams/roundcrew/tokens/not-a-uuid").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("path parameter"),
+        "{body}"
+    );
+    let (status, body) = admin.post("/credentials", json!({"team": ""})).await;
+    assert_eq!(
+        status, 400,
+        "an empty team is a mistake, not a global grant: {body}"
+    );
 
     // Revocation stops the token on /mcp immediately.
     let (status, _) = admin

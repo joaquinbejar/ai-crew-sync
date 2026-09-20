@@ -15,7 +15,10 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Request, State},
+    extract::{
+        Path, Request, State,
+        rejection::{JsonRejection, PathRejection},
+    },
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -119,6 +122,28 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+/// Extractor rejections become the same `{"error": …}` shape as everything
+/// else on this surface. Handlers take `Result<Json<T>, JsonRejection>` and
+/// `Result<Path<T>, PathRejection>` and unwrap them through these.
+impl From<JsonRejection> for ApiError {
+    fn from(r: JsonRejection) -> Self {
+        ApiError::BadRequest(format!(
+            "invalid JSON body: {}. Send an object with Content-Type: application/json",
+            r.body_text()
+        ))
+    }
+}
+
+impl From<PathRejection> for ApiError {
+    fn from(r: PathRejection) -> Self {
+        ApiError::BadRequest(format!("invalid path parameter: {}", r.body_text()))
+    }
+}
+
+/// What a JSON body or a path yields once its rejection is mapped.
+type Body<T> = Result<Json<T>, JsonRejection>;
+type Params<T> = Result<Path<T>, PathRejection>;
 
 /// Middleware: only an active administrative credential gets through. An
 /// agent token is refused with a message that says what to use instead.
@@ -237,14 +262,11 @@ async fn list_teams(
     req_ctx: Option<axum::Extension<AdminCtx>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ctx = ctx(req_ctx)?;
-    let teams = if ctx.is_global() {
-        store::list_teams(&state.pool).await?
-    } else {
-        // A team credential sees exactly its own team, never the roster.
-        let all = store::list_teams(&state.pool).await?;
-        all.into_iter()
-            .filter(|t| Some(t.id) == ctx.team_id)
-            .collect()
+    // A team credential sees exactly its own team, never the roster — and
+    // never pays for it either: one row by id, not a scan of every team.
+    let teams = match ctx.team_id {
+        None => store::list_teams(&state.pool).await?,
+        Some(tid) => vec![store::team_by_id(&state.pool, tid).await?],
     };
     Ok(Json(serde_json::json!({ "teams": teams })))
 }
@@ -258,9 +280,10 @@ struct CreateTeam {
 async fn create_team(
     State(state): State<AdminApiState>,
     req_ctx: Option<axum::Extension<AdminCtx>>,
-    Json(body): Json<CreateTeam>,
+    body: Body<CreateTeam>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let ctx = ctx(req_ctx)?;
+    let Json(body) = body?;
     require_global(&ctx, "creating a team")?;
     let team = store::create_team(&state.pool, Actor::Admin(ctx.id), &body.slug, body.name).await?;
     tracing::info!(credential = %ctx.id, team = %team.slug, "team ready");
@@ -273,9 +296,10 @@ async fn create_team(
 async fn list_agents(
     State(state): State<AdminApiState>,
     req_ctx: Option<axum::Extension<AdminCtx>>,
-    Path(team): Path<String>,
+    team: Params<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ctx = ctx(req_ctx)?;
+    let Path(team) = team?;
     let tid = scoped_team(&state.pool, &ctx, &team).await?;
     let agents = store::list_agents(&state.pool, tid).await?;
     Ok(Json(serde_json::json!({ "agents": agents })))
@@ -290,10 +314,12 @@ struct CreateAgent {
 async fn create_agent(
     State(state): State<AdminApiState>,
     req_ctx: Option<axum::Extension<AdminCtx>>,
-    Path(team): Path<String>,
-    Json(body): Json<CreateAgent>,
+    team: Params<String>,
+    body: Body<CreateAgent>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let ctx = ctx(req_ctx)?;
+    let Path(team) = team?;
+    let Json(body) = body?;
     let tid = scoped_team(&state.pool, &ctx, &team).await?;
     let agent = store::create_agent(
         &state.pool,
@@ -313,9 +339,10 @@ async fn create_agent(
 async fn list_tokens(
     State(state): State<AdminApiState>,
     req_ctx: Option<axum::Extension<AdminCtx>>,
-    Path(team): Path<String>,
+    team: Params<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ctx = ctx(req_ctx)?;
+    let Path(team) = team?;
     let tid = scoped_team(&state.pool, &ctx, &team).await?;
     let tokens = store::list_tokens(&state.pool, tid).await?;
     Ok(Json(serde_json::json!({ "tokens": tokens })))
@@ -332,10 +359,12 @@ struct IssueToken {
 async fn issue_token(
     State(state): State<AdminApiState>,
     req_ctx: Option<axum::Extension<AdminCtx>>,
-    Path(team): Path<String>,
-    Json(body): Json<IssueToken>,
+    team: Params<String>,
+    body: Body<IssueToken>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let ctx = ctx(req_ctx)?;
+    let Path(team) = team?;
+    let Json(body) = body?;
     let tid = scoped_team(&state.pool, &ctx, &team).await?;
     let issued = store::issue_token(
         &state.pool,
@@ -361,9 +390,10 @@ async fn issue_token(
 async fn revoke_token(
     State(state): State<AdminApiState>,
     req_ctx: Option<axum::Extension<AdminCtx>>,
-    Path((team, id)): Path<(String, Uuid)>,
+    params: Params<(String, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ctx = ctx(req_ctx)?;
+    let Path((team, id)) = params?;
     let tid = scoped_team(&state.pool, &ctx, &team).await?;
     // Always scoped to the resolved team, a global credential included: the
     // path names the team, and a token elsewhere is not found here.
@@ -394,18 +424,21 @@ struct GrantCredential {
 async fn grant_credential(
     State(state): State<AdminApiState>,
     req_ctx: Option<axum::Extension<AdminCtx>>,
-    Json(body): Json<GrantCredential>,
+    body: Body<GrantCredential>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let ctx = ctx(req_ctx)?;
+    let Json(body) = body?;
     require_global(&ctx, "granting an administrative credential")?;
-    let tid = match body
-        .team
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(slug) => Some(store::team_id_by_slug(&state.pool, slug).await?),
+    // Absent or null means global. An explicit empty string is a mistake,
+    // not a request for the widest scope there is.
+    let tid = match body.team.as_deref().map(str::trim) {
         None => None,
+        Some("") => {
+            return Err(ApiError::BadRequest(
+                "team is empty; pass a team slug, or omit it for a global credential".to_owned(),
+            ));
+        }
+        Some(slug) => Some(store::team_id_by_slug(&state.pool, slug).await?),
     };
     let issued = store::grant_admin(&state.pool, Actor::Admin(ctx.id), tid, body.label).await?;
     tracing::info!(
@@ -423,9 +456,10 @@ async fn grant_credential(
 async fn revoke_credential(
     State(state): State<AdminApiState>,
     req_ctx: Option<axum::Extension<AdminCtx>>,
-    Path(id): Path<Uuid>,
+    id: Params<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ctx = ctx(req_ctx)?;
+    let Path(id) = id?;
     // A team credential may revoke within its team (itself included); a
     // global or foreign credential is not found from there.
     store::revoke_admin(&state.pool, Actor::Admin(ctx.id), ctx.team_id, id).await?;
@@ -433,15 +467,12 @@ async fn revoke_credential(
     Ok(Json(serde_json::json!({ "revoked": id })))
 }
 
-/// A JSON body the extractor rejected: say so in the same shape as every
-/// other error here, rather than axum's plain-text default.
+/// The body-size layer answers with a bare 413 before any extractor runs;
+/// say so in the same shape as every other error here. Extractor rejections
+/// (malformed JSON, a bad UUID) are mapped in the handlers themselves.
 async fn explain_rejections(req: Request, next: Next) -> Response {
     let resp = next.run(req).await;
     match resp.status() {
-        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
-            ApiError::BadRequest("send a JSON body with Content-Type: application/json".to_owned())
-                .into_response()
-        }
         StatusCode::PAYLOAD_TOO_LARGE => ApiError::BadRequest(format!(
             "request body is too large; /admin accepts up to {MAX_ADMIN_REQUEST_BYTES} bytes"
         ))
@@ -457,9 +488,15 @@ pub fn router<S: Clone + Send + Sync + 'static>(
     pool: PgPool,
     mcp_rate_limit_per_minute: u32,
 ) -> Router<S> {
+    // Only 0 disables: a small but non-zero MCP limit still leaves /admin
+    // limited, at one request a minute if it comes to that.
+    let admin_per_minute = match mcp_rate_limit_per_minute {
+        0 => 0,
+        n => (n / ADMIN_RATE_LIMIT_DIVISOR).max(1),
+    };
     let state = AdminApiState {
         pool,
-        limiter: RateLimiter::new(mcp_rate_limit_per_minute / ADMIN_RATE_LIMIT_DIVISOR),
+        limiter: RateLimiter::new(admin_per_minute),
     };
     Router::new()
         .route("/whoami", get(whoami))
