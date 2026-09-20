@@ -129,6 +129,126 @@ pub async fn team_stream(
     Ok(())
 }
 
+/// Plan, and optionally run, a supervised move of conversation bodies.
+pub async fn conversations_migrate(
+    pool: &PgPool,
+    team: &str,
+    to: &str,
+    conversations: &[String],
+    nats_url: &str,
+    credentials: Option<String>,
+    apply: bool,
+) -> anyhow::Result<()> {
+    use crate::store::migrate::{self, Direction};
+
+    let id = team_id(pool, team).await?;
+    let direction = Direction::parse(to)?;
+    let only: Vec<Uuid> = conversations
+        .iter()
+        .map(|c| {
+            c.trim()
+                .parse::<Uuid>()
+                .map_err(|_| anyhow::anyhow!("'{c}' is not a conversation id"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    let mut config = crate::store::jetstream::Config::new(nats_url.to_owned());
+    config.credentials = credentials;
+    // Fail here rather than halfway through: a move that cannot reach the
+    // broker is a move that should not start.
+    let jetstream = crate::store::jetstream::JetStreamBackend::connect(&config, id).await?;
+
+    let plans = migrate::plan(pool, id, direction, &only).await?;
+    if plans.is_empty() {
+        println!("team '{team}': nothing matches");
+        return Ok(());
+    }
+    println!("team '{team}' → {}", direction.target());
+    for p in &plans {
+        println!(
+            "  {} {:<30} {} message(s), {}{}",
+            p.conversation_id,
+            p.title.chars().take(30).collect::<String>(),
+            p.messages,
+            human_bytes(p.bytes),
+            match &p.blocked {
+                Some(why) => format!("  — skipped: {why}"),
+                None => String::new(),
+            }
+        );
+    }
+    if !apply {
+        println!();
+        println!("Dry run. Nothing was moved. Add --apply to run it.");
+        println!(
+            "This moves message bodies only. Attachments, memberships, receipts and ids \
+             stay exactly where and as they are."
+        );
+        println!(
+            "Each thread pauses writes only while its own tail is copied and verified;              reads keep working throughout, and the rest of the bus is untouched."
+        );
+        return Ok(());
+    }
+
+    for p in plans.iter().filter(|p| p.blocked.is_none()) {
+        print!("  {} … ", p.conversation_id);
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        match migrate::run(pool, &jetstream, id, p.conversation_id, direction).await {
+            Ok(o) => println!(
+                "moved {} message(s), {} already there, {} verified",
+                o.copied,
+                o.skipped,
+                human_bytes(o.bytes)
+            ),
+            Err(e) => {
+                println!("FAILED: {e}");
+                println!(
+                    "      Nothing was cut over for this thread and its writes are open                      again. Fix the cause and run the same command: what is already                      verified is not copied twice."
+                );
+            }
+        }
+    }
+    println!();
+    println!(
+        "Source bodies are kept. `conversations cleanup` drops them later, once you are          sure you will not roll back."
+    );
+    Ok(())
+}
+
+/// Drop source bodies whose move is old enough to trust.
+pub async fn conversations_cleanup(
+    pool: &PgPool,
+    team: &str,
+    rollback_window_hours: i64,
+    apply: bool,
+) -> anyhow::Result<()> {
+    let id = team_id(pool, team).await?;
+    let (count, bytes) =
+        crate::store::migrate::cleanup(pool, id, rollback_window_hours, apply).await?;
+    if count == 0 {
+        println!(
+            "team '{team}': nothing to drop (no move finished more than \
+             {rollback_window_hours}h ago)"
+        );
+        return Ok(());
+    }
+    if apply {
+        println!(
+            "team '{team}': dropped {count} source body(ies), {} freed in Postgres",
+            human_bytes(bytes)
+        );
+        println!("Rolling those threads back now needs the broker, not an older image.");
+    } else {
+        println!(
+            "team '{team}': {count} source body(ies) could be dropped, {} in Postgres",
+            human_bytes(bytes)
+        );
+        println!("Dry run. Add --apply to delete them.");
+    }
+    Ok(())
+}
+
 fn human_bytes(n: i64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = n as f64;

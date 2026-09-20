@@ -888,11 +888,32 @@ ai-crew-sync serve --nats-url nats://broker:4222 \
                    --nats-credentials /etc/ai-crew-sync/runtime.creds
 ```
 
-**Los hilos existentes no se migran nunca.** Una conversación guarda el
-backend en el que nació y se queda con él de por vida: un hilo con media
-historia en cada sitio es la única forma que no puede leer nadie. Volver a
+**Enrutar no migra nada por sí solo.** Una conversación guarda el backend en
+el que nació, y cada mensaje guarda dónde está *su* cuerpo; volver a
 Postgres afecta solo a las conversaciones nuevas, y se rechaza mientras
 quede algo pendiente de publicar.
+
+Mover un hilo existente es una operación aparte y supervisada:
+
+```bash
+ai-crew-sync conversations migrate --team acme --to jetstream \
+    --conversation <id> --nats-url nats://broker:4222          # simulacro
+```
+
+Copia todos los cuerpos, pausa las escrituras **de ese único hilo** mientras
+se lleva la cola, vuelve a leer cada cuerpo desde el destino y compara
+checksums, y solo entonces hace el cambio, en una transacción. Un fallo no
+cambia nada y levanta la pausa; una ejecución interrumpida se reanuda sin
+copiar dos veces. Ids, autoría, pertenencias y cada receipt observado quedan
+intactos, y jamás se inventa un acuse. La vuelta atrás es el mismo comando
+con `--to postgres`, y los cuerpos de origen siguen ahí hasta que ejecutes
+`conversations cleanup` a propósito.
+
+**`docs/operations/jetstream.md`** tiene la topología de producción, las
+credenciales, las cuotas y el dimensionado, las alertas, los simulacros de
+restauración y de caída de nodo, y los límites; empezando por el que más
+conviene saber: un cuerpo en el broker no está en ningún índice de Postgres,
+así que esta versión no lo busca.
 
 Un equipo enrutado a JetStream en un servidor arrancado sin `--nats-url` no
 cae de vuelta a Postgres en silencio — eso partiría la historia. Al leer

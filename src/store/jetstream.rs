@@ -468,6 +468,14 @@ impl JetStreamBackend {
         }
         Ok(sequence)
     }
+
+    /// Can this process reach the broker at all? For health checks, which
+    /// is why it opens and drops a connection rather than reusing a
+    /// team's: it answers a question about the deployment, not about a
+    /// stream.
+    pub async fn reachable(config: &Config) -> bool {
+        connect_client(config).await.is_ok()
+    }
 }
 
 async fn connect_client(config: &Config) -> BusResult<async_nats::Client> {

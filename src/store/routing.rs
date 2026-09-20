@@ -165,6 +165,16 @@ impl Backends {
         self.named(&name, team_id).await
     }
 
+    /// Where one message's body is authoritative.
+    ///
+    /// Per message, not per conversation: during a supervised move, and
+    /// after a rollback that had to leave a tombstoned body behind, a
+    /// thread's bodies are not all in the same place. The message row says
+    /// where each one is, and that is what a read follows.
+    pub async fn for_message(&self, backend: &str, team_id: Uuid) -> BusResult<AnyBackend> {
+        self.named(backend, team_id).await
+    }
+
     /// Where a team's new conversations will be created.
     pub async fn for_team(&self, pool: &PgPool, team_id: Uuid) -> BusResult<AnyBackend> {
         let (name,): (String,) = sqlx::query_as("SELECT default_backend FROM teams WHERE id = $1")
@@ -172,6 +182,13 @@ impl Backends {
             .fetch_one(pool)
             .await?;
         self.named(&name, team_id).await
+    }
+
+    /// Whether the broker answers. `None` when none is configured, which
+    /// is not a fault: it is the default installation.
+    pub async fn broker_reachable(&self) -> Option<bool> {
+        let config = self.nats.as_ref()?;
+        Some(JetStreamBackend::reachable(config).await)
     }
 
     /// Every team whose conversations are routed off Postgres. The worker
