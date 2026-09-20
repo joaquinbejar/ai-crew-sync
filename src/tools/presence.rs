@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use super::{Bus, auth_of};
 use crate::{
-    model::{AgentInfo, AgentList},
+    model::{AgentInfo, AgentList, SessionList},
     store::presence,
 };
 
@@ -26,10 +26,39 @@ pub struct HeartbeatArgs {
     /// token refresh flow". This is what teammates see in list_agents.
     #[serde(default)]
     pub activity: Option<String>,
+    /// Discovery label: the logical project this session works on, usually
+    /// the repository name (e.g. "market-data"). One lower-case word. Lets
+    /// teammates find this window with list_sessions, and names the channel
+    /// this session posts to by default. Omit to keep, "" to clear.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Discovery label: what this session does on that project —
+    /// "implementation", "design", "review", … One lower-case word. Several
+    /// sessions may share a role; each keeps its own address. Omit to keep,
+    /// "" to clear.
+    #[serde(default)]
+    pub role: Option<String>,
     /// How long this presence stays valid before you are shown as offline.
     /// Defaults to 600 (10 minutes).
     #[serde(default)]
     pub ttl_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListSessionsArgs {
+    /// Only sessions that published this project label.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Only sessions that published this role label.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Only sessions whose presence has not expired.
+    #[serde(default)]
+    pub online_only: bool,
+    /// Most sessions to return (1-1000, default 200). Narrow with `project`
+    /// or `role` rather than raising it.
+    #[serde(default)]
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -57,6 +86,8 @@ impl Bus {
             repo: args.repo,
             branch: args.branch,
             activity: args.activity,
+            project: args.project,
+            role: args.role,
             ttl_seconds: args.ttl_seconds,
         };
         Ok(Json(presence::heartbeat(&self.db, &auth, input).await?))
@@ -74,6 +105,37 @@ impl Bus {
         let auth = auth_of(&ctx)?;
         Ok(Json(
             presence::list_agents(&self.db, &auth, args.online_only).await?,
+        ))
+    }
+
+    #[tool(
+        description = "Find the exact window to talk to. Lists every session in your team \
+                       with its address (`agent/session`), project and role, so you can \
+                       reach 'the design window of market-data' rather than guessing. \
+                       Filter by project and/or role; several sessions may share both \
+                       (two reviewers), and each keeps its own address — pick one, never \
+                       broadcast a private instruction to all of them. Use the address in \
+                       post_message `to` or ask_agent `to`. Labels are what a session said \
+                       about itself, not proof of anything."
+    )]
+    async fn list_sessions(
+        &self,
+        ctx: RequestContext<rmcp::RoleServer>,
+        Parameters(args): Parameters<ListSessionsArgs>,
+    ) -> Result<Json<SessionList>, ErrorData> {
+        let auth = auth_of(&ctx)?;
+        Ok(Json(
+            presence::list_sessions(
+                &self.db,
+                &auth,
+                presence::SessionFilter {
+                    project: args.project,
+                    role: args.role,
+                    online_only: args.online_only,
+                    limit: args.limit,
+                },
+            )
+            .await?,
         ))
     }
 }

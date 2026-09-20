@@ -145,6 +145,17 @@ pub enum ClientCmd {
         #[arg(long)]
         online: bool,
     },
+    /// Every session in the team with its exact address, project and role.
+    Sessions {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        online: bool,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
     /// Publish your own presence.
     Beat {
         #[arg(long)]
@@ -155,6 +166,11 @@ pub enum ClientCmd {
         branch: Option<String>,
         #[arg(long)]
         activity: Option<String>,
+        /// Discovery labels (see `sessions`). Pass "" to clear.
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
         #[arg(long)]
         ttl_seconds: Option<i64>,
     },

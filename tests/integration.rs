@@ -452,6 +452,7 @@ async fn tools_are_advertised_with_schemas() {
         "get_task",
         "heartbeat",
         "list_agents",
+        "list_sessions",
         "set_note",
         "get_note",
         "list_notes",
@@ -4989,5 +4990,223 @@ async fn local_profiles_resolve_and_verify_against_the_bus() {
     assert!(shown.contains(&fresh.token[..12]));
 
     let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+// -------------------------------------------------------- session discovery --
+
+/// Five windows on one token and one repository — implementation, design, a
+/// Claude reviewer and two Codex reviewers — are discoverable separately by
+/// project and role, keep distinct addresses even when they share both, and
+/// a message to one of them reaches that one alone.
+#[tokio::test]
+async fn sessions_are_discoverable_by_project_and_role_and_addressed_exactly() {
+    let h = require_db!("t_sessions");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    let outsider = seed_agent(&h.pool, "other", "eve").await;
+
+    // Opaque session ids, the way a per-conversation proxy would mint them.
+    let windows = [
+        ("s-1a2b3c4d", "market-data", "implementation"),
+        ("s-5e6f7a8b", "market-data", "design"),
+        ("s-9c0d1e2f", "market-data", "review"),
+        ("s-3a4b5c6d", "market-data", "review"),
+        ("s-7e8f9a0b", "market-data", "review"),
+    ];
+    let mut clients = Vec::new();
+    for (session, project, role) in windows {
+        let c = connect_with_session(&h.base, &token, session).await;
+        let beat = call(
+            &c,
+            "heartbeat",
+            json!({"project": project, "role": role, "repo": "acme/market-data",
+                   "activity": format!("{role} window")}),
+        )
+        .await;
+        assert_eq!(beat["project"], project);
+        assert_eq!(beat["role"], role);
+        clients.push(c);
+    }
+    // A labelled window of another person on another project, and one with
+    // an already expired lease.
+    let dani = connect_with_session(&h.base, &dani_token, "s-dani0001").await;
+    call(
+        &dani,
+        "heartbeat",
+        json!({"project": "core-manager", "role": "implementation"}),
+    )
+    .await;
+    let stale = connect_with_session(&h.base, &token, "s-stale001").await;
+    call(
+        &stale,
+        "heartbeat",
+        json!({"project": "market-data", "role": "review"}),
+    )
+    .await;
+    sqlx::query("UPDATE agent_presence SET expires_at = now() - interval '1 minute' WHERE session = 's-stale001'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    // Labels are validated as labels, not descriptions.
+    let err = call_expect_error(&clients[0], "heartbeat", json!({"role": "code review!"})).await;
+    assert!(err.contains("role"), "{err}");
+
+    // Discovery: by project, by role, by both; every window separately.
+    let all = call(
+        &clients[0],
+        "list_sessions",
+        json!({"project": "market-data"}),
+    )
+    .await;
+    let addresses: Vec<&str> = all["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        addresses.len(),
+        6,
+        "five live windows plus the expired one: {addresses:?}"
+    );
+    for (session, _, _) in windows {
+        assert!(addresses.contains(&format!("joaquin/{session}").as_str()));
+    }
+    assert!(
+        !addresses.iter().any(|a| a.starts_with("dani/")),
+        "other project"
+    );
+    let expired = all["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == "s-stale001")
+        .expect("expired sessions are listed unless online_only");
+    assert_eq!(expired["online"], false);
+    assert_eq!(expired["status"], "offline");
+
+    let reviewers = call(
+        &clients[0],
+        "list_sessions",
+        json!({"project": "market-data", "role": "review", "online_only": true}),
+    )
+    .await;
+    let mut review_addresses: Vec<String> = reviewers["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["address"].as_str().unwrap().to_owned())
+        .collect();
+    review_addresses.sort();
+    assert_eq!(
+        review_addresses,
+        vec![
+            "joaquin/s-3a4b5c6d",
+            "joaquin/s-7e8f9a0b",
+            "joaquin/s-9c0d1e2f"
+        ],
+        "three reviewers share a role and keep three addresses; the expired one is gone"
+    );
+    assert_eq!(reviewers["count"], 3);
+
+    let design = call(&clients[0], "list_sessions", json!({"role": "Design"})).await;
+    assert_eq!(
+        design["sessions"].as_array().unwrap().len(),
+        1,
+        "labels normalise"
+    );
+    assert_eq!(design["sessions"][0]["address"], "joaquin/s-5e6f7a8b");
+
+    // whoami and list_agents carry the labels too.
+    let me = call(&clients[1], "whoami", json!({})).await;
+    assert_eq!(me["project"], "market-data");
+    assert_eq!(me["role"], "design");
+    let roster = call(&clients[0], "list_agents", json!({})).await;
+    let joaquin = roster["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "joaquin")
+        .unwrap();
+    assert!(
+        joaquin["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["role"] == "design"),
+        "{joaquin}"
+    );
+
+    // Exact addressing: a message to the design window reaches only it, and
+    // a sibling's read neither sees it nor moves its cursor.
+    let design_addr = design["sessions"][0]["address"].as_str().unwrap();
+    call(
+        &clients[0],
+        "post_message",
+        json!({"to": design_addr, "body": "the header is wrong on mobile"}),
+    )
+    .await;
+    let sibling = call(&clients[2], "read_messages", json!({"scope": "inbox"})).await;
+    assert!(
+        sibling["messages"].as_array().unwrap().is_empty(),
+        "a reviewer window must not see the design window's DM: {sibling}"
+    );
+    let inbox = call(&clients[1], "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        inbox["messages"][0]["body"],
+        "the header is wrong on mobile"
+    );
+    assert_eq!(inbox["messages"][0]["to_session"], "s-5e6f7a8b");
+    let again = call(&clients[1], "read_messages", json!({"scope": "inbox"})).await;
+    assert!(
+        again["messages"].as_array().unwrap().is_empty(),
+        "read once, cursor moved"
+    );
+    let me = call(&clients[1], "whoami", json!({})).await;
+    assert_eq!(me["unread_direct_messages"], 0);
+
+    // The default channel follows the project label, not the opaque id.
+    call(
+        &clients[0],
+        "create_channel",
+        json!({"name": "market-data"}),
+    )
+    .await;
+    let me = call(&clients[0], "whoami", json!({})).await;
+    assert_eq!(me["default_channel"], "market-data");
+    let posted = call(
+        &clients[0],
+        "post_message",
+        json!({"body": "posted by default"}),
+    )
+    .await;
+    assert_eq!(posted["message"]["channel"], "market-data");
+    // Clearing the project clears the default with it.
+    call(&clients[0], "heartbeat", json!({"project": ""})).await;
+    let me = call(&clients[0], "whoami", json!({})).await;
+    assert!(me["default_channel"].is_null(), "{me}");
+    assert!(me["project"].is_null());
+
+    // Another team sees none of it.
+    let eve = connect_with_session(&h.base, &outsider, "s-eve").await;
+    let theirs = call(&eve, "list_sessions", json!({"project": "market-data"})).await;
+    assert_eq!(theirs["count"], 0);
+    let err = call_expect_error(
+        &eve,
+        "post_message",
+        json!({"to": design_addr, "body": "hi"}),
+    )
+    .await;
+    assert!(err.contains("no agent"), "{err}");
+
+    for c in clients {
+        let _ = c.cancel().await;
+    }
+    for c in [dani, stale, eve] {
+        let _ = c.cancel().await;
+    }
     h.shutdown().await;
 }

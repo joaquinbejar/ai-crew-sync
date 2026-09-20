@@ -151,6 +151,31 @@ pub(super) fn render(cmd: &ClientCmd, value: &Value) -> anyhow::Result<()> {
                 );
             }
         }
+        ClientCmd::Sessions { .. } => {
+            let sessions = value["sessions"].as_array().cloned().unwrap_or_default();
+            if sessions.is_empty() {
+                println!("(no sessions)");
+            }
+            for s in &sessions {
+                let labels = match (s["project"].as_str(), s["role"].as_str()) {
+                    (Some(p), Some(r)) => format!("{p}/{r}"),
+                    (Some(p), None) => p.to_owned(),
+                    (None, Some(r)) => format!("-/{r}"),
+                    _ => "-".to_owned(),
+                };
+                println!(
+                    "{:<36} {:<8} {:<28}{} {}",
+                    field(s, "address"),
+                    field(s, "status"),
+                    labels,
+                    agent_place(s),
+                    field(s, "activity"),
+                );
+            }
+            if value["count"] == value["limit"] {
+                println!("(limit reached: narrow with --project or --role)");
+            }
+        }
         ClientCmd::Agents { .. } => {
             for a in value["agents"].as_array().cloned().unwrap_or_default() {
                 let name = field(&a, "name");

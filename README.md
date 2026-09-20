@@ -56,7 +56,7 @@ Each agent — yours, each teammate's — connects with its own token and can:
 | **Agent↔agent RPC**: ask a teammate and wait for their answer in one call | `ask_agent` |
 | **Attachments**: diffs, logs, small files (≤256 KiB) on messages and tasks | `attach_file`, `get_attachment` (+ `attachments` in `post_message`) |
 | **Generic locks** with TTL over resources ("deploy:staging") | `acquire_lock`, `release_lock`, `list_locks` |
-| Presence (who is on which repo/branch doing what), with each teammate's open sessions under their name | `heartbeat`, `list_agents` |
+| Presence (who is on which repo/branch doing what), with each teammate's open sessions under their name; session discovery by project and role | `heartbeat`, `list_agents`, `list_sessions` |
 | Shared team memory (notes with history) | `set_note`, `get_note`, `list_notes`, `search_notes`, `delete_note` |
 | **Activity digest** of the last N hours | `team_digest` |
 | **Sessions**: one token, one working context per repository | `X-Crew-Session` header (see below) |
@@ -424,6 +424,38 @@ dani                active  Layer-V/core-manager@issue-151       settlements v2
 `online_count` counts *teammates*, not sessions. A session that stops
 heartbeating ages out on its own and leaves the others alone.
 
+#### Finding the right window: `project` and `role`
+
+A session label is good at keeping claims and cursors apart and bad at being
+typed by a person, especially once labels are opaque ids minted per
+conversation. Two optional **discovery labels** on `heartbeat` fix that:
+`project` (the logical project, usually the repository) and `role` (what the
+window does there: `implementation`, `design`, `review`, …). Then:
+
+```
+list_sessions {"project": "market-data", "role": "review", "online_only": true}
+→ {"sessions": [
+     {"agent": "joaquin", "session": "s-9c0d1e2f", "address": "joaquin/s-9c0d1e2f",
+      "project": "market-data", "role": "review", "status": "active", "online": true, …},
+     {"agent": "joaquin", "session": "s-3a4b5c6d", "address": "joaquin/s-3a4b5c6d", …}],
+   "count": 2, "limit": 200}
+```
+
+`address` is exactly what goes in `to` (or `ask_agent`'s `to`). Two reviewers
+share a role and keep two addresses: discovery returns both and the caller
+picks one — nothing is ever routed to "whoever has the role", and a private
+instruction is never broadcast to all of them. Labels are what a session said
+about itself: not identity (that is the token), not a permission, and freely
+shared by several windows. They also drive the default channel: a session that
+declared `project = "market-data"` posts to `#market-data` when it names no
+channel, whatever its session label is; an opaque label that matches no
+channel gets no default rather than a surprising one. Omit a label to keep it,
+send `""` to clear it. `whoami` reports both, and `list_agents` shows them
+under each session.
+
+Console: `ai-crew-sync client sessions --project market-data --role review
+--online`, and `client beat --project market-data --role design`.
+
 The top-level `activity`/`repo`/`branch` summarise **one** of a teammate's
 sessions, chosen in this order: a **live** session before a dead one, a
 **named** session before the shared one, then the most recently updated.
@@ -609,6 +641,7 @@ ai-crew-sync client send --channel deploys --body "staging is on 1.4.2"
 ai-crew-sync client send --to marta --body "look at PR 421"
 ai-crew-sync client read --scope inbox
 ai-crew-sync client agents
+ai-crew-sync client sessions --project market-data --role review   # exact addresses
 ai-crew-sync client task create refactor-auth --title "Rewrite token refresh"
 ai-crew-sync client task create update-clients --title "Update clients" \
     --depends-on refactor-auth              # pipeline: blocked until the 1st is done
