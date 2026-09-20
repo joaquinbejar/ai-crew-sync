@@ -191,6 +191,12 @@ pub fn build_router(pool: PgPool, opts: &ServeOptions, ct: CancellationToken) ->
         .route("/health", get(health))
         .merge(dashboard_routes)
         .merge(mcp_routes)
+        // Administration is its own surface with its own credential class,
+        // its own rate limit and no MCP: see `admin_api`.
+        .nest(
+            "/admin",
+            crate::admin_api::router(pool.clone(), opts.rate_limit_per_minute),
+        )
         // Record the method and path only. The default span records the whole
         // URI, which is how a credential in a query string reaches the logs —
         // the dashboard no longer accepts one, and the logs no longer invite it.

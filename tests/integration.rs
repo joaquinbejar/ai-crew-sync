@@ -4117,3 +4117,503 @@ async fn concurrent_revocations_produce_one_transition_and_one_audit_row() {
 
     h.shutdown().await;
 }
+
+// ------------------------------------------------------- /admin HTTP surface --
+
+/// Minimal client for `/admin/*`: a bearer, a method, a path, a JSON body.
+struct Admin {
+    http: reqwest::Client,
+    base: String,
+    token: String,
+}
+
+impl Admin {
+    fn new(base: &str, token: &str) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base: base.to_owned(),
+            token: token.to_owned(),
+        }
+    }
+
+    async fn req(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
+        let mut r = self
+            .http
+            .request(method, format!("{}/admin{path}", self.base))
+            .header("Authorization", format!("Bearer {}", self.token));
+        if let Some(body) = body {
+            r = r.json(&body);
+        }
+        let resp = r.send().await.unwrap();
+        let status = resp.status().as_u16();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    async fn get(&self, path: &str) -> (u16, Value) {
+        self.req(reqwest::Method::GET, path, None).await
+    }
+    async fn post(&self, path: &str, body: Value) -> (u16, Value) {
+        self.req(reqwest::Method::POST, path, Some(body)).await
+    }
+    async fn delete(&self, path: &str) -> (u16, Value) {
+        self.req(reqwest::Method::DELETE, path, None).await
+    }
+}
+
+/// A raw `tools/list` on `/mcp` with a bearer, for status checks only.
+async fn mcp_status(base: &str, token: &str) -> u16 {
+    reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn admin_api_refuses_everything_but_an_administrative_credential() {
+    let h = require_db!("t_admin_auth");
+    let agent_token = seed_agent(&h.pool, "acme", "joaquin").await;
+
+    // No bearer at all.
+    let (status, body) = Admin::new(&h.base, "").get("/whoami").await;
+    assert_eq!(status, 401);
+    assert!(
+        body["error"].as_str().unwrap().contains("bootstrap"),
+        "{body}"
+    );
+
+    // An agent token: refused, and told what to use instead.
+    let (status, body) = Admin::new(&h.base, &agent_token).get("/whoami").await;
+    assert_eq!(status, 401, "an agent token never administers");
+    assert!(
+        body["error"].as_str().unwrap().contains("agent token"),
+        "{body}"
+    );
+    // ...on every route, including the ones that mint.
+    let agent = Admin::new(&h.base, &agent_token);
+    assert_eq!(
+        agent
+            .post("/teams/acme/tokens", json!({"agent": "joaquin"}))
+            .await
+            .0,
+        401,
+        "an agent token cannot mint a token, not even for its own agent"
+    );
+    assert_eq!(agent.post("/credentials", json!({})).await.0, 401);
+
+    // A well-formed but unknown credential.
+    let (status, _) = Admin::new(&h.base, "acsa_deadbeef").get("/whoami").await;
+    assert_eq!(status, 401);
+
+    // And an administrative credential is not an agent token on /mcp.
+    let global = ai_crew_sync::store::admin::grant_admin(
+        &h.pool,
+        ai_crew_sync::store::admin::Actor::Cli,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_status(&h.base, &global.token).await, 401);
+    let (status, body) = Admin::new(&h.base, &global.token).get("/whoami").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["scope"], "global");
+    assert!(body["team"].is_null());
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_api_global_credential_runs_the_whole_onboarding_remotely() {
+    let h = require_db!("t_admin_global");
+    let bootstrap = ai_crew_sync::store::admin::grant_admin(
+        &h.pool,
+        ai_crew_sync::store::admin::Actor::Cli,
+        None,
+        Some("laptop".into()),
+    )
+    .await
+    .unwrap();
+    let admin = Admin::new(&h.base, &bootstrap.token);
+
+    let (status, body) = admin
+        .post("/teams", json!({"slug": "RoundCrew", "name": "RoundCrew"}))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["team"]["slug"], "roundcrew", "slugs are normalised");
+
+    let (status, body) = admin
+        .post(
+            "/teams/roundcrew/agents",
+            json!({"name": "backend", "display_name": "RoundCrew backend"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["agent"]["name"], "backend");
+
+    let (status, body) = admin
+        .post(
+            "/teams/roundcrew/tokens",
+            json!({"agent": "backend", "label": "sesion backend"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let token = body["token"]["token"].as_str().unwrap().to_owned();
+    let token_id = body["token"]["id"].as_str().unwrap().to_owned();
+    assert!(token.starts_with("acs_"));
+    assert_eq!(body["token"]["agent"], "backend");
+    assert_eq!(body["token"]["team"], "roundcrew");
+    assert_eq!(body["token"]["label"], "sesion backend");
+
+    // The property that matters: the token IS that agent in that team on /mcp.
+    let client = connect(&h.base, &token).await;
+    let me = call(&client, "whoami", json!({})).await;
+    assert_eq!(me["agent"], "backend");
+    assert_eq!(me["team"], "roundcrew");
+    let _ = client.cancel().await;
+
+    // Listings show it without the secret.
+    let (_, body) = admin.get("/teams/roundcrew/tokens").await;
+    let listed = &body["tokens"][0];
+    assert_eq!(listed["id"], token_id);
+    assert!(
+        listed.get("token").is_none(),
+        "a listing never carries a secret"
+    );
+    assert_eq!(listed["prefix"], &token[..12]);
+    let (_, body) = admin.get("/teams").await;
+    assert_eq!(body["teams"][0]["agents"], 1);
+
+    // Unknown things are 404 with a hint, bad input 400.
+    assert_eq!(
+        admin
+            .post("/teams/nope/agents", json!({"name": "x"}))
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        admin
+            .post("/teams/roundcrew/tokens", json!({"agent": "ghost"}))
+            .await
+            .0,
+        404
+    );
+    let (status, body) = admin
+        .post("/teams/roundcrew/agents", json!({"name": "has space"}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    // Extractor rejections wear the same JSON shape as every other error.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/admin/teams/roundcrew/agents", h.base))
+        .header("Authorization", format!("Bearer {}", bootstrap.token))
+        .header("Content-Type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.expect("a JSON error body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON body"),
+        "{body}"
+    );
+    let (status, body) = admin.delete("/teams/roundcrew/tokens/not-a-uuid").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("path parameter"),
+        "{body}"
+    );
+    let (status, body) = admin.post("/credentials", json!({"team": ""})).await;
+    assert_eq!(
+        status, 400,
+        "an empty team is a mistake, not a global grant: {body}"
+    );
+
+    // Revocation stops the token on /mcp immediately.
+    let (status, _) = admin
+        .delete(&format!("/teams/roundcrew/tokens/{token_id}"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(mcp_status(&h.base, &token).await, 401);
+
+    // Granting: a team credential, then a second global one; each works on
+    // /admin/whoami with the right scope, and revoking cuts it off.
+    let (status, body) = admin
+        .post(
+            "/credentials",
+            json!({"team": "roundcrew", "label": "dani"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let team_cred = body["credential"]["token"].as_str().unwrap().to_owned();
+    let team_cred_id = body["credential"]["id"].as_str().unwrap().to_owned();
+    assert!(team_cred.starts_with("acsa_"));
+    let (_, body) = Admin::new(&h.base, &team_cred).get("/whoami").await;
+    assert_eq!(body["scope"], "team");
+    assert_eq!(body["team"], "roundcrew");
+
+    let (status, body) = admin.post("/credentials", json!({})).await;
+    assert_eq!(status, 201, "{body}");
+    assert!(body["credential"]["team"].is_null(), "no team means global");
+
+    let (_, body) = admin.get("/credentials").await;
+    assert_eq!(body["credentials"].as_array().unwrap().len(), 3);
+    assert!(
+        body["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c.get("token").is_none()),
+        "listings never carry a secret"
+    );
+
+    let (status, _) = admin.delete(&format!("/credentials/{team_cred_id}")).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        Admin::new(&h.base, &team_cred).get("/whoami").await.0,
+        401,
+        "a revoked credential stops authorising at once"
+    );
+
+    // Audit: http rows name the credential that acted, and hold no secret.
+    let rows: Vec<(String, Option<Uuid>, String, Value)> = sqlx::query_as(
+        "SELECT actor_source, actor_admin_id, action, detail FROM admin_audit
+         WHERE actor_source = 'http' ORDER BY id",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    let actions: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec![
+            "team.create",
+            "agent.create",
+            "token.issue",
+            "token.revoke",
+            "admin.grant",
+            "admin.grant",
+            "admin.revoke",
+        ]
+    );
+    assert!(rows.iter().all(|r| r.1 == Some(bootstrap.id)));
+    let dump = serde_json::to_string(&rows.iter().map(|r| &r.3).collect::<Vec<_>>()).unwrap();
+    assert!(!dump.contains(&token[5..]));
+    assert!(!dump.contains(&team_cred[5..]));
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_api_team_credential_cannot_leave_its_team_by_any_route() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_admin_team");
+    let acme = store::create_team(&h.pool, Actor::Cli, "acme", None)
+        .await
+        .unwrap();
+    let other = store::create_team(&h.pool, Actor::Cli, "other", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, acme.id, "joaquin", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, other.id, "marta", None)
+        .await
+        .unwrap();
+    let foreign = store::issue_token(&h.pool, Actor::Cli, other.id, "marta", None)
+        .await
+        .unwrap();
+    let global = store::grant_admin(&h.pool, Actor::Cli, None, None)
+        .await
+        .unwrap();
+    let scoped = store::grant_admin(&h.pool, Actor::Cli, Some(acme.id), None)
+        .await
+        .unwrap();
+    let dani = Admin::new(&h.base, &scoped.token);
+
+    // Inside its team: everything a global credential can do there.
+    let (status, body) = dani
+        .post("/teams/acme/agents", json!({"name": "dani-codex"}))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = dani
+        .post(
+            "/teams/acme/tokens",
+            json!({"agent": "dani-codex", "label": "x"}),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let mine = body["token"]["token"].as_str().unwrap().to_owned();
+    let mine_id = body["token"]["id"].as_str().unwrap().to_owned();
+    let client = connect(&h.base, &mine).await;
+    let me = call(&client, "whoami", json!({})).await;
+    assert_eq!(
+        (me["agent"].as_str(), me["team"].as_str()),
+        (Some("dani-codex"), Some("acme"))
+    );
+    let _ = client.cancel().await;
+
+    // By slug: another team is forbidden, existing or not, same answer.
+    for path in [
+        "/teams/other/agents",
+        "/teams/other/tokens",
+        "/teams/nope/tokens",
+    ] {
+        let (status, body) = dani.get(path).await;
+        assert_eq!(status, 403, "{path}: {body}");
+        assert!(body["error"].as_str().unwrap().contains("'acme'"), "{body}");
+    }
+    assert_eq!(
+        dani.post("/teams/other/tokens", json!({"agent": "marta"}))
+            .await
+            .0,
+        403
+    );
+    // By UUID: a foreign token under its own team's path is simply not found.
+    let (status, _) = dani
+        .delete(&format!("/teams/acme/tokens/{}", foreign.id))
+        .await;
+    assert_eq!(status, 404);
+    assert_eq!(
+        mcp_status(&h.base, &foreign.token).await,
+        200,
+        "and untouched"
+    );
+    // Nor can a global credential revoke it through the wrong team's path.
+    let (status, _) = Admin::new(&h.base, &global.token)
+        .delete(&format!("/teams/acme/tokens/{}", foreign.id))
+        .await;
+    assert_eq!(status, 404);
+
+    // Global-only actions: create teams, grant credentials.
+    let (status, body) = dani.post("/teams", json!({"slug": "mine"})).await;
+    assert_eq!(status, 403, "{body}");
+    let (status, body) = dani.post("/credentials", json!({"team": "acme"})).await;
+    assert_eq!(status, 403, "{body}");
+    let (status, _) = dani.post("/credentials", json!({})).await;
+    assert_eq!(status, 403, "nor a global one");
+    assert_eq!(
+        store::list_admins(&h.pool, None).await.unwrap().len(),
+        2,
+        "nothing was granted"
+    );
+
+    // The team roster it sees is exactly its own team.
+    let (_, body) = dani.get("/teams").await;
+    assert_eq!(body["teams"].as_array().unwrap().len(), 1);
+    assert_eq!(body["teams"][0]["slug"], "acme");
+    let (_, body) = dani.get("/credentials").await;
+    assert_eq!(body["credentials"].as_array().unwrap().len(), 1);
+    assert_eq!(body["credentials"][0]["id"], scoped.id.to_string());
+
+    // It cannot revoke the global credential, and can revoke its own team's
+    // tokens and — last — itself.
+    let (status, _) = dani.delete(&format!("/credentials/{}", global.id)).await;
+    assert_eq!(status, 404);
+    assert_eq!(
+        Admin::new(&h.base, &global.token).get("/whoami").await.0,
+        200
+    );
+    assert_eq!(
+        dani.delete(&format!("/teams/acme/tokens/{mine_id}"))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(mcp_status(&h.base, &mine).await, 401);
+    assert_eq!(
+        dani.delete(&format!("/credentials/{}", scoped.id)).await.0,
+        200
+    );
+    assert_eq!(dani.get("/whoami").await.0, 401);
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_api_caps_active_tokens_per_agent() {
+    use ai_crew_sync::store::admin::{self as store, Actor, MAX_ACTIVE_TOKENS_PER_AGENT};
+
+    let h = require_db!("t_admin_cap");
+    let acme = store::create_team(&h.pool, Actor::Cli, "acme", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, acme.id, "bot", None)
+        .await
+        .unwrap();
+    for _ in 0..MAX_ACTIVE_TOKENS_PER_AGENT {
+        store::issue_token(&h.pool, Actor::Cli, acme.id, "bot", None)
+            .await
+            .unwrap();
+    }
+    let global = store::grant_admin(&h.pool, Actor::Cli, None, None)
+        .await
+        .unwrap();
+    let admin = Admin::new(&h.base, &global.token);
+    let (status, body) = admin
+        .post("/teams/acme/tokens", json!({"agent": "bot"}))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("Revoke"), "{body}");
+
+    // Revoking one frees a slot.
+    let (_, body) = admin.get("/teams/acme/tokens").await;
+    let some_id = body["tokens"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        admin
+            .delete(&format!("/teams/acme/tokens/{some_id}"))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        admin
+            .post("/teams/acme/tokens", json!({"agent": "bot"}))
+            .await
+            .0,
+        201
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_api_has_its_own_lower_rate_limit() {
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    // 200/min on MCP means 20/min on /admin, with a burst of 10.
+    let Some(h) = setup_rate_limited("t_admin_rl", 200).await else {
+        assert!(!db_required());
+        return;
+    };
+    let global = store::grant_admin(&h.pool, Actor::Cli, None, None)
+        .await
+        .unwrap();
+    let admin = Admin::new(&h.base, &global.token);
+    let mut throttled = None;
+    for _ in 0..30 {
+        let (status, body) = admin.get("/whoami").await;
+        if status == 429 {
+            throttled = Some(body);
+            break;
+        }
+    }
+    let body = throttled.expect("the admin bucket must run out well before the MCP one would");
+    assert!(
+        body["error"].as_str().unwrap().contains("retry in"),
+        "{body}"
+    );
+
+    h.shutdown().await;
+}

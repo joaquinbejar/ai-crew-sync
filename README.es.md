@@ -593,6 +593,54 @@ ai-crew-sync client call get_task --args '{"key":"refactor-auth"}'   # escape ha
 
 Todos los subcomandos aceptan `--json` para salida cruda (pipeable a `jq`).
 
+## Administración remota (`/admin/*`)
+
+Con una credencial global creada (`admin bootstrap`, más arriba), todo lo
+demás es una API JSON en el propio bus: sin SSH, sin `docker exec`, sin
+conexión a la base de datos. A propósito **no** es MCP: la administración
+nunca aparece en el catálogo de tools de un agente, y un token de agente
+presentado aquí se rechaza con un mensaje que dice qué usar en su lugar.
+
+```bash
+export ADMIN=acsa_...
+B=https://bus.tu-empresa.com
+
+curl -s $B/admin/whoami -H "Authorization: Bearer $ADMIN"
+curl -s $B/admin/teams -H "Authorization: Bearer $ADMIN" \
+     -H "Content-Type: application/json" -d '{"slug":"roundcrew","name":"RoundCrew"}'
+curl -s $B/admin/teams/roundcrew/agents -H "Authorization: Bearer $ADMIN" \
+     -H "Content-Type: application/json" -d '{"name":"backend"}'
+curl -s $B/admin/teams/roundcrew/tokens -H "Authorization: Bearer $ADMIN" \
+     -H "Content-Type: application/json" -d '{"agent":"backend","label":"repo backend"}'
+     # → {"token":{"id":"…","token":"acs_…","agent":"backend","team":"roundcrew",…}}  (el secreto, una sola vez)
+curl -s $B/admin/teams/roundcrew/tokens -H "Authorization: Bearer $ADMIN"           # listado, sin secretos
+curl -s -X DELETE $B/admin/teams/roundcrew/tokens/<id> -H "Authorization: Bearer $ADMIN"
+curl -s $B/admin/credentials -H "Authorization: Bearer $ADMIN" \
+     -H "Content-Type: application/json" -d '{"team":"roundcrew","label":"dani"}'   # administrador de equipo
+curl -s -X DELETE $B/admin/credentials/<id> -H "Authorization: Bearer $ADMIN"
+```
+
+| Ruta | Global | Credencial de equipo |
+|------|--------|----------------------|
+| `GET /admin/whoami` | ✓ | ✓ (su ámbito) |
+| `GET/POST /admin/teams` | ✓ | ve solo su equipo; no puede crear |
+| `GET/POST /admin/teams/{team}/agents` | ✓ | ✓ dentro de su equipo |
+| `GET/POST /admin/teams/{team}/tokens` | ✓ | ✓ dentro de su equipo |
+| `DELETE /admin/teams/{team}/tokens/{id}` | ✓ | ✓ dentro de su equipo |
+| `GET/POST /admin/credentials` | ✓ | lista las de su equipo; no puede conceder |
+| `DELETE /admin/credentials/{id}` | ✓ | solo las de su equipo |
+
+Cada comprobación la hace el servidor a partir de la credencial y nada más.
+Una credencial de equipo que pide otro equipo recibe `403`, exista o no ese
+equipo; un id de token de otro equipo es `404`; el cuerpo de la petición
+nunca amplía el ámbito. Cada emisión, concesión y revocación queda auditada
+con la credencial que actuó, y la única respuesta que contiene un secreto es
+la que lo emite.
+
+Dos techos: `/admin` funciona a una décima parte de `BUS_RATE_LIMIT_PER_MINUTE`,
+y un agente puede tener como máximo 100 tokens activos (revoca antes los que no
+uses).
+
 ## Webhooks salientes (puente a humanos)
 
 El bus puede avisar a Slack/Discord (o a cualquier endpoint JSON) cuando pasan
