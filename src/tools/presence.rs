@@ -109,14 +109,17 @@ impl Bus {
     }
 
     #[tool(
-        description = "Find the exact window to talk to. Lists every session in your team \
+        description = "Find the window to talk to. Lists every session in your team \
                        with its address (`agent/session`), project and role, so you can \
                        reach 'the design window of market-data' rather than guessing. \
                        Filter by project and/or role; several sessions may share both \
                        (two reviewers), and each keeps its own address — pick one, never \
                        broadcast a private instruction to all of them. Use the address in \
-                       post_message `to` or ask_agent `to`. Labels are what a session said \
-                       about itself, not proof of anything."
+                       post_message `to` or ask_agent `to`. CHECK `exact` FIRST: it is \
+                       false for the shared session, whose address is the bare agent name \
+                       and reaches EVERY window that agent has, so it is never a private \
+                       target. Labels are what a session said about itself, not proof of \
+                       anything."
     )]
     async fn list_sessions(
         &self,

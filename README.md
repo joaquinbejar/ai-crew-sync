@@ -441,8 +441,12 @@ list_sessions {"project": "market-data", "role": "review", "online_only": true}
    "count": 2, "limit": 200}
 ```
 
-`address` is exactly what goes in `to` (or `ask_agent`'s `to`). Two reviewers
-share a role and keep two addresses: discovery returns both and the caller
+`address` is what goes in `to` (or `ask_agent`'s `to`), and **`exact` says
+whether it reaches one window**. It is `true` for a named session and `false`
+for the shared one, whose address is the bare agent name: that reaches *every*
+window of that agent, named ones included, so it is never a private target and
+there is no address that reaches the shared session alone. Two reviewers share
+a role and keep two exact addresses: discovery returns both and the caller
 picks one — nothing is ever routed to "whoever has the role", and a private
 instruction is never broadcast to all of them. Labels are what a session said
 about itself: not identity (that is the token), not a permission, and freely

@@ -123,10 +123,16 @@ pub struct SessionEntry {
     /// Absent for the shared session.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub session: Option<String>,
-    /// Exactly what to put in `to` (or `ask_agent`'s `to`) to reach this
-    /// window and no other: `agent/session`, or just `agent` for the shared
-    /// session.
+    /// What to put in `to` (or `ask_agent`'s `to`) to reach this session.
+    /// `agent/session` for a named one; the bare `agent` for the shared
+    /// session — and see `exact` before treating that as private.
     pub address: String,
+    /// True when `address` reaches **this window and no other**. False for
+    /// the shared session, whose address is the bare agent name: that is a
+    /// broadcast to every window of that agent, named ones included, so it
+    /// is the wrong place to send a private instruction. There is no address
+    /// that reaches the shared session alone.
+    pub exact: bool,
     pub project: Option<String>,
     pub role: Option<String>,
     pub repo: Option<String>,

@@ -483,13 +483,19 @@ pub async fn list_sessions(
                 updated_at,
                 online,
             )| {
-                let address = if session.is_empty() {
-                    agent.clone()
-                } else {
+                // The shared session has no address of its own: the bare
+                // `agent` reaches every window that agent has. Reported
+                // as-is, because the row is real presence, and flagged, so a
+                // caller cannot mistake it for a private target.
+                let exact = !session.is_empty();
+                let address = if exact {
                     format!("{agent}/{session}")
+                } else {
+                    agent.clone()
                 };
                 SessionEntry {
                     address,
+                    exact,
                     session: (!session.is_empty()).then_some(session),
                     agent,
                     project,

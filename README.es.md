@@ -449,10 +449,14 @@ list_sessions {"project": "market-data", "role": "review", "online_only": true}
    "count": 2, "limit": 200}
 ```
 
-`address` es exactamente lo que va en `to` (o en el `to` de `ask_agent`). Dos
-revisores comparten rol y conservan dos direcciones: el descubrimiento
-devuelve ambas y quien llama elige una; nunca se enruta nada a "quien tenga el
-rol", ni se difunde una instrucción privada a todos. Las etiquetas son lo que
+`address` es lo que va en `to` (o en el `to` de `ask_agent`), y **`exact` dice
+si llega a una sola ventana**. Es `true` para una sesión con nombre y `false`
+para la compartida, cuya dirección es el nombre pelado del agente: eso llega a
+*todas* sus ventanas, incluidas las nombradas, así que nunca es un destino
+privado y no existe ninguna dirección que llegue solo a la sesión compartida.
+Dos revisores comparten rol y conservan dos direcciones exactas: el
+descubrimiento devuelve ambas y quien llama elige una; nunca se enruta nada a
+"quien tenga el rol", ni se difunde una instrucción privada a todos. Las etiquetas son lo que
 una sesión dijo de sí misma: no son identidad (eso es el token), no son un
 permiso, y varias ventanas pueden compartirlas. También fijan el canal por
 defecto: una sesión que declaró `project = "market-data"` publica en

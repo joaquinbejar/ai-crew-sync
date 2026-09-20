@@ -5197,6 +5197,72 @@ async fn sessions_are_discoverable_by_project_and_role_and_addressed_exactly() {
     assert!(me["default_channel"].is_null(), "{me}");
     assert!(me["project"].is_null());
 
+    // A shared session mixed with named ones: it is listed, because it is
+    // real presence, and it is NOT an exact address. Sending to the bare
+    // agent name reaches every window of that agent, which is exactly why
+    // `exact` is false — a caller that reads it cannot broadcast a private
+    // instruction by accident.
+    let shared = connect(&h.base, &dani_token).await;
+    call(
+        &shared,
+        "heartbeat",
+        json!({"project": "core-manager", "role": "design"}),
+    )
+    .await;
+    let mixed = call(
+        &clients[0],
+        "list_sessions",
+        json!({"project": "core-manager", "online_only": true}),
+    )
+    .await;
+    let rows = mixed["sessions"].as_array().unwrap();
+    let shared_row = rows
+        .iter()
+        .find(|s| s["session"].is_null())
+        .expect("the shared session is listed");
+    assert_eq!(shared_row["address"], "dani");
+    assert_eq!(
+        shared_row["exact"], false,
+        "a bare agent name is not one window"
+    );
+    let named_row = rows
+        .iter()
+        .find(|s| s["session"] == "s-dani0001")
+        .expect("the named session is listed");
+    assert_eq!(named_row["address"], "dani/s-dani0001");
+    assert_eq!(named_row["exact"], true);
+
+    // Prove the warning: a message to the shared row's address lands in the
+    // named window's inbox too.
+    call(
+        &clients[0],
+        "post_message",
+        json!({"to": shared_row["address"], "body": "for dani"}),
+    )
+    .await;
+    let named_inbox = call(&dani, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(
+        named_inbox["messages"][0]["body"], "for dani",
+        "the bare name reached the named window as well: {named_inbox}"
+    );
+    // The exact address of a named window reaches only it.
+    call(
+        &clients[0],
+        "post_message",
+        json!({"to": "dani/s-dani0001", "body": "only the named one"}),
+    )
+    .await;
+    let shared_inbox = call(&shared, "read_messages", json!({"scope": "inbox"})).await;
+    assert!(
+        shared_inbox["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["body"] != "only the named one"),
+        "an exact address must not reach the shared session: {shared_inbox}"
+    );
+    let _ = shared.cancel().await;
+
     // Another team sees none of it.
     let eve = connect_with_session(&h.base, &outsider, "s-eve").await;
     let theirs = call(&eve, "list_sessions", json!({"project": "market-data"})).await;
