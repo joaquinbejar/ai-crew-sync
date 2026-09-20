@@ -26,13 +26,26 @@ use serde_json::{Value, json};
 
 #[derive(Args)]
 pub struct ClientArgs {
-    /// URL of the bus MCP endpoint, e.g. https://bus.example.com/mcp
-    #[arg(long, env = "BUS_URL", default_value = "http://localhost:8787/mcp")]
-    pub url: String,
+    /// URL of the bus MCP endpoint, e.g. https://bus.example.com/mcp. Omit
+    /// it to take the endpoint from the selected profile.
+    #[arg(long, env = "BUS_URL")]
+    pub url: Option<String>,
 
-    /// Your agent token (issued with `ai-crew-sync token issue`).
+    /// Your agent token (issued with `ai-crew-sync token issue`). Omit it to
+    /// use a local profile: `--profile`, the project's .acs.toml, or the
+    /// user default (see `ai-crew-sync context show`).
     #[arg(long, env = "BUS_TOKEN", hide_env_values = true)]
-    pub token: String,
+    pub token: Option<String>,
+
+    /// Connect with this local profile (from `context profile add`).
+    /// Ignored when --token is given.
+    #[arg(long, env = "BUS_PROFILE")]
+    pub profile: Option<String>,
+
+    /// Directory whose project defaults (.acs.toml) apply; the current
+    /// directory by default.
+    #[arg(long, env = "BUS_PROJECT_DIR")]
+    pub project_dir: Option<std::path::PathBuf>,
 
     /// Which working context this is — usually the repository name. Separates
     /// your presence, task claims and locks from your other sessions. Omit it
@@ -286,10 +299,20 @@ use mapping::to_call;
 use render::render;
 
 pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
-    let mut config = StreamableHttpClientTransportConfig::with_uri(args.url.clone());
-    config.auth_header = Some(args.token.clone());
+    // Where to connect and as whom: explicit flags first, then the local
+    // profiles and the project's defaults. `context` owns the order.
+    let resolved = crate::context::resolve(&crate::context::Inputs {
+        config_dir: crate::context::config_dir()?,
+        explicit_url: args.url.clone(),
+        explicit_token: args.token.clone(),
+        explicit_session: args.session.clone(),
+        profile: args.profile.clone(),
+        project_dir: args.project_dir.clone(),
+    })?;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(resolved.mcp_url.clone());
+    config.auth_header = Some(resolved.token.clone());
     config.allow_stateless = true;
-    if let Some(session) = args
+    if let Some(session) = resolved
         .session
         .as_deref()
         .map(str::trim)

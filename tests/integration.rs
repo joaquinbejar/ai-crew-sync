@@ -4825,3 +4825,133 @@ async fn admin_cli_runs_the_remote_flow_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
 }
+
+// ------------------------------------------------------------ local context --
+
+/// The resolver against a real bus: a profile plus a token file yields a
+/// verified identity with no BUS_TOKEN anywhere; the wrong token behind the
+/// right profile, and a revoked one, are refused with a reason.
+#[tokio::test]
+async fn local_profiles_resolve_and_verify_against_the_bus() {
+    use ai_crew_sync::context::{self, Inputs, Profile, Profiles, Source};
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_context");
+    let dir = std::env::temp_dir().join(format!("acs-context-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let acme = store::create_team(&h.pool, Actor::Cli, "acme", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, acme.id, "joaquin", None)
+        .await
+        .unwrap();
+    store::create_agent(&h.pool, Actor::Cli, acme.id, "marta", None)
+        .await
+        .unwrap();
+    let mine = store::issue_token(&h.pool, Actor::Cli, acme.id, "joaquin", None)
+        .await
+        .unwrap();
+    let hers = store::issue_token(&h.pool, Actor::Cli, acme.id, "marta", None)
+        .await
+        .unwrap();
+
+    context::save_profiles(
+        &dir,
+        &Profiles {
+            default: None,
+            profiles: std::collections::BTreeMap::from([(
+                "acme".to_owned(),
+                Profile {
+                    url: h.base.clone(),
+                    team: "acme".into(),
+                    agent: "joaquin".into(),
+                    tokens: "tokens-acme".into(),
+                    key: None,
+                },
+            )]),
+        },
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tokens-acme"),
+        format!("_base={}\nstolen={}\n", mine.token, hers.token),
+    )
+    .unwrap();
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(context::PROJECT_FILE),
+        "profile = \"acme\"\nproject = \"api\"\nchannel = \"api\"\n",
+    )
+    .unwrap();
+
+    // Two windows in the same repository, no environment: both resolve the
+    // project's profile, and each may pick a different entry without
+    // touching the file the other reads.
+    let base = Inputs {
+        config_dir: dir.clone(),
+        project_dir: Some(repo.clone()),
+        ..Default::default()
+    };
+    let r = context::resolve(&base).unwrap();
+    assert_eq!(r.source, Source::ProjectDefault);
+    assert_eq!(
+        r.token_key.as_deref(),
+        Some("_base"),
+        "no 'api' entry, so _base"
+    );
+    assert_eq!(r.project.as_deref(), Some("api"));
+    let v = context::verify(&r).await.unwrap();
+    assert_eq!((v.agent.as_str(), v.team.as_str()), ("joaquin", "acme"));
+
+    // The right profile over someone else's token: refused, with the entry
+    // named, and the project file untouched.
+    let before = std::fs::read_to_string(repo.join(context::PROJECT_FILE)).unwrap();
+    std::fs::write(
+        repo.join(context::PROJECT_FILE),
+        "profile = \"acme\"\nproject = \"api\"\nkey = \"stolen\"\n",
+    )
+    .unwrap();
+    let r = context::resolve(&base).unwrap();
+    assert_eq!(r.token_key.as_deref(), Some("stolen"));
+    let err = format!("{:#}", context::verify(&r).await.unwrap_err());
+    assert!(err.contains("expects joaquin@acme"), "{err}");
+    assert!(err.contains("marta@acme"), "{err}");
+    assert!(err.contains("'stolen'"), "{err}");
+    std::fs::write(repo.join(context::PROJECT_FILE), before).unwrap();
+
+    // A revoked token is reported as such, pointing at the entry to replace.
+    store::revoke_token(&h.pool, Actor::Cli, None, mine.id)
+        .await
+        .unwrap();
+    let r = context::resolve(&base).unwrap();
+    let err = format!("{:#}", context::verify(&r).await.unwrap_err());
+    assert!(err.contains("did not accept the token"), "{err}");
+    assert!(err.contains("'_base'"), "{err}");
+    assert!(err.contains("admin token issue"), "{err}");
+
+    // Explicit credentials still work exactly as before, and are not
+    // checked against any profile.
+    let fresh = store::issue_token(&h.pool, Actor::Cli, acme.id, "marta", None)
+        .await
+        .unwrap();
+    let explicit = Inputs {
+        explicit_url: Some(format!("{}/mcp", h.base)),
+        explicit_token: Some(fresh.token.clone()),
+        ..base.clone()
+    };
+    let r = context::resolve(&explicit).unwrap();
+    assert_eq!(r.source, Source::Explicit);
+    assert!(r.expected.is_none());
+    let v = context::verify(&r).await.unwrap();
+    assert_eq!(v.agent, "marta");
+
+    // The secret never appears in the redacted view.
+    let shown = serde_json::to_string(&r.redacted()).unwrap();
+    assert!(!shown.contains(&fresh.token[5..]));
+    assert!(shown.contains(&fresh.token[..12]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
