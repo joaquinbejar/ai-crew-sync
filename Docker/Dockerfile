@@ -2,7 +2,7 @@
 # Alpine, so the binary links against musl and is fully static. That is what
 # lets the runtime stage be a bare Alpine rather than a distribution that has
 # to match this one's libc.
-FROM rust:1.97.1-alpine3.24 AS build
+FROM rust:1.98.1-alpine3.24 AS build
 WORKDIR /app
 
 # musl-dev provides the C toolchain the ring/rustls build scripts need; the
