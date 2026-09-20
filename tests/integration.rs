@@ -5702,3 +5702,250 @@ async fn proxy_switches_profiles_only_after_verification_and_never_across_teams(
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
 }
+
+// ------------------------------------------------- host integration (#86) --
+
+/// Run a plugin hook script the way a host would: payload on stdin, the
+/// repository as cwd, and only the environment a hook actually gets. No
+/// BUS_TOKEN, no BUS_SESSION — everything is resolved from the profiles and
+/// the conversation id in the payload.
+fn run_hook(
+    script: &str,
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    payload: &str,
+    extra_args: &[&str],
+) -> String {
+    use std::io::Write;
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("plugin/scripts")
+        .join(script);
+    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_ai-crew-sync"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = std::process::Command::new("sh")
+        .arg(&script)
+        .args(extra_args)
+        .current_dir(project_dir)
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("TMPDIR", config_dir)
+        .env("BUS_CONFIG_DIR", config_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("hook finished");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The workflow the whole stack exists for: five conversations in one
+/// repository, on one token, with no per-window export and no new token —
+/// implementation, design, a Claude review and two Codex reviews. They find
+/// each other, send targeted corrections, and each window's hooks act on its
+/// own session only.
+#[tokio::test]
+async fn five_conversations_share_a_repo_and_stay_separate() {
+    let h = require_db!("t_host_integration");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".acs.toml"),
+        "profile = \"acme\"\nproject = \"market-data\"\nchannel = \"market-data\"\n",
+    )
+    .unwrap();
+
+    // Five windows. Two hosts that expose a conversation id (Claude Code's
+    // variable and an explicit flag), and three that expose none.
+    let windows = [
+        ("impl", "implementation", Some("conv-impl")),
+        ("design", "design", Some("conv-design")),
+        ("claude-review", "review", None),
+        ("codex-review-1", "review", None),
+        ("codex-review-2", "review", None),
+    ];
+    let mut clients = Vec::new();
+    let mut ids = Vec::new();
+    for (name, role, conv) in windows {
+        let env: Vec<(&str, &str)> = match conv {
+            Some(c) if name == "impl" => vec![("CLAUDE_CODE_SESSION_ID", c)],
+            Some(c) => vec![("BUS_HOST_SESSION", c)],
+            None => vec![],
+        };
+        let c = spawn_proxy(&dir, &repo, &["--role", role], &env).await;
+        let st = call(&c, "session_status", json!({})).await;
+        assert_eq!(st["connected"], true, "{name}: {st}");
+        assert_eq!(st["agent"], "joaquin");
+        ids.push((
+            name,
+            st["session"].as_str().unwrap().to_owned(),
+            st["address"].as_str().unwrap().to_owned(),
+        ));
+        clients.push(c);
+    }
+    let sessions: std::collections::HashSet<&str> =
+        ids.iter().map(|(_, s, _)| s.as_str()).collect();
+    assert_eq!(
+        sessions.len(),
+        5,
+        "five conversations, five sessions: {ids:?}"
+    );
+
+    // Design discovers the implementation window and sends a correction; the
+    // two same-role Codex reviewers stay distinct.
+    let design = &clients[1];
+    let found = call(
+        design,
+        "list_sessions",
+        json!({"project": "market-data", "role": "implementation", "online_only": true}),
+    )
+    .await;
+    assert_eq!(found["count"], 1);
+    let impl_addr = found["sessions"][0]["address"].as_str().unwrap().to_owned();
+    assert_eq!(impl_addr, ids[0].2);
+    call(
+        design,
+        "post_message",
+        json!({"to": impl_addr, "body": "the empty state needs a spinner"}),
+    )
+    .await;
+    let reviewers = call(
+        design,
+        "list_sessions",
+        json!({"project": "market-data", "role": "review", "online_only": true}),
+    )
+    .await;
+    assert_eq!(
+        reviewers["count"], 3,
+        "three reviewers share a role, three addresses"
+    );
+
+    // The implementation window reads it, replies to the exact sender, and
+    // no other window's inbox moved.
+    let implementation = &clients[0];
+    let inbox = call(implementation, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+    let msg = &inbox["messages"][0];
+    assert_eq!(msg["body"], "the empty state needs a spinner");
+    let from = format!(
+        "{}/{}",
+        msg["from"].as_str().unwrap(),
+        msg["from_session"].as_str().unwrap()
+    );
+    assert_eq!(from, ids[1].2);
+    call(
+        implementation,
+        "post_message",
+        json!({"to": from, "body": "added", "reply_to": msg["id"]}),
+    )
+    .await;
+    let reply = call(design, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(reply["messages"][0]["body"], "added");
+    for c in clients.iter().skip(2) {
+        let quiet = call(c, "read_messages", json!({"scope": "inbox"})).await;
+        assert!(
+            quiet["messages"].as_array().unwrap().is_empty(),
+            "a reviewer saw another window's direct message"
+        );
+    }
+
+    // A hook of the implementation conversation acts on THAT window: the
+    // same conversation id resolves to the same session, so a heartbeat from
+    // the hook updates this window's presence and nobody else's.
+    run_hook("heartbeat.sh", &dir, &repo, "", &["busy"]);
+    let after = call(
+        design,
+        "list_sessions",
+        json!({"project": "market-data", "online_only": true}),
+    )
+    .await;
+    assert_eq!(after["count"], 5, "the hook did not create a sixth session");
+
+    // SessionStart for the design conversation injects its own identity,
+    // and only after the bus confirmed it.
+    let out = run_hook(
+        "session-start.sh",
+        &dir,
+        &repo,
+        &json!({"session_id": "conv-design", "cwd": repo.display().to_string()}).to_string(),
+        &[],
+    );
+    let injected: Value = serde_json::from_str(out.trim()).expect("hook emitted JSON");
+    let context = injected["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(context.contains("agent 'joaquin'"), "{context}");
+    assert!(
+        context.contains(&ids[1].1),
+        "the design window's own session: {context}"
+    );
+    assert!(context.contains("role 'design'"), "{context}");
+    for (name, session, _) in ids.iter().skip(2) {
+        assert!(
+            !context.contains(session.as_str()),
+            "{name}'s session leaked: {context}"
+        );
+    }
+
+    // A conversation with no bus configured injects nothing at all.
+    let empty_cfg = dir.join("no-profiles");
+    std::fs::create_dir_all(&empty_cfg).unwrap();
+    let out = run_hook(
+        "session-start.sh",
+        &empty_cfg,
+        &repo,
+        &json!({"session_id": "conv-nowhere"}).to_string(),
+        &[],
+    );
+    assert!(out.trim().is_empty(), "unconfigured session start: {out}");
+
+    // Ending one window leaves the others alone: no idled presence, no
+    // drained inbox, no released claim.
+    call(
+        implementation,
+        "create_task",
+        json!({"key": "md#1", "title": "spinner"}),
+    )
+    .await;
+    call(implementation, "claim_task", json!({"key": "md#1"})).await;
+    let closing = clients.remove(4);
+    let _ = closing.cancel().await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let implementation = &clients[0];
+    let mine = call(implementation, "list_tasks", json!({"mine_only": true})).await;
+    assert_eq!(mine["tasks"][0]["status"], "claimed");
+    assert_eq!(mine["tasks"][0]["claimed_session"], ids[0].1);
+    let still = call(
+        implementation,
+        "list_sessions",
+        json!({"project": "market-data", "role": "implementation", "online_only": true}),
+    )
+    .await;
+    assert_eq!(still["count"], 1, "the surviving window is still online");
+    assert_eq!(
+        call(implementation, "whoami", json!({})).await["session"],
+        ids[0].1
+    );
+
+    for c in clients {
+        let _ = c.cancel().await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}

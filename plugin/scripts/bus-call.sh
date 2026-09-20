@@ -1,16 +1,40 @@
 #!/bin/sh
 # bus-call.sh <tool> [json-args]
-# One stateless JSON-RPC tools/call against the crew bus. Prints the raw
-# JSON-RPC response on stdout. Silently no-ops if BUS_URL/BUS_TOKEN are unset,
-# so the plugin never breaks a session that has no bus configured.
+# One stateless tools/call against the crew bus. Prints the raw JSON-RPC
+# response on stdout, so every caller keeps parsing `.result.structuredContent`
+# whichever path answered. Silently no-ops when nothing is configured, so the
+# plugin never breaks a session that has no bus.
 #
-# Every hook goes through here, so this is where the session label has to be
-# sent. Without it the hooks are person-scoped while the MCP connection beside
-# them is session-scoped, and the two write different presence rows.
+# Two modes, in this order:
+#
+#   1. Local binary + profiles. When `ai-crew-sync` is on the PATH and no
+#      BUS_TOKEN is exported, credentials come from the local profiles and the
+#      project's .acs.toml, and BUS_HOST_SESSION (the host's conversation id,
+#      passed by each hook from its payload) picks the SAME bus session the
+#      `mcp proxy` of this conversation uses. That is what keeps a hook from
+#      draining a sibling window's messages: both sides derive the session from
+#      the conversation id, with no shared mutable file between them.
+#
+#   2. Legacy curl. BUS_URL + BUS_TOKEN in the environment, session from
+#      BUS_SESSION. Unchanged, so existing setups keep working with no binary
+#      installed.
 set -eu
-[ -n "${BUS_URL:-}" ] && [ -n "${BUS_TOKEN:-}" ] || exit 0
 TOOL="$1"
 ARGS="${2:-{\}}"
+
+# ---------------------------------------------------------------- mode 1 --
+if [ -z "${BUS_TOKEN:-}" ] && command -v ai-crew-sync >/dev/null 2>&1; then
+    # `client call` maps straight onto tools/call; --json prints the tool's
+    # structured content, which is wrapped below into the JSON-RPC envelope
+    # every caller already parses.
+    OUT="$(ai-crew-sync client --json call "$TOOL" --args "$ARGS" 2>/dev/null || true)"
+    [ -n "$OUT" ] || exit 0
+    printf '{"jsonrpc":"2.0","id":1,"result":{"structuredContent":%s}}\n' "$OUT"
+    exit 0
+fi
+
+# ---------------------------------------------------------------- mode 2 --
+[ -n "${BUS_URL:-}" ] && [ -n "${BUS_TOKEN:-}" ] || exit 0
 
 # Same source and same fallback as plugin/.mcp.json: unset means the shared
 # session, which is a real session and not an error.

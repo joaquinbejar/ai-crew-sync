@@ -117,11 +117,9 @@ pub struct ProxyOptions {
 }
 
 /// Session label derived from a conversation id: stable for the same id,
-/// unrelated to repository, role or pid.
-pub fn session_for(host_id: &str) -> String {
-    let digest = Sha256::digest(host_id.trim().as_bytes());
-    format!("{SESSION_PREFIX}{}", &hex::encode(digest)[..SESSION_HEX])
-}
+/// unrelated to repository, role or pid. Shared with the resolver so a hook
+/// of the same conversation lands on the same session without coordinating.
+pub use crate::context::session_for_host as session_for;
 
 fn random_session() -> String {
     let raw = crate::auth::generate_token();

@@ -10,6 +10,9 @@
 # the MCP heartbeat tool survives.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
+# Callers that have the hook payload export BUS_HOST_SESSION first; when a
+# hook has none (the Stop keep-alive is invoked without stdin), the resolver
+# falls back to BUS_SESSION exactly as before.
 STATUS="${1:-active}"
 # Clamped before it reaches a payload. The python path would encode a
 # surprising value safely, but the fallback below interpolates it straight

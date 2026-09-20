@@ -51,7 +51,28 @@ enum Command {
     /// Talk to a running bus from the console, as an agent. Everything the MCP
     /// tools can do: send/read messages, claim tasks, notes, presence.
     Client(client::ClientArgs),
-    /// Print a ready-to-paste .mcp.json snippet.
+    /// Print the client configuration for the per-conversation stdio proxy
+    /// (`mcp proxy`). Carries no credential: the proxy resolves one from the
+    /// local profiles.
+    ProxyConfig {
+        /// Output shape: "json" for the .mcp.json most MCP clients use,
+        /// "toml" for Codex's config.toml.
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Role this client's windows start with.
+        #[arg(long)]
+        role: Option<String>,
+        /// Project label, when it should not come from .acs.toml.
+        #[arg(long)]
+        project: Option<String>,
+        /// Profile to connect with, when it should not come from .acs.toml
+        /// or the user default.
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Print a ready-to-paste .mcp.json snippet for a DIRECT connection
+    /// (token in the config). Prefer `proxy-config` for a per-conversation
+    /// session.
     McpConfig {
         /// Public URL of the /mcp endpoint.
         #[arg(long, default_value = "http://localhost:8787/mcp")]
@@ -263,12 +284,6 @@ enum McpCmd {
         /// Initial default channel (defaults to the project's .acs.toml).
         #[arg(long)]
         channel: Option<String>,
-        /// Conversation id this process serves, for hosts that can set one
-        /// per window. Derives a stable session: the same id reconnects to
-        /// the same session. Otherwise CLAUDE_CODE_SESSION_ID or the request
-        /// metadata is used, else this process is the conversation.
-        #[arg(long, env = "BUS_HOST_SESSION")]
-        host_session: Option<String>,
     },
 }
 
@@ -292,6 +307,13 @@ struct ContextSelect {
     /// Session label (BUS_SESSION).
     #[arg(long, env = "BUS_SESSION")]
     session: Option<String>,
+    /// Id of the host conversation (BUS_HOST_SESSION). Every process of one
+    /// conversation — the `mcp proxy` and its lifecycle hooks — derives the
+    /// same bus session from it, so a hook acts on its own window and no
+    /// sibling's. A resumed conversation keeps its session; a fork gets a
+    /// new one.
+    #[arg(long, env = "BUS_HOST_SESSION")]
+    host_session: Option<String>,
 }
 
 impl ContextSelect {
@@ -303,6 +325,7 @@ impl ContextSelect {
             explicit_session: self.session.clone(),
             profile: self.profile.clone(),
             project_dir: self.project_dir.clone(),
+            host_session: self.host_session.clone(),
         })
     }
 }
@@ -526,6 +549,20 @@ async fn main() -> anyhow::Result<()> {
             admin::print_mcp_config(&url, &token, session.as_deref());
             return Ok(());
         }
+        Command::ProxyConfig {
+            format,
+            role,
+            project,
+            profile,
+        } => {
+            admin::print_proxy_config(
+                &format,
+                role.as_deref(),
+                project.as_deref(),
+                profile.as_deref(),
+            );
+            return Ok(());
+        }
         Command::Client(args) => return client::run(args).await,
         Command::Admin(cmd) if !admin_needs_database(&cmd) => return run_admin_remote(cmd).await,
         Command::Context(cmd) => return run_context(cmd).await,
@@ -534,9 +571,12 @@ async fn main() -> anyhow::Result<()> {
             project,
             role,
             channel,
-            host_session,
         }) => {
-            let inputs = select.inputs()?;
+            let mut inputs = select.inputs()?;
+            let host_session = inputs.host_session.clone();
+            // The proxy binds the conversation itself (it also accepts the
+            // host's own variables), so the resolver must not pre-empt it.
+            inputs.host_session = None;
             let state_dir = inputs.config_dir.clone();
             return proxy::run(proxy::ProxyOptions {
                 inputs,
@@ -573,9 +613,11 @@ async fn main() -> anyhow::Result<()> {
 async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
     match command {
         // `main` routes these before opening a pool; they cannot arrive here.
-        Command::McpConfig { .. } | Command::Client(_) | Command::Context(_) | Command::Mcp(_) => {
-            unreachable!("handled in main")
-        }
+        Command::McpConfig { .. }
+        | Command::ProxyConfig { .. }
+        | Command::Client(_)
+        | Command::Context(_)
+        | Command::Mcp(_) => unreachable!("handled in main"),
 
         Command::Migrate => {
             MIGRATOR.run(&pool).await?;

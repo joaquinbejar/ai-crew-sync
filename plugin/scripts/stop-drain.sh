@@ -21,6 +21,16 @@ command -v python3 >/dev/null 2>&1 || exit 0
 # guard so two sessions in different repositories do not share one.
 PAYLOAD="$(cat 2>/dev/null || true)"
 
+# Same conversation id as the proxy and the other hooks of this window: the
+# drain must look at this window's inbox, never a sibling's.
+HOST_SESSION="$(PAYLOAD="$PAYLOAD" python3 -c 'import json,os,sys
+try:
+    v = json.loads(os.environ.get("PAYLOAD") or "{}").get("session_id")
+except Exception:
+    v = None
+sys.stdout.write(str(v) if v else "")' 2>/dev/null || true)"
+[ -n "$HOST_SESSION" ] && export BUS_HOST_SESSION="$HOST_SESSION"
+
 # Scope "all" rather than "inbox": it carries this agent's own sent messages
 # too, which is the only way to tell a question that has already been answered
 # from one still waiting.
@@ -35,7 +45,15 @@ WHO="$("$DIR/bus-call.sh" whoami 2>/dev/null || true)"
 
 STATE_DIR="${TMPDIR:-/tmp}"
 export PAYLOAD FEED WHO STATE_DIR
-export BUS_SESSION="${BUS_SESSION:-}"
+# Which session this window is, as the server reports it: with the proxy the
+# label is derived from the conversation id, not exported in BUS_SESSION.
+MY_SESSION="$(WHO="$WHO" python3 -c 'import json,os,sys
+try:
+    sc = json.loads(os.environ.get("WHO") or "{}")["result"]["structuredContent"]
+    sys.stdout.write(str(sc.get("session") or ""))
+except Exception:
+    sys.stdout.write("")' 2>/dev/null || true)"
+export BUS_SESSION="${MY_SESSION:-${BUS_SESSION:-}}"
 
 python3 - <<'PY' 2>/dev/null || true
 import json, os, re

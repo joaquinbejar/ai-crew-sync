@@ -34,6 +34,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub use crate::admin_cli::{config_dir, write_private};
 use crate::auth::TOKEN_PREFIX;
@@ -340,6 +341,47 @@ pub struct Inputs {
     /// `--project-dir` / `BUS_PROJECT_DIR`; the current directory when
     /// absent.
     pub project_dir: Option<PathBuf>,
+    /// `--host-session` / `BUS_HOST_SESSION`: the id the host gives this
+    /// conversation. Two processes of one conversation — the MCP proxy and a
+    /// lifecycle hook — derive the same bus session from it without sharing
+    /// state, which is what keeps a hook from draining a sibling window's
+    /// messages.
+    pub host_session: Option<String>,
+}
+
+/// The bus session a conversation id maps to. Pure and deterministic, so
+/// every process of that conversation agrees without coordinating: this is
+/// the handshake, not a file.
+pub fn session_for_host(host_id: &str) -> String {
+    let digest = Sha256::digest(host_id.trim().as_bytes());
+    format!("s-{}", &hex::encode(digest)[..12])
+}
+
+/// Key of the binding record a proxy writes for its conversation.
+fn binding_key(host_id: &str) -> String {
+    hex::encode(Sha256::digest(host_id.trim().as_bytes()))
+}
+
+/// What the proxy of this conversation recorded: which profile, project and
+/// role it settled on. Advisory — a hook works without it, just with less.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Binding {
+    pub session: Option<String>,
+    pub profile: Option<String>,
+    pub project: Option<String>,
+    pub role: Option<String>,
+    pub agent: Option<String>,
+    pub team: Option<String>,
+}
+
+pub fn binding_path(dir: &Path, host_id: &str) -> PathBuf {
+    dir.join("sessions")
+        .join(format!("{}.json", binding_key(host_id)))
+}
+
+pub fn read_binding(dir: &Path, host_id: &str) -> Option<Binding> {
+    let text = std::fs::read_to_string(binding_path(dir, host_id)).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 /// Which rule produced the credentials.
@@ -435,7 +477,32 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
     let explicit_url = none_if_blank(inputs.explicit_url.clone());
     let explicit_token = none_if_blank(inputs.explicit_token.clone());
     let explicit_session = none_if_blank(inputs.explicit_session.clone());
-    let profile_flag = none_if_blank(inputs.profile.clone());
+    let mut profile_flag = none_if_blank(inputs.profile.clone());
+    let host_session = none_if_blank(inputs.host_session.clone());
+
+    // A conversation id fixes the session for every process of that
+    // conversation, and the proxy may have recorded which profile it settled
+    // on. The record never selects a profile over an explicit one, and never
+    // carries a credential.
+    let binding = host_session
+        .as_deref()
+        .and_then(|id| read_binding(&inputs.config_dir, id));
+    let session = match (&explicit_session, &host_session) {
+        (Some(s), _) => Some(s.clone()),
+        (None, Some(id)) => Some(
+            binding
+                .as_ref()
+                .and_then(|b| b.session.clone())
+                .unwrap_or_else(|| session_for_host(id)),
+        ),
+        (None, None) => None,
+    };
+    if profile_flag.is_none()
+        && inputs.explicit_token.is_none()
+        && let Some(p) = binding.as_ref().and_then(|b| b.profile.clone())
+    {
+        profile_flag = Some(p);
+    }
 
     // Project metadata is welcome whatever selects the credentials; a
     // broken project file is reported rather than silently ignored, since
@@ -453,7 +520,7 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
     // 1. Explicit credentials win, whole. Two explicit selections at once
     // are a contradiction to report, not a tie to break quietly.
     if let Some(token) = explicit_token {
-        if let Some(p) = &profile_flag {
+        if let Some(p) = none_if_blank(inputs.profile.clone()).as_ref() {
             bail!(
                 "both explicit credentials (--token / BUS_TOKEN) and a profile ('{p}', from \
                  --profile / BUS_PROFILE) were given; drop one so it is clear which identity \
@@ -475,7 +542,7 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
             project: project_cfg.project,
             channel: project_cfg.channel,
             project_root,
-            session: explicit_session,
+            session,
         });
     }
 
@@ -591,7 +658,7 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
         project: project_cfg.project,
         channel: project_cfg.channel,
         project_root,
-        session: explicit_session,
+        session,
     })
 }
 
