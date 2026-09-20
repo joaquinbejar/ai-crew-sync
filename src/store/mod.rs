@@ -2,6 +2,7 @@ pub mod admin;
 pub mod backend;
 pub mod conversations;
 pub mod digest;
+pub mod inbox;
 pub mod jetstream;
 pub mod locks;
 pub mod messaging;

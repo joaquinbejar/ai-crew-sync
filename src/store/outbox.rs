@@ -241,6 +241,11 @@ pub async fn settle(pool: &PgPool, lease: &Lease, outcome: Published) -> BusResu
             .bind(lease.message_id)
             .execute(&mut *tx)
             .await?;
+            // The body is canonical now, so the recipients can be told it
+            // exists. Queued on this transaction: there is no stored
+            // message without its references, and no reference to a message
+            // nobody stored.
+            crate::store::inbox::enqueue_message_references(&mut tx, lease.message_id).await?;
             tx.commit().await?;
             Ok(Settled::Stored)
         }

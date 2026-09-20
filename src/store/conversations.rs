@@ -1932,6 +1932,11 @@ pub async fn ack(
         serde_json::json!({ "resolved": resolved }),
     )
     .await?;
+    // Tell the sender to look again, on the same transaction as the receipt
+    // itself: a notification cannot exist without the receipt it reports,
+    // and a receipt cannot be written without queueing the notification.
+    // A no-op for a thread on Postgres, where the event hub already does it.
+    crate::store::inbox::enqueue_receipt_reference(&mut tx, message_id).await?;
     tx.commit().await?;
     receipt_of(pool, message_id, membership.id)
         .await?

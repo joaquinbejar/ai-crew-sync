@@ -358,7 +358,7 @@ pub fn session_for_host(host_id: &str) -> String {
 }
 
 /// Key of the binding record a proxy writes for its conversation.
-fn binding_key(host_id: &str) -> String {
+pub fn binding_key(host_id: &str) -> String {
     hex::encode(Sha256::digest(host_id.trim().as_bytes()))
 }
 

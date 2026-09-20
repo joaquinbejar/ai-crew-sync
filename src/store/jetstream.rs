@@ -72,6 +72,64 @@ pub fn subject_filter(team_id: Uuid) -> String {
     format!("acs.{}.>", team_id.simple())
 }
 
+/// The inbox stream for one team: references, not bodies.
+///
+/// A second stream on purpose. Bodies are canonical history and must not be
+/// dropped; references are an accelerator whose truth is in Postgres and can
+/// be dropped freely. One retention policy cannot be right for both.
+pub fn inbox_stream_name(team_id: Uuid) -> String {
+    format!("ACS_I_{}", team_id.simple())
+}
+
+/// One recipient's own subject. `recipient_key` is opaque and
+/// subject-safe by construction: a session id, or `a` plus an agent id.
+pub fn inbox_subject(team_id: Uuid, recipient_key: &str) -> String {
+    format!("acsi.{}.inbox.{}", team_id.simple(), recipient_key)
+}
+
+pub fn inbox_filter(team_id: Uuid) -> String {
+    format!("acsi.{}.>", team_id.simple())
+}
+
+/// How long an unread reference is kept before Postgres is the only place
+/// it exists. Reconciliation rebuilds it from there, so this is a cache
+/// horizon and not a data loss window.
+pub const INBOX_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+/// Redeliveries before the broker gives up on a reference. Postgres still
+/// has it, and a reader is told the difference.
+pub const INBOX_MAX_DELIVER: i64 = 5;
+/// References one recipient may hold un-acknowledged at once.
+pub const INBOX_MAX_ACK_PENDING: i64 = 256;
+/// How long a handed-out reference may stay unconfirmed before the broker
+/// offers it again.
+pub const INBOX_ACK_WAIT_SECS: u64 = 60;
+
+/// One reference as the broker handed it over.
+#[derive(Clone, Debug)]
+pub struct InboxRef {
+    pub payload: String,
+    /// Where to acknowledge it once the receipt is committed. Empty when
+    /// the broker offered no reply subject, which makes it unackable and
+    /// therefore redelivered — visible rather than silently dropped.
+    pub ack_subject: String,
+    pub stream_seq: u64,
+    /// How many times the broker has offered this one. Greater than one is
+    /// a redelivery, which is expected and must be idempotent.
+    pub deliveries: u64,
+}
+
+/// What a recipient's consumer holds, for an honest status.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct InboxStatus {
+    pub pending: u64,
+    pub awaiting_ack: u64,
+    pub redelivered: u64,
+    /// False when the consumer does not exist: expired, never created, or
+    /// deleted by an operator. Postgres is then the only source, and
+    /// reconciliation says so rather than reporting an empty inbox.
+    pub present: bool,
+}
+
 /// Connection settings. Kept away from the bus's own configuration: this is
 /// infrastructure an operator points at, never something a client supplies.
 #[derive(Clone, Debug)]
@@ -173,22 +231,206 @@ impl JetStreamBackend {
         Ok(name)
     }
 
+    /// Create or update a team's inbox stream. Same operator action and
+    /// same credential as `provision`; separate so a deployment can see
+    /// what each stream costs.
+    pub async fn provision_inbox(config: &Config, team_id: Uuid) -> BusResult<String> {
+        let client = connect_client(config).await?;
+        let context = jetstream::new(client);
+        let name = inbox_stream_name(team_id);
+        context
+            .get_or_create_stream(jetstream::stream::Config {
+                name: name.clone(),
+                subjects: vec![inbox_filter(team_id)],
+                storage: jetstream::stream::StorageType::File,
+                // A reference is work: it is removed when its recipient
+                // acknowledges it. With one exact subject per recipient and
+                // one consumer on it, two recipients can never compete for
+                // each other's references.
+                retention: jetstream::stream::RetentionPolicy::WorkQueue,
+                discard: jetstream::stream::DiscardPolicy::Old,
+                max_age: std::time::Duration::from_secs(INBOX_MAX_AGE_SECS),
+                max_messages: config.max_messages,
+                max_bytes: config.max_bytes,
+                allow_direct: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| BusError::invalid(format!("could not provision '{name}': {e}")))?;
+        Ok(name)
+    }
+
+    /// Publish one reference to a recipient's own subject.
+    ///
+    /// Deduplicated on the event id, so a retry of the same reference is
+    /// the same notification rather than a second one.
+    pub async fn publish_reference(
+        &self,
+        recipient_key: &str,
+        event_id: Uuid,
+        payload: &str,
+    ) -> Published {
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(MSG_ID_HEADER, event_id.to_string().as_str());
+        headers.insert("Acs-Team-Id", self.team_id.to_string().as_str());
+        let ack = self
+            .context
+            .publish_with_headers(
+                inbox_subject(self.team_id, recipient_key),
+                headers,
+                payload.to_owned().into(),
+            )
+            .await;
+        let ack = match ack {
+            Ok(ack) => ack,
+            Err(e) => return classify(&e.to_string()),
+        };
+        match ack.await {
+            Ok(ack) => Published::Confirmed(Locator(format!(
+                "jetstream:{}:{}",
+                ack.stream, ack.sequence
+            ))),
+            Err(e) => classify(&e.to_string()),
+        }
+    }
+
+    /// Adopt (creating if needed) the durable pull consumer for one
+    /// recipient. One consumer, one exact subject, explicit acknowledgement.
+    async fn inbox_consumer(
+        &self,
+        recipient_key: &str,
+    ) -> BusResult<jetstream::consumer::Consumer<jetstream::consumer::pull::Config>> {
+        let stream = self
+            .context
+            .get_stream(inbox_stream_name(self.team_id))
+            .await
+            .map_err(|e| {
+                BusError::invalid(format!(
+                    "this team's inbox stream is not provisioned or is unreachable ({e}). \
+                     Run `ai-crew-sync team stream --provision`; references are still in \
+                     Postgres meanwhile."
+                ))
+            })?;
+        let durable = format!("IN_{recipient_key}");
+        stream
+            .get_or_create_consumer(
+                &durable,
+                jetstream::consumer::pull::Config {
+                    durable_name: Some(durable.clone()),
+                    filter_subject: inbox_subject(self.team_id, recipient_key),
+                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                    ack_wait: std::time::Duration::from_secs(INBOX_ACK_WAIT_SECS),
+                    max_deliver: INBOX_MAX_DELIVER,
+                    max_ack_pending: INBOX_MAX_ACK_PENDING,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| BusError::invalid(format!("could not open the inbox: {e}")))
+    }
+
+    /// Take up to `limit` references without acknowledging any of them.
+    /// Acknowledgement happens only once the receipt is committed.
+    pub async fn fetch_references(
+        &self,
+        recipient_key: &str,
+        limit: usize,
+    ) -> BusResult<Vec<InboxRef>> {
+        use futures::StreamExt;
+        let consumer = self.inbox_consumer(recipient_key).await?;
+        let mut batch = consumer
+            .fetch()
+            .max_messages(limit)
+            .messages()
+            .await
+            .map_err(|e| BusError::invalid(format!("could not read the inbox: {e}")))?;
+        let mut out = Vec::new();
+        while let Some(message) = batch.next().await {
+            let message =
+                message.map_err(|e| BusError::invalid(format!("inbox read failed: {e}")))?;
+            let info = message.info().ok();
+            out.push(InboxRef {
+                payload: String::from_utf8_lossy(&message.payload).into_owned(),
+                ack_subject: message
+                    .reply
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                stream_seq: info.as_ref().map(|i| i.stream_sequence).unwrap_or(0),
+                deliveries: info.as_ref().map(|i| i.delivered as u64).unwrap_or(1),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Acknowledge one reference by the subject it was offered on. Sent
+    /// after the receipt has been committed, never before.
+    pub async fn ack_reference(&self, ack_subject: &str) -> BusResult<()> {
+        if ack_subject.is_empty() {
+            return Ok(());
+        }
+        let client = self.context.client();
+        client
+            .publish(ack_subject.to_owned(), bytes::Bytes::from_static(b"+ACK"))
+            .await
+            .map_err(|e| BusError::invalid(format!("could not acknowledge: {e}")))?;
+        client
+            .flush()
+            .await
+            .map_err(|e| BusError::invalid(format!("could not acknowledge: {e}")))?;
+        Ok(())
+    }
+
+    /// What this recipient's consumer holds. A missing consumer is a fact,
+    /// not an empty inbox.
+    pub async fn inbox_status(&self, recipient_key: &str) -> BusResult<InboxStatus> {
+        let Ok(stream) = self
+            .context
+            .get_stream(inbox_stream_name(self.team_id))
+            .await
+        else {
+            return Ok(InboxStatus::default());
+        };
+        let durable = format!("IN_{recipient_key}");
+        let Ok(mut consumer) = stream
+            .get_consumer::<jetstream::consumer::pull::Config>(&durable)
+            .await
+        else {
+            return Ok(InboxStatus::default());
+        };
+        let info = consumer
+            .info()
+            .await
+            .map_err(|e| BusError::invalid(format!("could not read the inbox state: {e}")))?;
+        Ok(InboxStatus {
+            pending: info.num_pending,
+            awaiting_ack: info.num_ack_pending as u64,
+            redelivered: info.num_redelivered as u64,
+            present: true,
+        })
+    }
+
     /// Remove a team's stream. Operator action, and a destructive one: it
     /// drops every body the stream holds.
     pub async fn deprovision(config: &Config, team_id: Uuid) -> BusResult<()> {
         let client = connect_client(config).await?;
         let context = jetstream::new(client);
-        let name = stream_name(team_id);
-        match context.delete_stream(&name).await {
-            Ok(_) => Ok(()),
-            // Already gone is the outcome the caller asked for.
-            Err(e) if e.to_string().contains("not found") => Ok(()),
-            // Anything else left the data in place, and an operator who is
-            // told "removed" would believe otherwise.
-            Err(e) => Err(BusError::invalid(format!(
-                "could not delete '{name}' ({e}). The stream and its bodies are still there."
-            ))),
+        // Both streams, and both report. An operator told "removed" while
+        // authorization was refused believes the data is gone.
+        for name in [stream_name(team_id), inbox_stream_name(team_id)] {
+            match context.delete_stream(&name).await {
+                Ok(_) => {}
+                // Already gone is the outcome the caller asked for.
+                Err(e) if e.to_string().contains("not found") => {}
+                Err(e) => {
+                    return Err(BusError::invalid(format!(
+                        "could not delete '{name}' ({e}). The stream and its contents are \
+                         still there."
+                    )));
+                }
+            }
         }
+        Ok(())
     }
 
     pub fn stream(&self) -> &str {

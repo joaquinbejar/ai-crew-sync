@@ -117,7 +117,11 @@ pub async fn team_stream(
         return Ok(());
     }
     let name = crate::store::jetstream::JetStreamBackend::provision(&config, id).await?;
-    println!("team '{team}': stream '{name}' ready");
+    // Two streams, because bodies and references cannot share a retention
+    // policy: history must not be dropped, and references are a cache whose
+    // truth is in Postgres.
+    let inbox = crate::store::jetstream::JetStreamBackend::provision_inbox(&config, id).await?;
+    println!("team '{team}': streams '{name}' (bodies) and '{inbox}' (inbox references) ready");
     println!(
         "This routes nobody. `team capability --team {team} --backend jetstream` is what \
          sends new conversations there."

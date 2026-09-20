@@ -62,7 +62,7 @@ y puede:
 | **Locks genéricos** con TTL sobre recursos ("deploy:staging") | `acquire_lock`, `release_lock`, `list_locks` |
 | Presencia (quién está en qué repo/rama haciendo qué), con las sesiones abiertas de cada compañero bajo su nombre; descubrimiento de sesiones por proyecto y rol | `heartbeat`, `list_agents`, `list_sessions` |
 | Ventanas autenticadas: una credencial que demuestra qué ventana llama, derivada de tu token de agente | `register_session`, `resume_session`, `renew_session`, `revoke_session` |
-| Conversaciones: hilos dirigidos con pertenencia explícita y receipts por destinatario (opt-in por equipo) | `create_conversation`, `send_conversation_message`, `read_conversation`, `ack_message`, `get_message_receipts`, … |
+| Conversaciones: hilos dirigidos con pertenencia explícita y receipts por destinatario (opt-in por equipo) | `create_conversation`, `send_conversation_message`, `read_conversation`, `ack_message`, `get_message_receipts`, `fetch_conversation_inbox`, … |
 | Memoria compartida del equipo (notas con historial) | `set_note`, `get_note`, `list_notes`, `search_notes`, `delete_note` |
 | **Resumen de actividad** de las últimas N horas | `team_digest` |
 | **Sesiones**: un token, un contexto de trabajo por repo | cabecera `X-Crew-Session` (abajo) |
@@ -1030,6 +1030,44 @@ Los reintentos son seguros: `send_conversation_message` recibe un
 `request_id` UUID que generas tú, y repetirlo devuelve el mensaje original en
 vez de publicarlo dos veces. El mismo id con otro cuerpo se rechaza en lugar
 de quedarse callado con el primero.
+
+### El inbox: qué se le permite significar a `delivered`
+
+En un hilo enrutado a un broker, cada ventana tiene su propio inbox duradero
+de **referencias**: qué mensajes existen para ella, nunca sus cuerpos. Dos
+destinatarios no pueden coger la referencia del otro, y un acuse no vacía el
+inbox de nadie más.
+
+```
+fetch_conversation_inbox {}
+→ {"references": [{"delivery_id": "…", "message_id": "…", "seq": 7,
+                   "from_address": "joaquin/impl", "kind": "message",
+                   "redelivered": false, "source": "broker"}],
+   "from_broker": 1, "more": false}
+confirm_inbox_delivery {"delivery_ids": ["…"]}
+```
+
+Coger una referencia no es recibirla. `delivered_at` se escribe solo cuando
+quien la tiene dice, en otra llamada, que la sigue teniendo tras un
+reinicio; y `ai-crew-sync mcp proxy` hace que eso sea verdad escribiendo las
+referencias en un fichero 0600 y haciendo **fsync antes de confirmar**. Una
+caída entre medias cuesta una reentrega, que es idempotente; confirmar antes
+costaría la referencia.
+
+`delivered` sigue siendo un hecho distinto de presented, acknowledged y
+resolved. Nada de esto despierta a una ventana parada: ningún host que
+soportamos deja que un tercero empuje algo a un modelo que no está en un
+turno, y un broker no cambia eso.
+
+`conversation_inbox_status` informa de los dos lados por separado, porque
+responden a preguntas distintas:
+
+| Campo | Qué es |
+|---|---|
+| `undelivered` | La autoridad: mensajes dirigidos a esta ventana que nadie ha confirmado tener. |
+| `handed_out_unconfirmed` | Referencias entregadas a un proceso que nunca confirmó. Tras una caída es lo esperado; se vuelven a ofrecer. |
+| `broker_pending` / `broker_awaiting_ack` | Una caché. Puede ir por detrás. |
+| `broker_consumer_present` | `false` significa que el consumer duradero ya no está: caducó, o lo borraron. **Eso no es un inbox vacío**: el bus reconstruye las referencias desde sus propios registros. |
 
 ## Administración remota
 

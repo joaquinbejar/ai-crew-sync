@@ -957,6 +957,105 @@ impl Proxy {
 
     /// Forward one call to the connected context, racing the host's own
     /// cancellation and the context's replacement.
+    /// Spool the references a fetch returned, fsync, then confirm them.
+    ///
+    /// Everything here is best effort in one direction only: a reference
+    /// that cannot be written to disk is **not** confirmed, so the bus keeps
+    /// offering it. The model still sees it in this turn — it is in the
+    /// result either way — but nothing claims durability that does not
+    /// exist.
+    async fn spool_and_confirm(
+        &self,
+        result: CallToolResult,
+        host_ct: CancellationToken,
+    ) -> CallToolResult {
+        let Some(structured) = result.structured_content.clone() else {
+            return result;
+        };
+        let session = self.state.read().await.session.clone();
+        let path = crate::spool::spool_path(&self.opts.state_dir, &session);
+
+        let mut entries: Vec<crate::spool::Entry> = structured
+            .get("references")
+            .and_then(|v| v.as_array())
+            .map(|refs| {
+                refs.iter()
+                    .filter_map(|r| {
+                        Some(crate::spool::Entry {
+                            delivery_id: r.get("delivery_id")?.as_str()?.to_owned(),
+                            message_id: r.get("message_id")?.as_str()?.to_owned(),
+                            conversation_id: r
+                                .get("conversation_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                            seq: r.get("seq").and_then(|v| v.as_i64()).unwrap_or(0),
+                            from_address: r
+                                .get("from_address")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                            created_at: r
+                                .get("created_at")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                            confirmed: false,
+                            spooled_at: chrono::Utc::now().to_rfc3339(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // Anything a previous process spooled and never confirmed goes in
+        // the same confirmation: that is what an interrupted delivery looks
+        // like from here.
+        let mut held = crate::spool::read(&path);
+        let spooled = match crate::spool::append(&path, &entries) {
+            Ok(written) => written,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not spool inbox references; not confirming");
+                return result;
+            }
+        };
+        held.extend(spooled.iter().cloned());
+        entries.clear();
+        let to_confirm = crate::spool::unconfirmed(&held);
+        if to_confirm.is_empty() {
+            return result;
+        }
+
+        let mut params = rmcp::model::JsonObject::new();
+        params.insert(
+            "delivery_ids".into(),
+            Value::Array(
+                to_confirm
+                    .iter()
+                    .map(|id| Value::String(id.clone()))
+                    .collect(),
+            ),
+        );
+        let confirm =
+            CallToolRequestParams::new("confirm_inbox_delivery".to_string()).with_arguments(params);
+        match self.forward(confirm, host_ct).await {
+            Ok(_) => {
+                for entry in held.iter_mut() {
+                    if to_confirm.contains(&entry.delivery_id) {
+                        entry.confirmed = true;
+                    }
+                }
+                if let Err(e) = crate::spool::rewrite(&path, &held) {
+                    // The bus has the truth; this only costs a repeated
+                    // confirmation next time, which is a no-op there.
+                    tracing::warn!(error = %e, "could not compact the inbox spool");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not confirm inbox delivery"),
+        }
+        result
+    }
+
     async fn forward(
         &self,
         request: CallToolRequestParams,
@@ -1288,6 +1387,14 @@ impl ServerHandler for Proxy {
                     // rather than a protocol error.
                     Err(e) => Ok(tool_error(format!("{e:#}")).into()),
                 }
+            }
+            // Delivery has to mean something. The bus hands over references
+            // and records nothing; this writes them to disk, fsyncs, and
+            // only then tells the bus they are held. A crash in between
+            // costs a redelivery, which is idempotent by design.
+            "fetch_conversation_inbox" => {
+                let result = self.forward(request, context.ct.clone()).await?;
+                Ok(self.spool_and_confirm(result, context.ct).await.into())
             }
             // A message with no channel and no recipient goes to this
             // window's channel. The state was decorative until now: the
