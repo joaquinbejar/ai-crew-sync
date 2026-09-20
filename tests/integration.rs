@@ -4617,3 +4617,189 @@ async fn admin_api_has_its_own_lower_rate_limit() {
 
     h.shutdown().await;
 }
+
+// ------------------------------------------------------- admin remote CLI --
+
+/// The remote CLI's library functions against the real server and a
+/// temporary configuration directory: the full onboarding flow with
+/// verification and `--save`, and the failure paths that must leave no
+/// trace.
+#[tokio::test]
+async fn admin_cli_runs_the_remote_flow_end_to_end() {
+    use ai_crew_sync::admin_cli::{self, SaveTarget};
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_admin_cli");
+    let dir = std::env::temp_dir().join(format!("acs-admin-cli-{}", Uuid::new_v4()));
+    let bootstrap = store::grant_admin(&h.pool, Actor::Cli, None, None)
+        .await
+        .unwrap();
+
+    // A bad credential is refused and nothing is written.
+    let err = admin_cli::login(&dir, &h.base, "acsa_nope".into())
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("nothing was saved"), "{err:#}");
+    assert!(!dir.join("admin").exists());
+
+    // Login verifies, then persists with 0600; the URL is normalised.
+    let (me, path) = admin_cli::login(&dir, &format!("{}/mcp", h.base), bootstrap.token.clone())
+        .await
+        .unwrap();
+    assert_eq!(me["scope"], "global");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(&format!("url={}\n", h.base)), "{text}");
+    assert!(text.contains(&format!("token={}\n", bootstrap.token)));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let cfg = admin_cli::load_config(&dir).unwrap();
+    assert_eq!(cfg.url, h.base);
+    let api = admin_cli::Api::new(cfg);
+
+    // Team, agent, token — and the token is verified before anything else.
+    api.create_team("roundcrew", Some("RoundCrew"))
+        .await
+        .unwrap();
+    api.create_agent("roundcrew", "backend", None)
+        .await
+        .unwrap();
+
+    // The file already has hand-written entries that must survive.
+    let tokens = admin_cli::tokens_file(&dir, "roundcrew");
+    std::fs::write(
+        &tokens,
+        "# roundcrew tokens\n_base=acs_base_keep\nweb=acs_web_keep\n",
+    )
+    .unwrap();
+    let issued = api
+        .issue_token("roundcrew", "backend", Some("sesion backend"))
+        .await
+        .unwrap();
+    let saved = admin_cli::finish_issue(
+        &api,
+        &issued,
+        "backend",
+        "roundcrew",
+        Some(&SaveTarget {
+            dir: dir.clone(),
+            repo: "backend".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.as_deref(), Some(tokens.as_path()));
+    let text = std::fs::read_to_string(&tokens).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "# roundcrew tokens\n_base=acs_base_keep\nweb=acs_web_keep\nbackend={}\n",
+            issued.token
+        ),
+        "only the backend= line is added; _base and the rest are untouched"
+    );
+    // The saved token is that agent on /mcp.
+    let client = connect(&h.base, &issued.token).await;
+    let me = call(&client, "whoami", json!({})).await;
+    assert_eq!(
+        (me["agent"].as_str(), me["team"].as_str()),
+        (Some("backend"), Some("roundcrew"))
+    );
+    let _ = client.cancel().await;
+
+    // Re-issuing for the same repo replaces the line and does NOT revoke the
+    // previous token.
+    let second = api.issue_token("roundcrew", "backend", None).await.unwrap();
+    admin_cli::finish_issue(
+        &api,
+        &second,
+        "backend",
+        "roundcrew",
+        Some(&SaveTarget {
+            dir: dir.clone(),
+            repo: "backend".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&tokens).unwrap();
+    assert!(text.contains(&format!("backend={}\n", second.token)));
+    assert!(!text.contains(&issued.token), "one line per repo");
+    assert!(text.starts_with("# roundcrew tokens\n_base=acs_base_keep\n"));
+    assert_eq!(
+        mcp_status(&h.base, &issued.token).await,
+        200,
+        "the old token still works"
+    );
+
+    // Verification failure: a token that authenticates as someone else is
+    // revoked, and the file is left exactly as it was.
+    api.create_agent("roundcrew", "web", None).await.unwrap();
+    let other = api.issue_token("roundcrew", "web", None).await.unwrap();
+    let before = std::fs::read_to_string(&tokens).unwrap();
+    let err = admin_cli::finish_issue(
+        &api,
+        &other,
+        "backend",
+        "roundcrew",
+        Some(&SaveTarget {
+            dir: dir.clone(),
+            repo: "backend".into(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("web@roundcrew, not backend@roundcrew"),
+        "{msg}"
+    );
+    assert!(msg.contains("has been revoked"), "{msg}");
+    assert_eq!(
+        std::fs::read_to_string(&tokens).unwrap(),
+        before,
+        "file untouched"
+    );
+    assert_eq!(
+        mcp_status(&h.base, &other.token).await,
+        401,
+        "the mismatched token is dead"
+    );
+
+    // Revoke through the CLI stops the token on /mcp.
+    api.revoke_token("roundcrew", second.id).await.unwrap();
+    assert_eq!(mcp_status(&h.base, &second.token).await, 401);
+
+    // A team credential logged in on this machine is confined to its team.
+    let team_dir = dir.join("dani");
+    let granted = api
+        .grant_credential(Some("roundcrew"), Some("dani"))
+        .await
+        .unwrap();
+    let team_token = granted["credential"]["token"].as_str().unwrap().to_owned();
+    let (me, _) = admin_cli::login(&team_dir, &h.base, team_token)
+        .await
+        .unwrap();
+    assert_eq!(me["team"], "roundcrew");
+    let dani = admin_cli::Api::new(admin_cli::load_config(&team_dir).unwrap());
+    dani.create_agent("roundcrew", "docs", None).await.unwrap();
+    let err = dani.create_agent("other", "docs", None).await.unwrap_err();
+    assert!(err.to_string().contains("403"), "{err}");
+    assert!(err.to_string().contains("'roundcrew'"), "{err}");
+    let err = dani.create_team("mine", None).await.unwrap_err();
+    assert!(err.to_string().contains("403"), "{err}");
+
+    // Logout forgets the file and nothing else.
+    assert!(admin_cli::remove_config(&team_dir).unwrap());
+    assert!(!admin_cli::remove_config(&team_dir).unwrap());
+    assert!(admin_cli::load_config(&team_dir).is_err());
+    assert!(tokens.exists(), "token files are not login state");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}

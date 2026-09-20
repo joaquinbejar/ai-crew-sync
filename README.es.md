@@ -593,13 +593,87 @@ ai-crew-sync client call get_task --args '{"key":"refactor-auth"}'   # escape ha
 
 Todos los subcomandos aceptan `--json` para salida cruda (pipeable a `jq`).
 
-## Administración remota (`/admin/*`)
+## Administración remota
 
 Con una credencial global creada (`admin bootstrap`, más arriba), todo lo
-demás es una API JSON en el propio bus: sin SSH, sin `docker exec`, sin
-conexión a la base de datos. A propósito **no** es MCP: la administración
-nunca aparece en el catálogo de tools de un agente, y un token de agente
-presentado aquí se rechaza con un mensaje que dice qué usar en su lugar.
+demás se hace desde tu propia máquina: sin SSH, sin `docker exec`, sin
+conexión a la base de datos.
+
+### Agente, token, label, sesión
+
+Cuatro palabras fáciles de confundir que el bus trata de forma muy distinta:
+
+| | Qué es | De dónde sale |
+|---|---|---|
+| **agente** | Una identidad en el bus: quien publica, reclama, sostiene locks. Uno por herramienta de código y persona (`joaquin`, `joaquin-codex`, `backend`). | `admin agent add` |
+| **token** | Una credencial que *es* un agente. Varios tokens pueden pertenecer al mismo agente; revocar uno deja los demás funcionando. | `admin token issue` |
+| **label** | Una nota en un token para humanos (`"repo backend"`, `"portátil de dani"`). Solo para mostrar: nunca decide quién es el token. | `--label` |
+| **sesión** | Qué ventana de un agente está llamando, según la cabecera `X-Crew-Session`. Separa presencia, claims y locks; nunca identidad. | `BUS_SESSION` / `--session` |
+
+Un token por repositorio es la forma que todo lo de abajo da por sentada: el
+token dice *quién*, la sesión dice *dónde*.
+
+### Administración diaria: `ai-crew-sync admin`
+
+```bash
+ai-crew-sync admin login --url https://bus.tu-empresa.com:8443   # pide la acsa_… (sin eco)
+ai-crew-sync admin whoami
+
+ai-crew-sync admin team add --slug roundcrew --name "RoundCrew"    # solo global
+ai-crew-sync admin agent add --team roundcrew --name backend
+ai-crew-sync admin token issue --team roundcrew --agent backend --label "sesion backend"
+ai-crew-sync admin token list --team roundcrew
+ai-crew-sync admin token revoke --team roundcrew --id <uuid>
+
+ai-crew-sync admin grant --team roundcrew --label dani    # credencial para el admin de roundcrew
+ai-crew-sync admin credential list
+ai-crew-sync admin credential revoke --id <uuid>
+ai-crew-sync admin logout
+```
+
+`login` nunca recibe el secreto como argumento: lo pide sin eco, o lo lee de
+stdin con `--token-stdin` para scripts. Primero llama al bus y solo si
+responde guarda endpoint y credencial en `~/.config/ai-crew-sync/admin` con
+permisos `0600` (`BUS_CONFIG_DIR` cambia el directorio; `BUS_ADMIN_URL` +
+`BUS_ADMIN_TOKEN` evitan el fichero en CI).
+
+**Cada token emitido se verifica antes de que lo veas.** `token issue`
+presenta el token nuevo a `/mcp`, llama a `whoami` y exige que la respuesta
+sea exactamente el agente y el equipo que pediste. Ante cualquier
+discrepancia el token se revoca y no se imprime ni se guarda nada; el label no
+interviene: la identidad es lo que dice el servidor, nunca lo que decía la
+petición.
+
+La forma de cada día escribe el token directamente en el fichero del equipo y
+no lo imprime nunca:
+
+```bash
+ai-crew-sync admin token issue --team roundcrew --agent backend \
+    --label "sesion backend" --save --repo backend
+# token for backend@roundcrew verified and saved to ~/.config/ai-crew-sync/tokens-roundcrew as backend=…
+```
+
+`tokens-<equipo>` es una línea `nombre=token` por repositorio (sin comillas ni
+espacios), más `_base=` para la raíz de la organización. `--save` sustituye
+solo la línea `backend=`: todas las demás sobreviven, `_base` incluida, la
+escritura es atómica y `0600`, un `backend=` duplicado por una edición a mano
+se funde en uno, y el token anterior de esa entrada **no** se revoca (revócalo
+tú cuando la ventana vieja haya desaparecido). `--repo` es una sola palabra
+segura; la ruta del fichero sale del slug del equipo, nunca del flag. Una
+función de shell que exporte `BUS_TOKEN` desde ese fichero según el directorio
+es toda la fontanería que necesita una máquina.
+
+`bootstrap` es el único comando `admin` que habla con Postgres. `credential
+list --local` / `credential revoke --local` también, para el día en que se
+pierda la última credencial global; los comandos clásicos `team`/`agent`/
+`token` siguen como estaban.
+
+### La API de debajo (`/admin/*`)
+
+La CLI es un cliente fino sobre una API JSON en el propio bus, usable con un
+`curl` suelto. A propósito **no** es MCP: la administración nunca aparece en
+el catálogo de tools de un agente, y un token de agente presentado aquí se
+rechaza con un mensaje que dice qué usar en su lugar.
 
 ```bash
 export ADMIN=acsa_...
