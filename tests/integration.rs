@@ -1663,11 +1663,17 @@ async fn the_digest_cost_does_not_grow_with_channel_count() {
     // runs at 2.0-2.1 here — real growth, 360 rows against 12 — and a query
     // per channel at 4.2-4.3. Three sits between them with room on both
     // sides.
-    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    // The bound has an absolute term as well as a ratio. Two channels can
+    // measure well under a millisecond, and the ratio of two sub-millisecond
+    // durations on a shared CI runner is mostly scheduler noise — which is
+    // how this assertion failed on runs where nothing was wrong. A query per
+    // channel costs tens of milliseconds at sixty channels, so the slack
+    // does not hide the shape it is here to catch.
+    let allowed = small.mul_f64(3.0) + std::time::Duration::from_millis(5);
     assert!(
-        ratio < 3.0,
+        large < allowed,
         "digest over 60 channels took {large:?} against {small:?} over 2 \
-         (ratio {ratio:.2}): the cost is scaling with channel count"
+         (allowed {allowed:?}): the cost is scaling with channel count"
     );
 
     let _ = client.cancel().await;
