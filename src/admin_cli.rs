@@ -569,7 +569,15 @@ pub async fn finish_issue(
     match save {
         Some(target) => {
             let path = tokens_file(&target.dir, &team);
-            upsert_token_entry(&path, &target.repo, &issued.token)?;
+            if let Err(e) = upsert_token_entry(&path, &target.repo, &issued.token) {
+                // A token that was never printed and could not be saved is
+                // one nobody can use: do not leave it active.
+                return Err(mismatch(format!(
+                    "the token was verified but could not be saved to {}: {e:#}",
+                    path.display()
+                ))
+                .await);
+            }
             Ok(Some(path))
         }
         None => Ok(None),

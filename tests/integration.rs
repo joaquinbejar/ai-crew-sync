@@ -4771,6 +4771,28 @@ async fn admin_cli_runs_the_remote_flow_end_to_end() {
         "the mismatched token is dead"
     );
 
+    // A save that cannot be written revokes the verified token too: a token
+    // that was never printed and never saved must not stay active.
+    let unwritable = dir.join("blocked");
+    std::fs::write(&unwritable, "not a directory").unwrap();
+    let doomed = api.issue_token("roundcrew", "backend", None).await.unwrap();
+    let err = admin_cli::finish_issue(
+        &api,
+        &doomed,
+        "backend",
+        "roundcrew",
+        Some(&SaveTarget {
+            dir: unwritable.clone(),
+            repo: "backend".into(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("could not be saved"), "{msg}");
+    assert!(msg.contains("has been revoked"), "{msg}");
+    assert_eq!(mcp_status(&h.base, &doomed.token).await, 401);
+
     // Revoke through the CLI stops the token on /mcp.
     api.revoke_token("roundcrew", second.id).await.unwrap();
     assert_eq!(mcp_status(&h.base, &second.token).await, 401);

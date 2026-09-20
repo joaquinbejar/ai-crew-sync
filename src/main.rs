@@ -254,8 +254,7 @@ enum AdminCredentialCmd {
     /// List administrative credentials: every team's for a global
     /// credential, its own team's for a team credential.
     List {
-        /// With --local: restrict to this team. Remote listings are already
-        /// scoped by the credential.
+        /// Only this team's credentials (global ones are never included).
         #[arg(long)]
         team: Option<String>,
         /// Talk to Postgres (DATABASE_URL) instead of the bus. For emergencies.
@@ -633,11 +632,29 @@ async fn run_admin_remote(cmd: AdminCmd) -> anyhow::Result<()> {
                 api.config().url
             );
         }
-        AdminCmd::Credential(AdminCredentialCmd::List { .. }) => {
+        AdminCmd::Credential(AdminCredentialCmd::List { team, .. }) => {
             let v = api.list_credentials().await?;
-            let rows = v["credentials"].as_array().cloned().unwrap_or_default();
+            // The server already scopes the listing to the credential; --team
+            // narrows a global listing further (a team credential's is its
+            // own team whatever the flag says, so the flag is checked).
+            let wanted = team.as_deref().map(|t| t.trim().to_lowercase());
+            let rows: Vec<serde_json::Value> = v["credentials"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| match &wanted {
+                    Some(t) => c["team"].as_str() == Some(t.as_str()),
+                    None => true,
+                })
+                .collect();
             if rows.is_empty() {
-                println!("(no administrative credentials)");
+                match wanted {
+                    Some(t) => println!(
+                        "(no administrative credentials for team '{t}' visible to this credential)"
+                    ),
+                    None => println!("(no administrative credentials)"),
+                }
             }
             for c in rows {
                 let flag = if c["revoked"] == true {
