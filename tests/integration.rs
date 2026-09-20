@@ -5986,6 +5986,73 @@ async fn five_conversations_share_a_repo_and_stay_separate() {
         );
     }
 
+    // The workflow the stack exists for, end to end: design opens a thread
+    // with the implementation window and both reviewers, each acknowledges
+    // for itself, and the sender can see who acted.
+    enable_conversations(&h.pool, "acme").await;
+    let convo = call(
+        design,
+        "create_conversation",
+        json!({"title": "the empty state", "private": true,
+               "invite": [ids[0].2.clone(), ids[2].2.clone(), ids[3].2.clone()]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    for c in [&clients[0], &clients[2], &clients[3]] {
+        call(c, "join_conversation", json!({"conversation_id": cid})).await;
+    }
+    let asked = call(
+        design,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "the empty state needs a spinner",
+               "request_id": Uuid::new_v4().to_string()}),
+    )
+    .await;
+    let asked_id = asked["message_id"].as_str().unwrap().to_owned();
+    assert_eq!(asked["recipients"].as_array().unwrap().len(), 3);
+
+    // The fifth window was never invited and sees nothing.
+    let err = call_expect_error(
+        &clients[4],
+        "read_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("no such conversation"), "{err}");
+
+    // Independent observations: implementation resolves, one reviewer only
+    // acknowledges, the other has not answered.
+    call(
+        &clients[0],
+        "ack_message",
+        json!({"message_id": asked_id, "resolved": true, "note": "added in 4d21f"}),
+    )
+    .await;
+    call(&clients[2], "ack_message", json!({"message_id": asked_id})).await;
+    let receipts = call(
+        design,
+        "get_message_receipts",
+        json!({"message_id": asked_id}),
+    )
+    .await;
+    assert_eq!(receipts["total"], 3);
+    assert_eq!(receipts["acknowledged"], 2);
+    assert_eq!(receipts["resolved"], 1, "{receipts}");
+    let pending = receipts["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["address"] == ids[3].2.as_str())
+        .unwrap();
+    assert!(
+        pending["acknowledged_at"].is_null(),
+        "still to answer: {pending}"
+    );
+    assert!(
+        pending["presented_at"].is_null(),
+        "unknown presentation stays unknown"
+    );
+
     // A hook of the implementation conversation acts on THAT window: the
     // same conversation id resolves to the same session, so a heartbeat from
     // the hook updates this window's presence and nobody else's.
