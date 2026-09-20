@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod conversations;
 pub mod digest;
 pub mod locks;
 pub mod messaging;

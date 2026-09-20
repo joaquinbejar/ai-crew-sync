@@ -1,4 +1,5 @@
 pub mod attachments;
+pub mod conversations;
 pub mod events;
 pub mod locks;
 pub mod messaging;
@@ -90,7 +91,8 @@ impl Bus {
             + Self::locks_router()
             + Self::events_router()
             + Self::attachments_router()
-            + Self::sessions_router();
+            + Self::sessions_router()
+            + Self::conversations_router();
         Self {
             db,
             hub,
