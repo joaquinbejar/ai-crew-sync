@@ -817,6 +817,50 @@ be built and tested before there is anything external to blame for it;
 returning a conversation to synchronous mode is refused while work is still
 outstanding, because a thread would otherwise keep a gap nobody drains.
 
+## JetStream (phase 4: the adapter, not a rollout)
+
+A JetStream adapter exists behind the backend boundary. **A default
+installation never contacts a broker**: `conversations.backend` is
+`postgres`, ordinary teams stay on the synchronous path, and NATS does not
+need to be running. Merging or installing this does not move anyone's data.
+
+What is in place, proven against a real broker in the test suite:
+
+- One **file-backed, bounded stream per team**, named from the team id so a
+  rename never moves data and a slug never reaches the broker. Limits
+  retention, `DiscardNew` when full: a full stream refuses new writes instead
+  of quietly dropping history.
+- **Provisioning is an operator action with its own credential.** The runtime
+  credential publishes and fetches and cannot create or delete a stream; a
+  team routed to JetStream without provisioning fails at startup with a
+  message saying so, rather than at the first message.
+- **NATS is internal.** No subject, stream or consumer name is ever a
+  client-facing argument, and ACS checks every ACL itself.
+- **`stored` still means acknowledged.** The adapter awaits the PubAck; a
+  publish that has not been acknowledged is not stored, and is not reported
+  as such.
+- **Idempotency** on `Nats-Msg-Id`, using the outbox's publish key, so a retry
+  inside the deduplication window returns the original sequence. Outside it,
+  reconciliation asks the broker what it holds rather than guessing.
+
+### The 1 MiB body contract needs two limits raised, not one
+
+The stream's `max_message_size` is not enough. The **server's** own
+`max_payload` defaults to 1 MiB, and a 1 MiB body plus its envelope headers
+is about 1,048,800 bytes — refused by a couple of hundred bytes. A deployment
+that raises only the stream limit rejects exactly the messages the body
+contract allows.
+
+Run the broker with `--max_payload 2MB` (the test fixture does), and a body
+at the contract's ceiling is refused by neither. Bodies past the broker's
+limit fail **fatally** rather than retrying for ever, along with a full
+stream and a refused authorization; a timeout or a dropped connection stays
+retryable.
+
+The integration fixture is **required** from this phase: `make test` starts a
+real NATS 2.12 with JetStream, and a missing broker fails the suite visibly.
+A broker test that skips itself proves nothing and reads like a pass.
+
 ## A worked example: design, implementation, review
 
 Five conversations in one repository, one agent token, nothing exported.

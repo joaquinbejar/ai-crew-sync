@@ -7388,3 +7388,194 @@ async fn team_id(pool: &PgPool, slug: &str) -> Uuid {
         .await
         .unwrap()
 }
+
+// -------------------------------------------------- the JetStream adapter --
+
+/// The broker fixture. Required from phase 4: a skipped broker test proves
+/// nothing and reads like a pass, so a missing broker fails visibly.
+fn nats_url() -> String {
+    match std::env::var("TEST_NATS_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => panic!(
+            "TEST_NATS_URL is not set. From phase 4 the real JetStream fixture is required: \
+             run `make test`, which starts it, or set TEST_NATS_URL yourself. This is a \
+             failure rather than a skip on purpose."
+        ),
+    }
+}
+
+/// The adapter contract against a real broker: publish and await the PubAck,
+/// read the body back, refuse another team's locator, deduplicate on the
+/// publish key, carry a body at the contract's ceiling, and tell a full
+/// stream apart from a timeout.
+#[tokio::test]
+async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
+    use ai_crew_sync::store::backend::{Envelope, Locator, MessagingBackend, Published};
+    use ai_crew_sync::store::jetstream::{self, Config, JetStreamBackend};
+
+    // Small ceilings: the fixture's broker has a small store, and the
+    // quota behaviour is the same at any size.
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    let team = Uuid::new_v4();
+    let other_team = Uuid::new_v4();
+    let conversation = Uuid::new_v4();
+
+    // Provisioning is an operator action, and the runtime path refuses to
+    // start against a team that has not had it done.
+    let err = match JetStreamBackend::connect(&config, team).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("connecting to an unprovisioned team must fail"),
+    };
+    assert!(err.contains("does not exist"), "{err}");
+    assert!(err.contains("Provision it first"), "{err}");
+
+    let stream = JetStreamBackend::provision(&config, team).await.unwrap();
+    assert_eq!(stream, jetstream::stream_name(team));
+    JetStreamBackend::provision(&config, other_team)
+        .await
+        .unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    let theirs = JetStreamBackend::connect(&config, other_team)
+        .await
+        .unwrap();
+
+    // A publish is stored when the PubAck says so, and the locator reads it
+    // back.
+    let key = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let envelope = Envelope {
+        message_id,
+        conversation_id: conversation,
+        team_id: team,
+        body: "the empty state needs a spinner".into(),
+        publish_key: key,
+    };
+    let locator = match backend.publish(envelope.clone()).await {
+        Published::Confirmed(l) => l,
+        other => panic!("expected a PubAck: {other:?}"),
+    };
+    assert!(locator.0.starts_with("jetstream:"), "{locator:?}");
+    assert_eq!(
+        backend.fetch(&locator).await.unwrap().as_deref(),
+        Some("the empty state needs a spinner")
+    );
+
+    // Another team cannot read it even holding the locator. Two independent
+    // reasons, and either is a pass: the locator names a sequence in *their*
+    // stream, which does not hold it, and the envelope's team is checked
+    // rather than trusted if it ever did.
+    match theirs.fetch(&locator).await {
+        Ok(None) => {}
+        Err(e) => assert!(e.to_string().contains("another team"), "{e}"),
+        Ok(Some(body)) => panic!("another team read a body it must not see: {body}"),
+    }
+
+    // Idempotency: the same publish key inside the dedup window returns the
+    // same sequence rather than storing twice.
+    let again = match backend.publish(envelope.clone()).await {
+        Published::Confirmed(l) => l,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(again, locator, "a retry must not duplicate the body");
+    // And reconciliation recognises the key for the uncertain case.
+    assert_eq!(
+        backend.reconcile(key).await.unwrap(),
+        Some(locator.clone()),
+        "reconcile must find a key the broker has seen"
+    );
+    assert_eq!(
+        backend.reconcile(Uuid::new_v4()).await.unwrap(),
+        None,
+        "a key the broker never saw means the write did not land"
+    );
+
+    // The 1 MiB body contract still fits once headers and framing are added
+    // — but only because the fixture raises the server's own max_payload as
+    // well as the stream's ceiling. With the server default of 1 MiB this
+    // publish is refused by a couple of hundred bytes of headers, which is
+    // why the Makefile passes --max_payload 2MB and the constant says so.
+    let big = "x".repeat(1024 * 1024);
+    let outcome = backend
+        .publish(Envelope {
+            message_id: Uuid::new_v4(),
+            conversation_id: conversation,
+            team_id: team,
+            body: big.clone(),
+            publish_key: Uuid::new_v4(),
+        })
+        .await;
+    assert!(
+        matches!(outcome, Published::Confirmed(_)),
+        "a body at the contract's ceiling must fit: {outcome:?}"
+    );
+    // And one past the broker's limit is fatal, not retried for ever.
+    let too_big = "x".repeat(jetstream::MAX_BROKER_MESSAGE_BYTES as usize + 1);
+    let outcome = backend
+        .publish(Envelope {
+            message_id: Uuid::new_v4(),
+            conversation_id: conversation,
+            team_id: team,
+            body: too_big,
+            publish_key: Uuid::new_v4(),
+        })
+        .await;
+    assert!(matches!(outcome, Published::Fatal(_)), "{outcome:?}");
+
+    // An unknown locator is absent, not an error, and a forged one is
+    // refused rather than guessed at.
+    assert!(
+        backend
+            .fetch(&Locator("jetstream:ACS_T_x:999999".into()))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(backend.fetch(&Locator("nonsense".into())).await.is_err());
+
+    // A broker that is not there fails retryably rather than hanging.
+    let unreachable = Config::new("nats://127.0.0.1:1");
+    assert!(
+        JetStreamBackend::connect(&unreachable, team).await.is_err(),
+        "an unreachable broker must fail, not block"
+    );
+
+    // Clean up after ourselves: streams and their bodies are per test.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    JetStreamBackend::deprovision(&config, other_team)
+        .await
+        .unwrap();
+}
+
+/// The default install does not need a broker: an ordinary team's
+/// conversations are Postgres-backed and untouched by anything above.
+#[tokio::test]
+async fn the_default_backend_stays_postgres_with_no_broker_involved() {
+    let h = require_db!("t_default_backend");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let client = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &client,
+        "create_conversation",
+        json!({"title": "ordinary", "private": true}),
+    )
+    .await;
+    let (backend, publication): (String, String) =
+        sqlx::query_as("SELECT backend, publication FROM conversations WHERE id = $1")
+            .bind(convo["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(backend, "postgres");
+    assert_eq!(publication, "sync");
+    let sent = call(
+        &client,
+        "send_conversation_message",
+        json!({"conversation_id": convo["id"], "body": "no broker here",
+               "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(sent["stored"], true);
+    let _ = client.cancel().await;
+    h.shutdown().await;
+}

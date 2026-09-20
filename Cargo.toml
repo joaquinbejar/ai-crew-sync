@@ -78,6 +78,13 @@ rand = "0.10"
 hex = "0.4"
 base64 = "0.23"
 
+# JetStream adapter (phase 4 of ADR 0001). Pinned: the broker protocol and
+# this client move together, and the integration fixture pins the server to
+# match. Nothing uses it unless a team is explicitly routed to JetStream.
+async-nats = "0.50"
+# Shared with async-nats: payloads cross that boundary as Bytes.
+bytes = "1"
+
 # Outgoing webhooks. Kept on the same major as the reqwest rmcp resolves,
 # so the binary carries one HTTP client and one TLS stack, not two.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

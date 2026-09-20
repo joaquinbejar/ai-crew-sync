@@ -16,6 +16,12 @@ STACK       ?= crew
 TRAEFIK_NETWORK ?= edge
 
 TEST_PG_NAME  = ai-crew-sync-test-pg
+# The JetStream fixture. Required from phase 4 of ADR 0001: a broker test
+# that skips itself proves nothing and reads like a pass, so a missing
+# broker is a visible failure rather than a silent one.
+TEST_NATS_NAME  = ai-crew-sync-test-nats
+TEST_NATS_PORT ?= 14222
+TEST_NATS_IMAGE = nats:2.12-alpine
 TEST_PG_PORT ?= 55432
 TEST_PG_IMAGE ?= postgres:18-alpine
 
@@ -99,9 +105,21 @@ test: ## Integration tests against a throwaway Postgres (needs docker)
 		-e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=test \
 		$(TEST_PG_IMAGE) >/dev/null
 	@until docker exec $(TEST_PG_NAME) pg_isready -U test >/dev/null 2>&1; do sleep 1; done
-	@AI_CREW_SYNC_REQUIRE_DB=1 \
-		TEST_DATABASE_URL=postgres://test:test@localhost:$(TEST_PG_PORT)/test cargo test; \
-		status=$$?; docker rm -f $(TEST_PG_NAME) >/dev/null; exit $$status
+	@docker rm -f $(TEST_NATS_NAME) >/dev/null 2>&1 || true
+	@# Docker/nats-test.conf raises max_payload, which nats-server accepts
+	@# only in a config file and whose 1 MiB default refuses a 1 MiB body
+	@# once envelope headers are added. Measured — see the adapter test.
+	@docker run -d --name $(TEST_NATS_NAME) -p $(TEST_NATS_PORT):4222 \
+		-v "$(PWD)/Docker/nats-test.conf:/etc/nats/nats.conf:ro" \
+		$(TEST_NATS_IMAGE) -js -c /etc/nats/nats.conf >/dev/null
+	@until docker logs $(TEST_NATS_NAME) 2>&1 | grep -q 'Server is ready'; do sleep 1; done
+	@AI_CREW_SYNC_REQUIRE_DB=1 AI_CREW_SYNC_REQUIRE_NATS=1 \
+		TEST_DATABASE_URL=postgres://test:test@localhost:$(TEST_PG_PORT)/test \
+		TEST_NATS_URL=nats://127.0.0.1:$(TEST_NATS_PORT) cargo test; \
+		status=$$?; \
+		docker rm -f $(TEST_PG_NAME) >/dev/null; \
+		docker rm -f $(TEST_NATS_NAME) >/dev/null; \
+		exit $$status
 
 # --- build and run ----------------------------------------------------------
 
