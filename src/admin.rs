@@ -1,50 +1,34 @@
 //! Operator-facing commands. These bypass MCP entirely and talk to Postgres
-//! directly, so they are the only way to mint credentials.
+//! directly. They remain the emergency path and the only way to bootstrap the
+//! first administrative credential; day-to-day administration goes through
+//! the remote API with `ai-crew-sync admin …`.
+//!
+//! Every mutation is delegated to [`crate::store::admin`] with
+//! [`Actor::Cli`], so the audit trail is the same whichever door was used.
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::auth::{generate_token, hash_token, token_prefix};
+use crate::store::admin::{self as store, Actor};
 
 async fn team_id(pool: &PgPool, slug: &str) -> anyhow::Result<Uuid> {
-    let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM teams WHERE slug = $1")
-        .bind(slug)
-        .fetch_optional(pool)
-        .await?;
-    row.map(|r| r.0)
-        .with_context(|| format!("no team with slug '{slug}'"))
+    Ok(store::team_id_by_slug(pool, slug).await?)
 }
 
 pub async fn team_create(pool: &PgPool, slug: &str, name: Option<String>) -> anyhow::Result<()> {
-    let slug = slug.trim().to_lowercase();
-    if slug.is_empty() {
-        bail!("team slug cannot be empty");
-    }
-    let name = name.unwrap_or_else(|| slug.clone());
-    sqlx::query("INSERT INTO teams (slug, name) VALUES ($1, $2) ON CONFLICT (slug) DO NOTHING")
-        .bind(&slug)
-        .bind(&name)
-        .execute(pool)
-        .await?;
-    println!("team '{slug}' ready");
+    let team = store::create_team(pool, Actor::Cli, slug, name).await?;
+    println!("team '{}' ready", team.slug);
     Ok(())
 }
 
 pub async fn team_list(pool: &PgPool) -> anyhow::Result<()> {
-    let rows: Vec<(String, String, i64)> = sqlx::query_as(
-        r#"
-        SELECT t.slug, t.name, (SELECT count(*) FROM agents a WHERE a.team_id = t.id)
-        FROM teams t ORDER BY t.slug
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows = store::list_teams(pool).await?;
     if rows.is_empty() {
         println!("(no teams yet — create one with `team create --slug <slug>`)");
     }
-    for (slug, name, agents) in rows {
-        println!("{slug:<20} {name:<30} {agents} agent(s)");
+    for t in rows {
+        println!("{:<20} {:<30} {} agent(s)", t.slug, t.name, t.agents);
     }
     Ok(())
 }
@@ -156,53 +140,24 @@ pub async fn agent_add(
     issue_token: bool,
 ) -> anyhow::Result<()> {
     let tid = team_id(pool, team).await?;
-    let name = name.trim().to_lowercase();
-    if name.is_empty() {
-        bail!("agent name cannot be empty");
-    }
-
-    sqlx::query(
-        r#"
-        INSERT INTO agents (team_id, name, display_name)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (team_id, name) DO UPDATE
-            SET display_name = COALESCE(EXCLUDED.display_name, agents.display_name),
-                disabled_at = NULL
-        "#,
-    )
-    .bind(tid)
-    .bind(&name)
-    .bind(display_name)
-    .execute(pool)
-    .await?;
-    println!("agent '{name}' ready in team '{team}'");
+    let agent = store::create_agent(pool, Actor::Cli, tid, name, display_name).await?;
+    println!("agent '{}' ready in team '{team}'", agent.name);
 
     if issue_token {
-        token_issue(pool, team, &name, None).await?;
+        token_issue(pool, team, &agent.name, None).await?;
     }
     Ok(())
 }
 
 pub async fn agent_list(pool: &PgPool, team: &str) -> anyhow::Result<()> {
     let tid = team_id(pool, team).await?;
-    let rows: Vec<(String, Option<String>, bool, i64)> = sqlx::query_as(
-        r#"
-        SELECT a.name,
-               a.display_name,
-               (a.disabled_at IS NOT NULL) AS disabled,
-               (SELECT count(*) FROM api_tokens t
-                 WHERE t.agent_id = a.id AND t.revoked_at IS NULL)
-        FROM agents a WHERE a.team_id = $1 ORDER BY a.name
-        "#,
-    )
-    .bind(tid)
-    .fetch_all(pool)
-    .await?;
-    for (name, display, disabled, tokens) in rows {
-        let flag = if disabled { " [disabled]" } else { "" };
+    for a in store::list_agents(pool, tid).await? {
+        let flag = if a.disabled { " [disabled]" } else { "" };
         println!(
-            "{name:<24} {:<28} {tokens} active token(s){flag}",
-            display.unwrap_or_default()
+            "{:<24} {:<28} {} active token(s){flag}",
+            a.name,
+            a.display_name.unwrap_or_default(),
+            a.active_tokens
         );
     }
     Ok(())
@@ -210,13 +165,9 @@ pub async fn agent_list(pool: &PgPool, team: &str) -> anyhow::Result<()> {
 
 pub async fn agent_disable(pool: &PgPool, team: &str, name: &str) -> anyhow::Result<()> {
     let tid = team_id(pool, team).await?;
-    let res = sqlx::query("UPDATE agents SET disabled_at = now() WHERE team_id = $1 AND name = $2")
-        .bind(tid)
-        .bind(name.trim())
-        .execute(pool)
-        .await?;
-    if res.rows_affected() == 0 {
-        bail!("no agent '{name}' in team '{team}'");
+    match store::disable_agent(pool, Actor::Cli, tid, name).await {
+        Err(crate::error::BusError::NotFound(_)) => bail!("no agent '{name}' in team '{team}'"),
+        other => other?,
     }
     println!("agent '{name}' disabled; its tokens no longer authenticate");
     Ok(())
@@ -229,79 +180,117 @@ pub async fn token_issue(
     label: Option<String>,
 ) -> anyhow::Result<()> {
     let tid = team_id(pool, team).await?;
-    let row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM agents WHERE team_id = $1 AND name = $2")
-            .bind(tid)
-            .bind(agent.trim())
-            .fetch_optional(pool)
-            .await?;
-    let Some((agent_id,)) = row else {
-        bail!("no agent '{agent}' in team '{team}' — add it with `agent add` first");
+    let issued = match store::issue_token(pool, Actor::Cli, tid, agent, label).await {
+        Err(crate::error::BusError::NotFound(_)) => {
+            bail!("no agent '{agent}' in team '{team}' — add it with `agent add` first")
+        }
+        other => other?,
     };
 
-    let raw = generate_token();
-    sqlx::query(
-        "INSERT INTO api_tokens (agent_id, token_hash, prefix, label) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(agent_id)
-    .bind(hash_token(&raw))
-    .bind(token_prefix(&raw))
-    .bind(label)
-    .execute(pool)
-    .await?;
-
     println!();
-    println!("Token for {agent}@{team} — shown once, store it now:");
+    println!(
+        "Token for {}@{} — shown once, store it now:",
+        issued.agent, issued.team
+    );
     println!();
-    println!("  {raw}");
+    println!("  {}", issued.token);
     println!();
     Ok(())
 }
 
 pub async fn token_list(pool: &PgPool, team: &str) -> anyhow::Result<()> {
     let tid = team_id(pool, team).await?;
-    let rows: Vec<(
-        Uuid,
-        String,
-        String,
-        Option<String>,
-        Option<chrono::DateTime<chrono::Utc>>,
-        bool,
-    )> = sqlx::query_as(
-        r#"
-        SELECT t.id, a.name, t.prefix, t.label, t.last_used_at,
-               (t.revoked_at IS NOT NULL) AS revoked
-        FROM api_tokens t
-        JOIN agents a ON a.id = t.agent_id
-        WHERE a.team_id = $1
-        ORDER BY a.name, t.created_at
-        "#,
-    )
-    .bind(tid)
-    .fetch_all(pool)
-    .await?;
-    for (id, agent, prefix, label, last_used, revoked) in rows {
-        let used = last_used
+    for t in store::list_tokens(pool, tid).await? {
+        let used = t
+            .last_used_at
             .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_else(|| "never".into());
-        let flag = if revoked { " [revoked]" } else { "" };
+        let flag = if t.revoked { " [revoked]" } else { "" };
         println!(
-            "{id}  {agent:<20} {prefix}…  last used {used}  {}{flag}",
-            label.unwrap_or_default()
+            "{}  {:<20} {}…  last used {used}  {}{flag}",
+            t.id,
+            t.agent,
+            t.prefix,
+            t.label.unwrap_or_default()
         );
     }
     Ok(())
 }
 
 pub async fn token_revoke(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
-    let res = sqlx::query("UPDATE api_tokens SET revoked_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
-    if res.rows_affected() == 0 {
-        bail!("no token with id {id}");
+    match store::revoke_token(pool, Actor::Cli, None, id).await {
+        Err(crate::error::BusError::NotFound(_)) => bail!("no token with id {id}"),
+        other => other?,
     }
     println!("token {id} revoked");
+    Ok(())
+}
+
+// ------------------------------------------------- administrative credentials --
+
+/// Mint a global administrative credential. The one operation that needs a
+/// database connection and no prior credential: everything else can be done
+/// remotely with the credential this prints.
+pub async fn admin_bootstrap(pool: &PgPool, label: Option<String>) -> anyhow::Result<()> {
+    let issued = store::grant_admin(pool, Actor::Cli, None, label).await?;
+    let active = store::list_admins(pool, None)
+        .await?
+        .into_iter()
+        .filter(|c| c.team.is_none() && !c.revoked)
+        .count();
+
+    println!();
+    println!("Global administrative credential — shown once, store it now:");
+    println!();
+    println!("  {}", issued.token);
+    println!();
+    println!("Use it from your machine with `ai-crew-sync admin login --url <bus>`.");
+    println!(
+        "{active} global credential(s) are now active; list them with `admin credential list`."
+    );
+    Ok(())
+}
+
+pub async fn admin_credential_list(pool: &PgPool, team: Option<&str>) -> anyhow::Result<()> {
+    let tid = match team {
+        Some(slug) => Some(team_id(pool, slug).await?),
+        None => None,
+    };
+    let rows = store::list_admins(pool, tid).await?;
+    if rows.is_empty() {
+        println!("(no administrative credentials — mint the first with `admin bootstrap`)");
+    }
+    for c in rows {
+        print_admin_row(&c);
+    }
+    Ok(())
+}
+
+/// One line per credential, shared with the remote CLI so both listings read
+/// the same.
+pub fn print_admin_row(c: &store::AdminRow) {
+    let used = c
+        .last_used_at
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "never".into());
+    let scope = c.team.as_deref().unwrap_or("(global)");
+    let flag = if c.revoked { " [revoked]" } else { "" };
+    println!(
+        "{}  {scope:<20} {}…  last used {used}  {}{flag}",
+        c.id,
+        c.prefix,
+        c.label.as_deref().unwrap_or_default()
+    );
+}
+
+pub async fn admin_credential_revoke(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
+    match store::revoke_admin(pool, Actor::Cli, None, id).await {
+        Err(crate::error::BusError::NotFound(_)) => {
+            bail!("no administrative credential with id {id}")
+        }
+        other => other?,
+    }
+    println!("administrative credential {id} revoked");
     Ok(())
 }
 

@@ -179,6 +179,22 @@ El token se enseña **una sola vez**.
 Gestión posterior: `agent list`, `agent disable`, `token issue`, `token list`,
 `token revoke`.
 
+Estos comandos necesitan `DATABASE_URL`: se ejecutan junto a Postgres, casi
+siempre dentro del contenedor del bus. Hazlo allí **una sola vez** para emitir
+una credencial administrativa global; el resto puede hacerse desde tu máquina:
+
+```bash
+ai-crew-sync admin bootstrap --label "portátil de joaquin"   # imprime acsa_… una vez
+```
+
+Una credencial administrativa (prefijo `acsa_`) es una clase distinta del token
+de agente (`acs_`): no identifica a nadie en el bus, no puede publicar, reclamar
+ni leer nada, y solo gestiona equipos, agentes y tokens. Los tokens de agente, a
+su vez, nunca pueden emitir credenciales, ni siquiera para su propio agente.
+`admin credential list` / `admin credential revoke --id …` gestionan esta clase;
+cada emisión, concesión y revocación queda en una tabla de auditoría que jamás
+contiene un secreto.
+
 ### Un agente por herramienta, no por persona
 
 Si usas Claude Code *y* Codex —o dos agentes de código cualesquiera— dale a

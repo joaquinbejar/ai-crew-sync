@@ -37,6 +37,10 @@ enum Command {
     /// Manage outgoing webhooks (Slack/Discord/generic).
     #[command(subcommand)]
     Webhook(WebhookCmd),
+    /// Administrative credentials: bootstrap the first one next to Postgres,
+    /// then administer the bus remotely with it.
+    #[command(subcommand)]
+    Admin(AdminCmd),
     /// Talk to a running bus from the console, as an agent. Everything the MCP
     /// tools can do: send/read messages, claim tasks, notes, presence.
     Client(client::ClientArgs),
@@ -181,6 +185,33 @@ enum WebhookCmd {
         team: String,
     },
     Remove {
+        #[arg(long)]
+        id: Uuid,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCmd {
+    /// Mint a GLOBAL administrative credential. Needs DATABASE_URL: this is
+    /// the one step that runs next to Postgres, once per deployment.
+    Bootstrap {
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Administrative credentials (not agent tokens — those are `token …`).
+    #[command(subcommand)]
+    Credential(AdminCredentialCmd),
+}
+
+#[derive(Subcommand)]
+enum AdminCredentialCmd {
+    /// List administrative credentials; every team's unless --team is given.
+    List {
+        #[arg(long)]
+        team: Option<String>,
+    },
+    /// Revoke an administrative credential. It stops authorising immediately.
+    Revoke {
         #[arg(long)]
         id: Uuid,
     },
@@ -337,6 +368,18 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
             }
             TokenCmd::List { team } => admin::token_list(&pool, &team).await?,
             TokenCmd::Revoke { id } => admin::token_revoke(&pool, id).await?,
+        },
+
+        Command::Admin(cmd) => match cmd {
+            AdminCmd::Bootstrap { label } => admin::admin_bootstrap(&pool, label).await?,
+            AdminCmd::Credential(cmd) => match cmd {
+                AdminCredentialCmd::List { team } => {
+                    admin::admin_credential_list(&pool, team.as_deref()).await?
+                }
+                AdminCredentialCmd::Revoke { id } => {
+                    admin::admin_credential_revoke(&pool, id).await?
+                }
+            },
         },
 
         Command::Webhook(cmd) => match cmd {

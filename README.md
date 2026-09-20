@@ -174,6 +174,21 @@ The token is shown **only once**.
 Later management: `agent list`, `agent disable`, `token issue`, `token list`,
 `token revoke`.
 
+These commands need `DATABASE_URL`: they run next to Postgres, typically
+inside the bus container. Do this **once** there to mint a global
+administrative credential, so the rest can be done from your own machine:
+
+```bash
+ai-crew-sync admin bootstrap --label "joaquin laptop"   # prints acsa_… once
+```
+
+An administrative credential (prefix `acsa_`) is a different class from an
+agent token (`acs_`): it identifies nobody on the bus, cannot post, claim or
+read anything, and only manages teams, agents and tokens. Agent tokens, in
+turn, can never mint credentials, not even for their own agent. `admin
+credential list` / `admin credential revoke --id …` manage this class; every
+issue, grant and revocation lands in an audit table that never holds a secret.
+
 ### One agent per tool, not per person
 
 If you run Claude Code *and* Codex — or any two coding agents — give each its
