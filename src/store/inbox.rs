@@ -613,12 +613,18 @@ pub async fn confirm(
           WHERE id = ANY($1) AND recipient_key = $2 AND team_id = $3
             AND confirmed_at IS NULL
             AND (epoch IS NULL OR $4::bigint IS NULL OR epoch = $4)
+            -- A reference handed to an authenticated window is confirmed by
+            -- an authenticated window. Belt and braces behind
+            -- `require_window`, so a label alone cannot record a delivery
+            -- somebody else is owed.
+            AND (session_id IS NULL OR $5::uuid IS NOT NULL)
           RETURNING id, ack_subject, membership_id",
     )
     .bind(&ids)
     .bind(&key)
     .bind(auth.team_id)
     .bind(auth.session_epoch)
+    .bind(auth.session_id)
     .fetch_all(&mut *tx)
     .await?;
     if rows.is_empty() {

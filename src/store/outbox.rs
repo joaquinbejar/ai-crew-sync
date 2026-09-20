@@ -357,6 +357,17 @@ pub async fn publish_leased<B: MessagingBackend>(
     lease: &Lease,
 ) -> BusResult<Settled> {
     let outcome = backend.publish(envelope_of(lease)).await;
+    // The last attempt is where a lost confirmation turns into a permanent
+    // lie. "The backend did not answer" and "the backend does not have it"
+    // are different facts, and giving up on the first one records the
+    // second. Ask before writing a failure that is not one; every earlier
+    // attempt just retries, which is cheaper.
+    if matches!(outcome, Published::Retryable(_))
+        && lease.attempts >= MAX_ATTEMPTS
+        && let Some(locator) = backend.reconcile(&envelope_of(lease)).await?
+    {
+        return settle(pool, lease, Published::Confirmed(locator)).await;
+    }
     settle(pool, lease, outcome).await
 }
 

@@ -321,20 +321,25 @@ pub async fn require_window(pool: &PgPool, auth: &AuthCtx) -> BusResult<()> {
     if auth.session.is_empty() || auth.session_id.is_some() {
         return Ok(());
     }
-    let (live,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM agent_sessions
-          WHERE agent_id = $1 AND label = $2 AND revoked_at IS NULL AND expires_at > now()",
-    )
-    .bind(auth.agent_id)
-    .bind(&auth.session)
-    .fetch_one(pool)
-    .await?;
-    if live == 0 {
+    // Registered at all, not registered *and still live*. Revoking or
+    // expiring a window must not turn it back into a label anyone holding
+    // the agent token can wear: that would make revocation a way in rather
+    // than a way out. The audited path for an agent to reach a window that
+    // is gone is `recover_conversation_history`, which requires every
+    // window to be closed and grants nothing.
+    let (registered,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM agent_sessions WHERE agent_id = $1 AND label = $2")
+            .bind(auth.agent_id)
+            .bind(&auth.session)
+            .fetch_one(pool)
+            .await?;
+    if registered == 0 {
         return Ok(());
     }
     Err(BusError::Forbidden(format!(
         "'{}' is a registered window and this call carries an agent token, not that \
-         window's session credential. Ask that window to make the call, or use \
+         window's session credential. Revoking or expiring it does not hand the label \
+         back: ask that window to make the call, register it again, or use \
          recover_conversation_history, which is the audited way for an agent to reach \
          its own windows' threads.",
         auth.session
