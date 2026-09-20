@@ -861,6 +861,18 @@ second copy of an attachment anywhere.
 - Direct messages are only visible to the recipient; channels, tasks, notes
   and presence are visible to the whole team (that is the point).
 
+## Architecture decisions
+
+`docs/adr/0001-authenticated-sessions-and-staged-messaging.md` records the
+accepted direction: session credentials issued by the server and derived from
+an agent token, lifecycle hooks backed by the `ai-crew-sync` binary,
+conversations and per-recipient receipts delivered on Postgres, and an
+optional JetStream route for conversation bodies and inbox fanout afterwards.
+Seven independently deployable phases; nothing in it is active until the
+corresponding release ships and an operator opts in. Today's behavior — all
+state in Postgres, `X-Crew-Session` as a caller-supplied label, hooks that
+need only `curl` and `python3` — keeps working throughout.
+
 ## Contribution and Contact
 
 We welcome contributions to this project! If you would like to contribute, please follow these steps:
