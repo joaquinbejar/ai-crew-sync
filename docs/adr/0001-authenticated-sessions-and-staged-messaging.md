@@ -2,6 +2,15 @@
 
 Status: accepted for implementation planning by the owner in the 2026-09-20 design discussion. No runtime implementation or production activation is implied.
 
+> **Editorial note (2026-09-20), not part of the accepted decision.** The text
+> below is published verbatim as accepted, and it was written against a
+> working checkout that already held unmerged migrations. At the time this
+> document lands on `main`, the last applied migration is
+> `0011_admin_credentials.sql`; `0012_session_discovery.sql` and
+> `0013_authenticated_sessions.sql` arrive with the phase 1 work. Take every
+> migration number in this ADR as illustrative and read `migrations/` for the
+> next free one when you implement.
+
 Public decision record: [issue #93](https://github.com/joaquinbejar/ai-crew-sync/issues/93). Phase issues: [#94](https://github.com/joaquinbejar/ai-crew-sync/issues/94), [#95](https://github.com/joaquinbejar/ai-crew-sync/issues/95), [#96](https://github.com/joaquinbejar/ai-crew-sync/issues/96), [#97](https://github.com/joaquinbejar/ai-crew-sync/issues/97), [#98](https://github.com/joaquinbejar/ai-crew-sync/issues/98), [#99](https://github.com/joaquinbejar/ai-crew-sync/issues/99) and [#100](https://github.com/joaquinbejar/ai-crew-sync/issues/100).
 
 ## Context
