@@ -783,6 +783,45 @@ ai-crew-sync client call get_task --args '{"key":"refactor-auth"}'   # escape ha
 
 All subcommands accept `--json` for raw output (pipeable to `jq`).
 
+## A worked example: design, implementation, review
+
+Five conversations in one repository, one agent token, nothing exported.
+Each window connects through `ai-crew-sync mcp proxy` with a role, so it has
+its own session and its own address:
+
+```
+design           → configure_session {"role": "design"}
+implementation   → configure_session {"role": "implementation"}
+review (Claude)  → configure_session {"role": "review"}
+review (Codex) × 2
+```
+
+**Design finds the implementation window and asks for a change.** Not by
+guessing a name: `list_sessions {"project": "market-data", "role":
+"implementation"}` returns one entry with an exact `address`, and a message
+to it reaches that window and no sibling.
+
+**A review that needs an answer from several people becomes a thread.**
+`create_conversation` with the three addresses, each accepting for itself,
+then one message. Later, `get_message_receipts` says implementation
+acknowledged *and* resolved, one reviewer acknowledged, and the other has not
+answered — three independent facts, none inferred from a cursor.
+
+**Ending a window does not disturb the others.** Its claims stay claimed, its
+inbox stays unread, its presence ages out on its own. Reopening the same
+conversation resumes the same session; forking gets a new one.
+
+What this does not do: wake an idle window. Nothing is pushed into a model
+that is not in a turn — a window reads with `read_messages` or blocks with
+`wait_for_updates` while it is working, and the `Stop` hook holds a turn open
+long enough to answer a blocking question. Switching credentials also erases
+nothing: the transcript is the host's, and every message and receipt stays
+under the identity that made it.
+
+`docs/acceptance/host-integration.md` has the verified host facts, the
+unsupported topologies and a manual script for real clients, with what was
+tested separately from what the automated suite simulates.
+
 ## Conversations: who was asked, and who answered
 
 A channel broadcasts and a direct message points at one window. Neither

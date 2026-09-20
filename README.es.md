@@ -793,6 +793,45 @@ ai-crew-sync client call get_task --args '{"key":"refactor-auth"}'   # escape ha
 
 Todos los subcomandos aceptan `--json` para salida cruda (pipeable a `jq`).
 
+## Un ejemplo completo: diseño, implementación, revisión
+
+Cinco conversaciones en un repositorio, un solo token de agente, sin exportar
+nada. Cada ventana conecta por `ai-crew-sync mcp proxy` con un rol, así que
+tiene su propia sesión y su propia dirección:
+
+```
+design           → configure_session {"role": "design"}
+implementation   → configure_session {"role": "implementation"}
+review (Claude)  → configure_session {"role": "review"}
+review (Codex) × 2
+```
+
+**Diseño encuentra la ventana de implementación y pide un cambio.** No
+adivinando un nombre: `list_sessions {"project": "market-data", "role":
+"implementation"}` devuelve una entrada con su `address` exacta, y un mensaje
+a esa dirección llega a esa ventana y a ninguna hermana.
+
+**Una revisión que necesita respuesta de varios se convierte en un hilo.**
+`create_conversation` con las tres direcciones, cada una aceptando por sí
+misma, y un mensaje. Después, `get_message_receipts` dice que implementación
+confirmó *y* resolvió, que un revisor confirmó y que el otro no ha
+contestado: tres hechos independientes, ninguno deducido de un cursor.
+
+**Cerrar una ventana no molesta a las demás.** Sus claims siguen suyos, su
+inbox sigue sin leer, su presencia caduca sola. Reabrir la misma conversación
+reanuda la misma sesión; bifurcarla da una nueva.
+
+Lo que esto no hace: despertar una ventana inactiva. Nada se empuja a un
+modelo que no está en un turno; una ventana lee con `read_messages` o espera
+con `wait_for_updates` mientras trabaja, y el hook `Stop` mantiene el turno
+abierto lo justo para contestar una pregunta bloqueante. Cambiar de
+credencial tampoco borra nada: el transcript es del host, y cada mensaje y
+cada receipt se quedan bajo la identidad que los hizo.
+
+`docs/acceptance/host-integration.md` recoge los hechos verificados de cada
+host, las topologías no soportadas y un guion manual para clientes reales,
+separando lo probado de lo que la suite automática simula.
+
 ## Conversaciones: a quién se preguntó y quién contestó
 
 Un canal difunde y un DM apunta a una ventana. Ninguno responde a la pregunta
