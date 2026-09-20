@@ -5,13 +5,15 @@
 //! - [`store`] holds all business logic and every SQL statement,
 //! - [`tools`] is a thin MCP layer over it,
 //! - [`serve`] wires the transport, authentication and axum together,
-//! - [`admin`] is the operator CLI (teams, agents, tokens).
+//! - [`admin`] is the operator CLI (teams, agents, tokens),
+//! - [`admin_api`] is the remote administration surface at `/admin/*`.
 
 // Row tuples for `sqlx::query_as` are spelled out next to the SELECT that
 // produces them; naming each one would only add indirection.
 #![allow(clippy::type_complexity)]
 
 pub mod admin;
+pub mod admin_api;
 pub mod auth;
 pub mod client;
 pub mod dashboard;

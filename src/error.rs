@@ -18,6 +18,11 @@ pub enum BusError {
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
 
+    /// The caller is known but not allowed: a team-scoped administrative
+    /// credential reaching for another team, or for a global-only action.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -32,6 +37,9 @@ impl BusError {
     pub fn conflict(msg: impl Into<String>) -> Self {
         Self::Conflict(msg.into())
     }
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self::Forbidden(msg.into())
+    }
 }
 
 impl From<BusError> for ErrorData {
@@ -43,6 +51,7 @@ impl From<BusError> for ErrorData {
             BusError::Unauthenticated(m) => {
                 ErrorData::invalid_request(format!("unauthenticated: {m}"), None)
             }
+            BusError::Forbidden(m) => ErrorData::invalid_request(format!("forbidden: {m}"), None),
             BusError::Db(e) => {
                 // Never leak SQL/connection detail to the model; log it instead.
                 tracing::error!(error = %e, "database error");
