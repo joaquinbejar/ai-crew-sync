@@ -68,7 +68,7 @@ pub async fn set_note(pool: &PgPool, auth: &AuthCtx, input: SetInput) -> BusResu
     if scope.len() > MAX_SCOPE_BYTES {
         return Err(BusError::invalid(format!(
             "note scope is {} bytes; the limit is {MAX_SCOPE_BYTES}. A scope is a \
-             namespace such as a repository name",
+             namespace such as a repository name; the content belongs in `value`",
             scope.len()
         )));
     }
