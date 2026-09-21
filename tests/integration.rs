@@ -9192,3 +9192,105 @@ async fn completing_a_task_respects_whoever_holds_it() {
     }
     h.shutdown().await;
 }
+
+/// Every task write is fenced by the session epoch, not only the claim.
+/// Found in review: a context admitted before a resume could still complete
+/// the replacement window's work, because the holder predicate matches the
+/// agent and the label, which a resumed window shares.
+#[tokio::test]
+async fn a_replaced_window_cannot_finish_the_work_of_the_one_that_replaced_it() {
+    use ai_crew_sync::store::tasks;
+
+    let h = require_db!("t_task_epoch_fence");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let agent = connect(&h.base, &token).await;
+    let cred = call(&agent, "register_session", json!({"session": "obrero"})).await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+
+    call(
+        &window,
+        "create_task",
+        json!({"key": "suya", "title": "en curso"}),
+    )
+    .await;
+    let claimed = call(
+        &window,
+        "claim_task",
+        json!({"key": "suya", "lease_seconds": 600}),
+    )
+    .await;
+    assert_eq!(claimed["claimed"], true);
+
+    // The context that connection was admitted with, kept while the window
+    // is resumed by the process that took over.
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'joaquin'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "joaquin".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "obrero".into(),
+        session_id: Some(cred["session_id"].as_str().unwrap().parse().unwrap()),
+        session_epoch: Some(cred["epoch"].as_i64().unwrap()),
+        token_id: None,
+    };
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2);
+
+    // Same agent, same label, replaced connection. Every write is refused.
+    for (name, result) in [
+        (
+            "complete",
+            tasks::complete_task(&h.pool, &stale, "suya", Some("no soy yo".into()))
+                .await
+                .err(),
+        ),
+        (
+            "renew",
+            tasks::renew_lease(&h.pool, &stale, "suya", Some(600))
+                .await
+                .err(),
+        ),
+        (
+            "release",
+            tasks::release_task(&h.pool, &stale, "suya").await.err(),
+        ),
+        (
+            "claim",
+            tasks::claim_task(&h.pool, &stale, "suya", Some(600))
+                .await
+                .err(),
+        ),
+    ] {
+        let err = result
+            .unwrap_or_else(|| panic!("{name} accepted a replaced connection"))
+            .to_string();
+        assert!(err.contains("stale"), "{name}: {err}");
+        assert!(err.contains("Nothing was written"), "{name}: {err}");
+    }
+
+    // The resume rotated the secret, so the live window is the one holding
+    // the new credential.
+    let live = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+    let still = call(&live, "get_task", json!({"key": "suya"})).await;
+    assert_eq!(
+        still["task"]["status"], "claimed",
+        "the task is still the live window's: {still}"
+    );
+
+    // And that window finishes it.
+    let done = call(
+        &live,
+        "complete_task",
+        json!({"key": "suya", "result": "hecho"}),
+    )
+    .await;
+    assert_eq!(done["status"], "done", "{done}");
+
+    for c in [agent, window, live] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

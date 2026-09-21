@@ -136,6 +136,26 @@ async fn log_event(
     Ok(())
 }
 
+/// The same row, on the transaction that made the change. A history entry
+/// that commits separately can outlive a rolled-back mutation, or be lost
+/// by one that committed.
+async fn log_event_tx(
+    conn: &mut sqlx::PgConnection,
+    task_id: Uuid,
+    agent_id: Uuid,
+    event: &str,
+    detail: Option<&str>,
+) -> BusResult<()> {
+    sqlx::query("INSERT INTO task_events (task_id, agent_id, event, detail) VALUES ($1,$2,$3,$4)")
+        .bind(task_id)
+        .bind(agent_id)
+        .bind(event)
+        .bind(detail)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 fn normalize_key(key: &str) -> BusResult<String> {
     let key = key.trim();
     if key.is_empty() {
@@ -519,6 +539,11 @@ pub async fn claim_next_task(
         .unwrap_or(DEFAULT_LEASE_SECS)
         .clamp(30, MAX_LEASE_SECS);
 
+    // Fenced like the named claim: a replaced connection does not pick up
+    // work as the window that replaced it.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
+
     let picked: Option<(Uuid, String)> = sqlx::query_as(
         r#"
         WITH candidate AS (
@@ -552,30 +577,34 @@ pub async fn claim_next_task(
     .bind(auth.agent_id)
     .bind(lease as f64)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     match picked {
         Some((id, key)) => {
-            log_event(
-                pool,
+            log_event_tx(
+                &mut tx,
                 id,
                 auth.agent_id,
                 "claimed",
                 Some("via claim_next_task"),
             )
             .await?;
+            tx.commit().await?;
             Ok(ClaimResult {
                 claimed: true,
                 task: Some(fetch_task(pool, auth, &key).await?),
                 reason: None,
             })
         }
-        None => Ok(ClaimResult {
-            claimed: false,
-            task: None,
-            reason: Some("no unclaimed task available".into()),
-        }),
+        None => {
+            tx.rollback().await?;
+            Ok(ClaimResult {
+                claimed: false,
+                task: None,
+                reason: Some("no unclaimed task available".into()),
+            })
+        }
     }
 }
 
@@ -590,6 +619,10 @@ pub async fn renew_lease(
         .unwrap_or(DEFAULT_LEASE_SECS)
         .clamp(30, MAX_LEASE_SECS);
 
+    // Same fence as claiming and completing: a stale connection does not
+    // extend the replacement window's lease.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
     let updated: Option<(Uuid,)> = sqlx::query_as(
         r#"
         UPDATE tasks
@@ -605,17 +638,23 @@ pub async fn renew_lease(
     .bind(&key)
     .bind(auth.agent_id)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if updated.is_none() {
+        tx.rollback().await?;
         return Err(no_claim_here(pool, auth, &key).await);
     }
+    tx.commit().await?;
     fetch_task(pool, auth, &key).await
 }
 
 pub async fn release_task(pool: &PgPool, auth: &AuthCtx, key: &str) -> BusResult<TaskInfo> {
     let key = normalize_key(key)?;
+    // Fenced like the rest: a connection that has been replaced does not
+    // put back the claim its replacement is holding.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
     let updated: Option<(Uuid,)> = sqlx::query_as(
         r#"
         UPDATE tasks
@@ -637,15 +676,19 @@ pub async fn release_task(pool: &PgPool, auth: &AuthCtx, key: &str) -> BusResult
     .bind(&key)
     .bind(auth.agent_id)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     match updated {
         Some((id,)) => {
-            log_event(pool, id, auth.agent_id, "released", None).await?;
+            log_event_tx(&mut tx, id, auth.agent_id, "released", None).await?;
+            tx.commit().await?;
             fetch_task(pool, auth, &key).await
         }
-        None => Err(no_claim_here(pool, auth, &key).await),
+        None => {
+            tx.rollback().await?;
+            Err(no_claim_here(pool, auth, &key).await)
+        }
     }
 }
 
@@ -660,6 +703,14 @@ pub async fn complete_task(
         Some(r) => Some(super::check_text("task result", r, MAX_RESULT_BYTES)?),
         None => None,
     };
+    // Serialised with the mutation, like claim_task: a request already
+    // queued when its window was resumed must not finish the work of the
+    // session that replaced it. The holder predicate below cannot catch
+    // that on its own — a resumed window has the same agent and the same
+    // label, and only the epoch tells them apart.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
+
     // A claim has to mean something on the way out too. Completing is the
     // one write that ended someone else's work: anyone on the team could
     // mark a task done while its holder was still doing it, and the holder
@@ -690,15 +741,17 @@ pub async fn complete_task(
     .bind(&key)
     .bind(auth.agent_id)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     match updated {
         Some((id,)) => {
-            log_event(pool, id, auth.agent_id, "completed", result.as_deref()).await?;
+            log_event_tx(&mut tx, id, auth.agent_id, "completed", result.as_deref()).await?;
+            tx.commit().await?;
             fetch_task(pool, auth, &key).await
         }
         None => {
+            tx.rollback().await?;
             let current = fetch_task(pool, auth, &key).await?;
             if current.status == "claimed" {
                 // Somebody is working on it right now. Say who, and for how
