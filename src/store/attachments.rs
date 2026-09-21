@@ -121,9 +121,17 @@ pub async fn attach_to_task(
             .await?;
     let (task_id,) = task.ok_or_else(|| BusError::not_found(format!("task '{task_key}'")))?;
 
+    // The cap, the quota and the insert share one transaction, under the
+    // task's row lock: two uploads racing for the last slot cannot both see
+    // room and both commit, any more than two racing for the last megabyte.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE")
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
     let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM attachments WHERE task_id = $1")
         .bind(task_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
     if count >= MAX_ATTACHMENTS_PER_TARGET {
         return Err(BusError::invalid(format!(
@@ -131,10 +139,6 @@ pub async fn attach_to_task(
              delete-and-recreate is not supported, start a new task or link externally"
         )));
     }
-
-    // The quota check and the insert share one transaction, so two uploads
-    // racing for the last megabyte cannot both see room and both commit.
-    let mut tx = pool.begin().await?;
     super::quota::check_attachment_quota(&mut tx, auth.team_id, att.data.len() as i64).await?;
 
     let (id,): (i64,) = sqlx::query_as(
@@ -185,18 +189,25 @@ pub async fn attach_to_message(
         ));
     }
 
+    // Same rule as a task: the cap is decided under the message's row lock,
+    // in the transaction that inserts.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM messages WHERE id = $1 FOR UPDATE")
+        .bind(message_id)
+        .fetch_one(&mut *tx)
+        .await?;
     let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM attachments WHERE message_id = $1")
         .bind(message_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
     if count >= MAX_ATTACHMENTS_PER_TARGET {
         return Err(BusError::invalid(format!(
             "message {message_id} already has {MAX_ATTACHMENTS_PER_TARGET} attachments"
         )));
     }
-
-    let mut conn = pool.acquire().await?;
-    insert_for_message(&mut conn, auth.team_id, message_id, auth.agent_id, att).await
+    let meta = insert_for_message(&mut tx, auth.team_id, message_id, auth.agent_id, att).await?;
+    tx.commit().await?;
+    Ok(meta)
 }
 
 /// Fetch an attachment's content. Team-scoped; attachments on direct messages
