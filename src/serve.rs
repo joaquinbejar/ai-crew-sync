@@ -32,6 +32,9 @@ pub struct ServeOptions {
     /// Broker for teams routed off Postgres, e.g. `nats://127.0.0.1:4222`.
     /// Absent on a default installation, which never opens a socket to one.
     /// Configuring it routes nobody: that is `team capability --backend`.
+    ///
+    /// Empty counts as absent. A compose file declares every variable it
+    /// supports, so one nobody set arrives here as `Some("")`.
     pub nats_url: Option<String>,
     /// Runtime NATS credentials file: publish and fetch only. The
     /// provisioning credential is an operator's and this process never
@@ -160,6 +163,16 @@ async fn run_presence_sweeper(pool: PgPool, ct: CancellationToken) {
             _ = tokio::time::sleep(PRESENCE_SWEEP_INTERVAL) => {}
         }
     }
+}
+
+/// An empty setting is an unset one.
+///
+/// A compose file defines every variable it supports, so an option nobody
+/// set arrives as `Some("")` rather than `None`. Taken at face value, the
+/// bus reported a broker it did not have and started a drainer pointed at
+/// an empty URL.
+fn configured(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|v| !v.is_empty())
 }
 
 /// How long one publish may take before the worker stops waiting for an
@@ -346,10 +359,10 @@ pub fn build_router(pool: PgPool, opts: &ServeOptions, ct: CancellationToken) ->
     // Where bodies live. Postgres for everybody unless an operator both
     // configured a broker here and routed a team to it; either alone
     // changes nothing.
-    let backends = match &opts.nats_url {
+    let backends = match configured(&opts.nats_url) {
         Some(url) => {
-            let mut config = crate::store::jetstream::Config::new(url.clone());
-            config.credentials = opts.nats_credentials.clone();
+            let mut config = crate::store::jetstream::Config::new(url.to_owned());
+            config.credentials = configured(&opts.nats_credentials).map(str::to_owned);
             tracing::info!(%url, "JetStream available for teams routed to it");
             crate::store::routing::Backends::with_jetstream(pool.clone(), config)
         }
@@ -508,4 +521,26 @@ pub async fn run(pool: PgPool, opts: ServeOptions) -> anyhow::Result<()> {
         .await
         .context("server error")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configured;
+
+    #[test]
+    fn an_empty_variable_is_not_a_setting() {
+        assert_eq!(
+            configured(&Some("nats://b:4222".into())),
+            Some("nats://b:4222")
+        );
+        assert_eq!(
+            configured(&Some("  nats://b:4222 ".into())),
+            Some("nats://b:4222")
+        );
+        // What a compose file that declares the variable and sets nothing
+        // actually delivers.
+        assert_eq!(configured(&Some(String::new())), None);
+        assert_eq!(configured(&Some("   ".into())), None);
+        assert_eq!(configured(&None), None);
+    }
 }
