@@ -10516,3 +10516,169 @@ async fn a_listener_that_went_deaf_is_noticed_and_reattached() {
 
     h.shutdown().await;
 }
+
+/// An owner's seat is only an owner's to change. Re-inviting someone already
+/// seated changes their role on the spot, and a moderator used that to
+/// demote the owner to observer and then remove it, walking around "only an
+/// owner can remove another owner" (#133). The refusal leaves the owner's
+/// role, floor and binding exactly as they were; an owner re-inviting a
+/// moderator still changes its role.
+#[tokio::test]
+async fn a_moderator_cannot_demote_an_owner_by_reinviting_it() {
+    for backend in ["postgres", "jetstream"] {
+        let schema = format!("t_owner_seat_{backend}");
+        let h = require_db_broker!(&schema);
+        let token = seed_agent(&h.pool, "acme", "joaquin").await;
+        let reader_token = seed_agent(&h.pool, "acme", "dani").await;
+        enable_conversations(&h.pool, "acme").await;
+        if backend == "jetstream" {
+            route_team_to_jetstream(&h, "acme").await;
+        }
+        // The owner is a registered window, so its seat carries a binding
+        // the refusal has to leave alone.
+        let agent = connect(&h.base, &token).await;
+        let cred = call(&agent, "register_session", json!({"session": "owner"})).await;
+        let owner = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+        let reader = connect_with_session(&h.base, &reader_token, "reader").await;
+
+        let convo = call(
+            &owner,
+            "create_conversation",
+            json!({"title": "whose seat", "private": true}),
+        )
+        .await;
+        let cid = convo["id"].as_str().unwrap().to_owned();
+        let cid_uuid: Uuid = cid.parse().unwrap();
+        let first = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "the owner's own thread",
+                   "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/reader", "role": "moderator"}),
+        )
+        .await;
+        call(
+            &reader,
+            "join_conversation",
+            json!({"conversation_id": cid}),
+        )
+        .await;
+
+        let seat = |session: &'static str| {
+            let pool = h.pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, String, Option<i64>, Option<Uuid>)>(
+                    "SELECT role, state, history_from_seq, session_id
+                       FROM conversation_memberships
+                      WHERE conversation_id = $1 AND session = $2",
+                )
+                .bind(cid_uuid)
+                .bind(session)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let owner_seat = seat("owner").await;
+        assert_eq!(owner_seat.0, "owner", "[{backend}]");
+        assert!(
+            owner_seat.3.is_some(),
+            "[{backend}] the owner's seat is bound"
+        );
+
+        let err = call_expect_error(
+            &reader,
+            "remove_conversation_member",
+            json!({"conversation_id": cid, "address": "joaquin/owner"}),
+        )
+        .await;
+        assert!(
+            err.contains("only an owner can remove another owner"),
+            "[{backend}] {err}"
+        );
+
+        // Every role a moderator could hand out, and the default one.
+        for role in [
+            Some("observer"),
+            Some("participant"),
+            Some("moderator"),
+            None,
+        ] {
+            let mut args = json!({"conversation_id": cid, "address": "joaquin/owner"});
+            if let Some(role) = role {
+                args["role"] = json!(role);
+            }
+            let err = call_expect_error(&reader, "invite_to_conversation", args).await;
+            assert!(
+                err.contains("only an owner can change or remove another owner"),
+                "[{backend}] role {role:?}: {err}"
+            );
+            assert!(!err.contains("database error"), "[{backend}] {err}");
+            assert_eq!(
+                seat("owner").await,
+                owner_seat,
+                "[{backend}] role {role:?} changed the seat"
+            );
+            let seen = call(
+                &owner,
+                "get_conversation_message",
+                json!({"message_id": first}),
+            )
+            .await;
+            assert_eq!(seen["body"], "the owner's own thread", "[{backend}] {seen}");
+        }
+        let err = call_expect_error(
+            &reader,
+            "remove_conversation_member",
+            json!({"conversation_id": cid, "address": "joaquin/owner"}),
+        )
+        .await;
+        assert!(
+            err.contains("only an owner can remove another owner"),
+            "[{backend}] {err}"
+        );
+        let read = call(&owner, "read_conversation", json!({"conversation_id": cid})).await;
+        assert_eq!(
+            read["messages"].as_array().map(Vec::len),
+            Some(1),
+            "[{backend}] {read}"
+        );
+
+        // The ordinary path is untouched: an owner re-inviting a moderator
+        // changes its role, and nothing else about its seat.
+        let reader_seat = seat("reader").await;
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/reader", "role": "observer"}),
+        )
+        .await;
+        let demoted = seat("reader").await;
+        assert_eq!(demoted.0, "observer", "[{backend}] {demoted:?}");
+        assert_eq!(
+            (&demoted.1, demoted.2, demoted.3),
+            (&reader_seat.1, reader_seat.2, reader_seat.3),
+            "[{backend}] state, floor and binding stay"
+        );
+        let read = call(
+            &reader,
+            "read_conversation",
+            json!({"conversation_id": cid}),
+        )
+        .await;
+        assert!(read["messages"].is_array(), "[{backend}] {read}");
+
+        for c in [agent, owner, reader] {
+            let _ = c.cancel().await;
+        }
+        h.shutdown().await;
+    }
+}
