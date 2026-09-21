@@ -871,13 +871,17 @@ pub async fn invite(
     .await?;
     let readmitting = removed.as_ref().map(|r| r.0.as_str()) == Some("removed");
 
-    // History boundary: from the start only when an inviter with the right
-    // to see it says so, otherwise from here on. Recorded either way. A
-    // re-admission is always from here on.
-    let from_seq: Option<i64> = if history_from_start && !readmitting {
-        None
-    } else {
+    // History boundary: from here on unless the inviter asks for more, and
+    // never more than the inviter can read itself. A moderator admitted
+    // without the past cannot hand that past to somebody else — nor to
+    // another window of its own agent — so a full-history grant is clamped
+    // to the inviter's floor, and the audit row keeps both what was asked
+    // and what was given. A re-admission is always from here on.
+    let inviter_floor = a.membership.as_ref().and_then(|m| m.history_from_seq);
+    let from_seq: Option<i64> = if readmitting || !history_from_start {
         Some(last_seq)
+    } else {
+        inviter_floor
     };
     sqlx::query(
         "INSERT INTO conversation_memberships
@@ -920,7 +924,12 @@ pub async fn invite(
             "member.invite"
         },
         Some(agent_id),
-        serde_json::json!({ "address": address, "role": role, "history_from_seq": from_seq }),
+        serde_json::json!({
+            "address": address,
+            "role": role,
+            "history_from_seq": from_seq,
+            "history_from_start_requested": history_from_start,
+        }),
     )
     .await?;
     tx.commit().await?;

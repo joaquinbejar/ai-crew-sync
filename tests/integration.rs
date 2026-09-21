@@ -9834,3 +9834,161 @@ async fn a_removed_member_is_readmitted_without_its_old_history() {
         h.shutdown().await;
     }
 }
+
+/// A moderator admitted without the past cannot hand that past to anyone:
+/// not to another agent, not to another window of its own agent. Its grant
+/// is clamped to its own floor, for bodies and for receipts alike, and the
+/// audit row keeps what was asked. An inviter that can read the start still
+/// grants it (#124).
+#[tokio::test]
+async fn a_late_moderator_cannot_grant_history_it_cannot_read() {
+    for backend in ["postgres", "jetstream"] {
+        let schema = format!("t_late_moderator_{backend}");
+        let h = require_db_broker!(&schema);
+        let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+        let reader_token = seed_agent(&h.pool, "acme", "dani").await;
+        let outsider_token = seed_agent(&h.pool, "acme", "marta").await;
+        let full_token = seed_agent(&h.pool, "acme", "luis").await;
+        enable_conversations(&h.pool, "acme").await;
+        if backend == "jetstream" {
+            route_team_to_jetstream(&h, "acme").await;
+        }
+        let owner = connect_with_session(&h.base, &owner_token, "owner").await;
+        let reader = connect_with_session(&h.base, &reader_token, "reader").await;
+        let outsider = connect_with_session(&h.base, &outsider_token, "outsider").await;
+        let sibling = connect_with_session(&h.base, &reader_token, "other").await;
+        let full = connect_with_session(&h.base, &full_token, "full").await;
+
+        let convo = call(
+            &owner,
+            "create_conversation",
+            json!({"title": "late moderator", "private": true}),
+        )
+        .await;
+        let cid = convo["id"].as_str().unwrap().to_owned();
+        let withheld = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "history withheld from later moderator",
+                   "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // A moderator, admitted from here on.
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/reader", "role": "moderator"}),
+        )
+        .await;
+        call(
+            &reader,
+            "join_conversation",
+            json!({"conversation_id": cid}),
+        )
+        .await;
+        let err = call_expect_error(
+            &reader,
+            "get_conversation_message",
+            json!({"message_id": withheld}),
+        )
+        .await;
+        assert!(!err.contains("database error"), "[{backend}] {err}");
+
+        // It invites another agent and another window of its own agent,
+        // asking for the whole history. Both invitations go through, with
+        // the moderator's own floor.
+        for address in ["marta/outsider", "dani/other"] {
+            call(
+                &reader,
+                "invite_to_conversation",
+                json!({"conversation_id": cid, "address": address, "history_from_start": true}),
+            )
+            .await;
+        }
+        for (address, window) in [("marta/outsider", &outsider), ("dani/other", &sibling)] {
+            call(window, "join_conversation", json!({"conversation_id": cid})).await;
+            let err = call_expect_error(
+                window,
+                "get_conversation_message",
+                json!({"message_id": withheld}),
+            )
+            .await;
+            assert!(
+                !err.contains("database error"),
+                "[{backend}] {address} body: {err}"
+            );
+            let err = call_expect_error(
+                window,
+                "get_message_receipts",
+                json!({"message_id": withheld}),
+            )
+            .await;
+            assert!(
+                !err.contains("database error"),
+                "[{backend}] {address} receipts: {err}"
+            );
+            let read = call(window, "read_conversation", json!({"conversation_id": cid})).await;
+            assert_eq!(
+                read["messages"].as_array().map(Vec::len),
+                Some(0),
+                "[{backend}] {address} reads nothing from before the moderator: {read}"
+            );
+        }
+        let cid_uuid: Uuid = cid.parse().unwrap();
+        let floors: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT session, history_from_seq FROM conversation_memberships
+              WHERE conversation_id = $1 AND session IN ('reader', 'outsider', 'other')
+              ORDER BY session",
+        )
+        .bind(cid_uuid)
+        .fetch_all(&h.pool)
+        .await
+        .unwrap();
+        assert!(
+            floors.iter().all(|(_, f)| *f == Some(1)),
+            "[{backend}] every seat the moderator handed out starts where it did: {floors:?}"
+        );
+        let (requested,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM conversation_audit
+              WHERE conversation_id = $1 AND action = 'member.invite'
+                AND (detail->>'history_from_start_requested')::boolean
+                AND (detail->>'history_from_seq')::bigint = 1",
+        )
+        .bind(cid_uuid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            requested, 2,
+            "[{backend}] the audit keeps what was asked and what was given"
+        );
+
+        // The owner can read the start, so the owner can grant it.
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "luis/full", "history_from_start": true}),
+        )
+        .await;
+        call(&full, "join_conversation", json!({"conversation_id": cid})).await;
+        let seen = call(
+            &full,
+            "get_conversation_message",
+            json!({"message_id": withheld}),
+        )
+        .await;
+        assert_eq!(
+            seen["body"], "history withheld from later moderator",
+            "[{backend}] {seen}"
+        );
+
+        for c in [owner, reader, outsider, sibling, full] {
+            let _ = c.cancel().await;
+        }
+        h.shutdown().await;
+    }
+}
