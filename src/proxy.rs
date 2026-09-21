@@ -376,8 +376,7 @@ fn no_such_tool(e: &ServiceError) -> bool {
     match e {
         ServiceError::McpError(err) => {
             err.code == ErrorCode::METHOD_NOT_FOUND
-                || (err.code == ErrorCode::INVALID_PARAMS
-                    && err.message.trim_start().starts_with("tool not found"))
+                || (err.code == ErrorCode::INVALID_PARAMS && err.message.trim() == "tool not found")
         }
         _ => false,
     }
@@ -1596,6 +1595,13 @@ mod unauthorized_tests {
         assert_eq!(verdict(&e), None);
         // The bus's own not-found errors share the code too.
         let e = ServiceError::McpError(ErrorData::invalid_params("not found: message 32601", None));
+        assert!(!no_such_tool(&e));
+        // Exactly rmcp's wording, not a prefix of it: a tool that exists
+        // could open its refusal with the same three words.
+        let e = ServiceError::McpError(ErrorData::invalid_params(
+            "tool not found: the deploy tool named in `depends_on` does not exist",
+            None,
+        ));
         assert!(!no_such_tool(&e));
         assert!(!no_such_tool(&ServiceError::TransportClosed));
     }
