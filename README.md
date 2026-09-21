@@ -876,7 +876,9 @@ ai-crew-sync team stream --team acme --nats-url nats://broker:4222
 #    bodies on the broker.
 ai-crew-sync team capability --team acme --backend jetstream
 
-# And the server has to be able to reach it:
+# And the server has to be able to reach it. In the compose stack that is
+# NATS_REPLICAS=1 and BUS_NATS_URL=nats://nats:4222, which starts the broker
+# the stack already carries (zero replicas until you ask for it):
 ai-crew-sync serve --nats-url nats://broker:4222 \
                    --nats-credentials /etc/ai-crew-sync/runtime.creds
 ```
