@@ -10026,3 +10026,236 @@ async fn a_late_moderator_cannot_grant_history_it_cannot_read() {
         h.shutdown().await;
     }
 }
+
+/// A transfer to a window that already has a seat changes nothing: it is
+/// refused before anything is written, and the target keeps its role, its
+/// history boundary and its credential binding while the source stays. A
+/// window that holds an invitation, or that was removed, is not a target
+/// either. A window that left is, and then the handoff completes (#126).
+#[tokio::test]
+async fn a_transfer_to_a_window_with_a_seat_changes_nothing() {
+    for backend in ["postgres", "jetstream"] {
+        let schema = format!("t_transfer_target_{backend}");
+        let h = require_db_broker!(&schema);
+        let token = seed_agent(&h.pool, "acme", "joaquin").await;
+        enable_conversations(&h.pool, "acme").await;
+        if backend == "jetstream" {
+            route_team_to_jetstream(&h, "acme").await;
+        }
+        // Two registered windows of the same agent, each with its own
+        // credential, plus a third that only ever gets invited.
+        let agent = connect(&h.base, &token).await;
+        let owner_cred = call(&agent, "register_session", json!({"session": "owner"})).await;
+        let owner = connect(&h.base, owner_cred["session_token"].as_str().unwrap()).await;
+        let next_cred = call(&agent, "register_session", json!({"session": "next"})).await;
+        let next = connect(&h.base, next_cred["session_token"].as_str().unwrap()).await;
+
+        let convo = call(
+            &owner,
+            "create_conversation",
+            json!({"title": "handoff", "private": true}),
+        )
+        .await;
+        let cid = convo["id"].as_str().unwrap().to_owned();
+        let cid_uuid: Uuid = cid.parse().unwrap();
+        let earlier = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "before the observer arrived",
+                   "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "joaquin/next", "role": "observer"}),
+        )
+        .await;
+        call(&next, "join_conversation", json!({"conversation_id": cid})).await;
+        let err = call_expect_error(
+            &next,
+            "get_conversation_message",
+            json!({"message_id": earlier}),
+        )
+        .await;
+        assert!(!err.contains("database error"), "[{backend}] {err}");
+
+        // A message sent while the observer is seated has receipts for the
+        // seats of that moment; a refused transfer must leave them as they
+        // are, denominator included.
+        let seated = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "while the observer is here",
+                   "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let receipts_before = call(
+            &owner,
+            "get_message_receipts",
+            json!({"message_id": seated}),
+        )
+        .await;
+        assert!(
+            receipts_before["total"].as_u64() >= Some(1),
+            "[{backend}] {receipts_before}"
+        );
+
+        let seat = |session: &'static str| {
+            let pool = h.pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, String, Option<i64>, Option<Uuid>, Option<Uuid>)>(
+                    "SELECT role, state, history_from_seq, session_id, superseded_by
+                       FROM conversation_memberships
+                      WHERE conversation_id = $1 AND session = $2",
+                )
+                .bind(cid_uuid)
+                .bind(session)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let next_before = seat("next").await;
+        assert_eq!(next_before.0, "observer", "[{backend}]");
+        assert_eq!(next_before.2, Some(1), "[{backend}]");
+        assert!(
+            next_before.3.is_some(),
+            "[{backend}] the seat is bound to the window"
+        );
+
+        // Already seated: refused, and nothing moved.
+        let err = call_expect_error(
+            &owner,
+            "transfer_membership",
+            json!({"conversation_id": cid, "to": "joaquin/next"}),
+        )
+        .await;
+        assert!(err.contains("seat of its own"), "[{backend}] {err}");
+        assert!(err.contains("nothing was written"), "[{backend}] {err}");
+        assert_eq!(
+            seat("next").await,
+            next_before,
+            "[{backend}] the target is untouched"
+        );
+        let source = seat("owner").await;
+        assert_eq!(
+            source.1, "active",
+            "[{backend}] the source is not superseded"
+        );
+        assert!(source.4.is_none(), "[{backend}]");
+        let err = call_expect_error(
+            &next,
+            "get_conversation_message",
+            json!({"message_id": earlier}),
+        )
+        .await;
+        assert!(
+            !err.contains("database error"),
+            "[{backend}] still withheld: {err}"
+        );
+        let receipts_after = call(
+            &owner,
+            "get_message_receipts",
+            json!({"message_id": seated}),
+        )
+        .await;
+        assert_eq!(
+            receipts_after, receipts_before,
+            "[{backend}] the receipts and their denominator are untouched"
+        );
+        let err =
+            call_expect_error(&next, "join_conversation", json!({"conversation_id": cid})).await;
+        assert!(
+            err.contains("already in this conversation"),
+            "[{backend}] {err}"
+        );
+
+        // Merely invited: refused too.
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "joaquin/third"}),
+        )
+        .await;
+        let err = call_expect_error(
+            &owner,
+            "transfer_membership",
+            json!({"conversation_id": cid, "to": "joaquin/third"}),
+        )
+        .await;
+        assert!(
+            err.contains("already holds an invitation"),
+            "[{backend}] {err}"
+        );
+
+        // Removed: a transfer does not undo a removal.
+        call(
+            &owner,
+            "remove_conversation_member",
+            json!({"conversation_id": cid, "address": "joaquin/next"}),
+        )
+        .await;
+        let err = call_expect_error(
+            &owner,
+            "transfer_membership",
+            json!({"conversation_id": cid, "to": "joaquin/next"}),
+        )
+        .await;
+        assert!(err.contains("does not undo a removal"), "[{backend}] {err}");
+        assert_eq!(seat("next").await.1, "removed", "[{backend}]");
+
+        // Re-admitted, then gone of its own accord: that seat can be offered
+        // the handoff, and accepting it completes the transfer.
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "joaquin/next"}),
+        )
+        .await;
+        call(&next, "join_conversation", json!({"conversation_id": cid})).await;
+        call(&next, "leave_conversation", json!({"conversation_id": cid})).await;
+        let proposal = call(
+            &owner,
+            "transfer_membership",
+            json!({"conversation_id": cid, "to": "joaquin/next"}),
+        )
+        .await;
+        assert_eq!(proposal["state"], "proposed", "[{backend}] {proposal}");
+        call(&next, "join_conversation", json!({"conversation_id": cid})).await;
+        let seen = call(
+            &next,
+            "get_conversation_message",
+            json!({"message_id": earlier}),
+        )
+        .await;
+        assert_eq!(
+            seen["body"], "before the observer arrived",
+            "[{backend}] the seat's history came with it: {seen}"
+        );
+        let taken = seat("next").await;
+        assert_eq!(
+            (taken.0.as_str(), taken.1.as_str(), taken.2),
+            ("owner", "active", None),
+            "[{backend}]"
+        );
+        assert!(
+            taken.3.is_some(),
+            "[{backend}] bound to the window that accepted"
+        );
+        let source = seat("owner").await;
+        assert_eq!(source.1, "left", "[{backend}] the source is superseded");
+        assert!(source.4.is_some(), "[{backend}]");
+
+        for c in [agent, owner, next] {
+            let _ = c.cancel().await;
+        }
+        h.shutdown().await;
+    }
+}

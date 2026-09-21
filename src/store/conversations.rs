@@ -2192,6 +2192,15 @@ pub async fn transfer_membership(
 
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
+    // The thread first, in the same order as `invite`: every change of who
+    // sits where serialises on the conversation row, so two transfers
+    // between the same windows cannot take each other's seats in opposite
+    // orders, and an invitation cannot create the target seat between the
+    // check below and the write.
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     // The source seat is re-read and locked here: it was active when the
     // request arrived, and leaving or being removed in between must stop
     // the transfer rather than hand over a seat that no longer exists.
@@ -2205,23 +2214,60 @@ pub async fn transfer_membership(
             "your membership of this conversation is no longer active, so there is nothing to transfer. Nothing was written.",
         ));
     }
+    // The target's own seat, if it has one. A transfer moves this window's
+    // seat to a window that has none. One that is active or invited already
+    // has a seat, with its own role and its own history boundary, and a
+    // proposal it cannot accept (`join` takes invitations only) must not
+    // rewrite them meanwhile. One that was removed was put out on purpose:
+    // a transfer does not undo a removal.
+    let target: Option<(String,)> = sqlx::query_as(
+        "SELECT state FROM conversation_memberships
+          WHERE conversation_id = $1 AND agent_id = $2 AND session = $3
+          FOR UPDATE",
+    )
+    .bind(id)
+    .bind(auth.agent_id)
+    .bind(&session)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match target.as_ref().map(|t| t.0.as_str()) {
+        Some("active") => {
+            return Err(BusError::conflict(format!(
+                "'{to}' is already in this conversation with a seat of its own, so there is \
+                 nothing to hand over; nothing was written. Keep using that window, or have \
+                 it leave first if it should take this seat and its history instead."
+            )));
+        }
+        Some("invited") => {
+            return Err(BusError::conflict(format!(
+                "'{to}' already holds an invitation to this conversation; nothing was \
+                 written. Accept it from that window, or have it leave first and transfer \
+                 again."
+            )));
+        }
+        Some("removed") => {
+            return Err(BusError::Forbidden(format!(
+                "'{to}' was removed from this conversation, and a transfer does not undo a \
+                 removal; nothing was written."
+            )));
+        }
+        _ => {}
+    }
     let moved: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO conversation_memberships
             (conversation_id, agent_id, session, role, state, history_from_seq, invited_by,
              transfer_from)
          SELECT $1, $2, $3, m.role, 'invited', m.history_from_seq, $2, m.id
            FROM conversation_memberships m WHERE m.id = $4
+         -- Only a seat that was left reaches this: the others were refused
+         -- above. It is offered again, unbound, so whoever accepts proves
+         -- it is that window.
          ON CONFLICT (conversation_id, agent_id, session) DO UPDATE SET
             role = EXCLUDED.role,
-            state = CASE WHEN conversation_memberships.state IN ('left', 'removed')
-                         THEN 'invited' ELSE conversation_memberships.state END,
+            state = 'invited',
             history_from_seq = EXCLUDED.history_from_seq,
             transfer_from = EXCLUDED.transfer_from,
-            -- Same rule as an invitation: a seat that is being offered
-            -- again is unbound, one that is already active keeps the
-            -- window it belongs to.
-            session_id = CASE WHEN conversation_memberships.state IN ('left', 'removed')
-                              THEN NULL ELSE conversation_memberships.session_id END,
+            session_id = NULL,
             invited_at = now(),
             ended_at = NULL
          RETURNING id",
