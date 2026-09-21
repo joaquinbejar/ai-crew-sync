@@ -660,6 +660,14 @@ pub async fn complete_task(
         Some(r) => Some(super::check_text("task result", r, MAX_RESULT_BYTES)?),
         None => None,
     };
+    // A claim has to mean something on the way out too. Completing is the
+    // one write that ended someone else's work: anyone on the team could
+    // mark a task done while its holder was still doing it, and the holder
+    // found out when its next renew was refused with "it is done".
+    //
+    // The lease decides, exactly as it does for claiming. An unclaimed task
+    // is anyone's to finish; a claim whose lease has expired is fair game,
+    // which is what a lease is for; a live claim belongs to its holder.
     let updated: Option<(Uuid,)> = sqlx::query_as(
         r#"
         UPDATE tasks
@@ -668,12 +676,20 @@ pub async fn complete_task(
             lease_expires_at = NULL,
             updated_at = now()
         WHERE team_id = $2 AND key = $3 AND status IN ('open', 'claimed')
+          AND (
+              claimed_by IS NULL
+              OR lease_expires_at IS NULL
+              OR lease_expires_at <= now()
+              OR (claimed_by = $4 AND COALESCE(claimed_session, '') = $5)
+          )
         RETURNING id
         "#,
     )
     .bind(result.as_deref())
     .bind(auth.team_id)
     .bind(&key)
+    .bind(auth.agent_id)
+    .bind(&auth.session)
     .fetch_optional(pool)
     .await?;
 
@@ -684,6 +700,15 @@ pub async fn complete_task(
         }
         None => {
             let current = fetch_task(pool, auth, &key).await?;
+            if current.status == "claimed" {
+                // Somebody is working on it right now. Say who, and for how
+                // much longer, so the caller can do something about it.
+                return Err(BusError::conflict(format!(
+                    "task '{key}' is {}. Completing it would end work somebody else is \
+                     doing; ask them, or wait for the lease to expire.",
+                    holder_reason(auth, &current)
+                )));
+            }
             Err(BusError::conflict(format!(
                 "task '{key}' is already {}",
                 current.status

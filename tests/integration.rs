@@ -9102,3 +9102,93 @@ async fn a_broker_that_is_gone_does_not_take_the_thread_with_it() {
     }
     h.shutdown().await;
 }
+
+/// A claim has to mean something on the way out too. Found on a deployment:
+/// anyone on the team could mark a task done while its holder was still
+/// working, and the holder learned about it from a refused renewal.
+#[tokio::test]
+async fn completing_a_task_respects_whoever_holds_it() {
+    let h = require_db!("t_complete_claim");
+    let owner = seed_agent(&h.pool, "acme", "joaquin").await;
+    let holder = seed_agent(&h.pool, "acme", "marta").await;
+    let other = seed_agent(&h.pool, "acme", "dani").await;
+    let o = connect(&h.base, &owner).await;
+    let m = connect(&h.base, &holder).await;
+    let d = connect(&h.base, &other).await;
+
+    call(
+        &o,
+        "create_task",
+        json!({"key": "suya", "title": "el trabajo de marta"}),
+    )
+    .await;
+    let claimed = call(
+        &m,
+        "claim_task",
+        json!({"key": "suya", "lease_seconds": 300}),
+    )
+    .await;
+    assert_eq!(claimed["claimed"], true);
+
+    // The holder is working and the lease is live.
+    let err = call_expect_error(&d, "complete_task", json!({"key": "suya"})).await;
+    assert!(err.contains("held by marta"), "{err}");
+    assert!(
+        err.contains("end work somebody else is doing"),
+        "and it says why: {err}"
+    );
+    let still = call(&o, "get_task", json!({"key": "suya"})).await;
+    assert_eq!(
+        still["task"]["status"], "claimed",
+        "nothing was written: {still}"
+    );
+
+    // Its holder finishes it.
+    let done = call(
+        &m,
+        "complete_task",
+        json!({"key": "suya", "result": "hecho"}),
+    )
+    .await;
+    assert_eq!(done["status"], "done");
+
+    // An unclaimed task is anyone's to finish: nobody's work is ended.
+    call(
+        &o,
+        "create_task",
+        json!({"key": "libre", "title": "de nadie"}),
+    )
+    .await;
+    let done = call(&d, "complete_task", json!({"key": "libre"})).await;
+    assert_eq!(done["status"], "done", "{done}");
+
+    // And an expired lease is fair game, which is what a lease is for.
+    call(
+        &o,
+        "create_task",
+        json!({"key": "caducada", "title": "abandonada"}),
+    )
+    .await;
+    call(
+        &m,
+        "claim_task",
+        json!({"key": "caducada", "lease_seconds": 60}),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE tasks SET lease_expires_at = now() - interval '1 minute' WHERE key = 'caducada'",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let done = call(&d, "complete_task", json!({"key": "caducada"})).await;
+    assert_eq!(
+        done["status"], "done",
+        "a claim nobody renewed does not hold the task for ever: {done}"
+    );
+
+    for c in [o, m, d] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
