@@ -1321,6 +1321,7 @@ nombra el límite y qué hacer en su lugar, porque quien llama es un modelo.
 | Objeto `metadata` | 16 KiB | — |
 | Título / descripción / resultado de tarea | 512 B / 64 KiB / 64 KiB | — |
 | Dependencias de una tarea | 32 | — |
+| Ámbito / clave de nota | 64 B / 256 B | — |
 | Tags de nota | 16 tags, 64 B cada uno | — |
 | Topic de canal, campos de presencia | 256 B | — |
 
