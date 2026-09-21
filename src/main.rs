@@ -153,6 +153,14 @@ struct ServeArgs {
     #[arg(long, env = "BUS_PUBLICATION_WORKER", default_value_t = true,
           action = clap::ArgAction::Set)]
     publication_worker: bool,
+
+    /// Seconds between the pings each replica sends itself through Postgres
+    /// to prove its event listener still hears. Three unanswered pings and
+    /// the listener is reattached; `/health` reports the state under
+    /// `events`.
+    #[arg(long, env = "BUS_EVENT_PING_SECS",
+          default_value_t = ai_crew_sync::events::DEFAULT_PING_SECS)]
+    event_ping_secs: u64,
 }
 
 #[derive(Subcommand)]
@@ -774,6 +782,7 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
                     nats_url: args.nats_url,
                     nats_credentials: args.nats_credentials,
                     publication_worker: args.publication_worker,
+                    event_ping_secs: args.event_ping_secs,
                 },
             )
             .await?;

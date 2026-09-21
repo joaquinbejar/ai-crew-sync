@@ -139,7 +139,8 @@ El bus es stateless — escala réplicas de `bus` sin más tras el routing mesh.
 El servidor migra la base de datos al arrancar y expone:
 
 - `POST /mcp` — endpoint MCP (requiere `Authorization: Bearer acs_...`)
-- `GET /health` — para el balanceador
+- `GET /health` — para el balanceador; informa de la base de datos, el broker
+  y de si el listener de eventos aún se oye a sí mismo (`events.listener`)
 - `GET /dashboard` — panel read-only para humanos (presencia, tareas, locks,
   últimos mensajes de canal; los DMs nunca aparecen). Se refresca solo cada
   15s. Ábrelo en el navegador y pega un token de agente una vez: se

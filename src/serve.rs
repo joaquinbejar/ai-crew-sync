@@ -46,6 +46,10 @@ pub struct ServeOptions {
     /// drives publication itself turns it off to keep the timing its own.
     /// With no broker configured there is nothing to drain either way.
     pub publication_worker: bool,
+    /// Seconds between the pings each replica sends itself through Postgres
+    /// to prove its event listener still hears. Three unanswered and the
+    /// listener is reattached; `/health` reports the state under `events`.
+    pub event_ping_secs: u64,
 }
 
 /// Headroom over the largest legitimate request: a 1 MiB message body plus
@@ -59,6 +63,7 @@ pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 600;
 struct HealthState {
     pool: PgPool,
     backends: crate::store::routing::Backends,
+    hub: EventHub,
 }
 
 /// Health, aware of what this deployment actually runs.
@@ -88,6 +93,15 @@ async fn health(
         );
     }
     let mut body = serde_json::json!({ "status": "ok", "database": "up" });
+    // The listener is what turns a write into a wake. A replica whose
+    // listener went deaf still serves every request and still stores every
+    // message, so it does not fail the probe either; it says so, because a
+    // successful write is not proof that anyone was told.
+    let events = state.hub.listener().report();
+    if events["listener"] != "live" {
+        body["status"] = serde_json::json!("degraded");
+    }
+    body["events"] = events;
     if state.backends.jetstream_configured() {
         body["broker"] = serde_json::json!("configured");
         if query.get("broker").is_some_and(|v| v == "check") {
@@ -343,7 +357,7 @@ async fn reconcile_routed_teams(pool: &PgPool, backends: &crate::store::routing:
 pub fn build_router(pool: PgPool, opts: &ServeOptions, ct: CancellationToken) -> Router {
     // One LISTEN connection feeds every in-process consumer: wait_for_updates
     // long-polls and the webhook dispatcher.
-    let hub = EventHub::new();
+    let hub = EventHub::with_ping(std::time::Duration::from_secs(opts.event_ping_secs));
     tokio::spawn(crate::events::run_pg_listener(
         pool.clone(),
         hub.clone(),
@@ -459,6 +473,7 @@ pub fn build_router(pool: PgPool, opts: &ServeOptions, ct: CancellationToken) ->
         .with_state(HealthState {
             pool: pool.clone(),
             backends: backends.clone(),
+            hub: hub.clone(),
         });
 
     Router::new()
