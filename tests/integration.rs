@@ -10675,8 +10675,127 @@ async fn a_moderator_cannot_demote_an_owner_by_reinviting_it() {
         )
         .await;
         assert!(read["messages"].is_array(), "[{backend}] {read}");
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/reader", "role": "moderator"}),
+        )
+        .await;
 
-        for c in [agent, owner, reader] {
+        // A transfer proposal is an owner seat in the `invited` state, and
+        // it is not the moderator's to reshape either.
+        let cred2 = call(&agent, "register_session", json!({"session": "owner-2"})).await;
+        let successor = connect(&h.base, cred2["session_token"].as_str().unwrap()).await;
+        let proposal = call(
+            &owner,
+            "transfer_membership",
+            json!({"conversation_id": cid, "to": "joaquin/owner-2"}),
+        )
+        .await;
+        assert_eq!(proposal["state"], "proposed", "[{backend}] {proposal}");
+        let proposed_seat = seat("owner-2").await;
+        assert_eq!(
+            (proposed_seat.0.as_str(), proposed_seat.1.as_str()),
+            ("owner", "invited"),
+            "[{backend}] {proposed_seat:?}"
+        );
+        let err = call_expect_error(
+            &reader,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "joaquin/owner-2", "role": "observer"}),
+        )
+        .await;
+        assert!(
+            err.contains("only an owner can change or remove another owner"),
+            "[{backend}] {err}"
+        );
+        assert_eq!(seat("owner-2").await, proposed_seat, "[{backend}]");
+
+        // A storm: the moderator hammers both owner seats from a dozen
+        // connections while the owner keeps flipping the moderator's role.
+        // Whatever the interleaving, no attempt lands on an owner seat, and
+        // none dies of a deadlock, which would surface as "database error".
+        let owner_token = cred["session_token"].as_str().unwrap().to_owned();
+        let mut storm = Vec::new();
+        for i in 0..12usize {
+            let base = h.base.clone();
+            let reader_token = reader_token.clone();
+            let cid = cid.clone();
+            storm.push(tokio::spawn(async move {
+                let c = connect_with_session(&base, &reader_token, "reader").await;
+                let target = if i % 2 == 0 {
+                    "joaquin/owner"
+                } else {
+                    "joaquin/owner-2"
+                };
+                let role = ["observer", "participant", "moderator"][i % 3];
+                let args: serde_json::Map<String, Value> = serde_json::from_value(
+                    json!({"conversation_id": cid, "address": target, "role": role}),
+                )
+                .unwrap();
+                let outcome = c
+                    .call_tool(
+                        CallToolRequestParams::new("invite_to_conversation").with_arguments(args),
+                    )
+                    .await;
+                let _ = c.cancel().await;
+                match outcome {
+                    Ok(res) if res.is_error != Some(true) => {
+                        Err(format!("{target} as {role} went through"))
+                    }
+                    Ok(res) => Ok(format!("{:?}", res.content)),
+                    Err(e) => Ok(e.to_string()),
+                }
+            }));
+        }
+        for i in 0..4usize {
+            let base = h.base.clone();
+            let owner_token = owner_token.clone();
+            let cid = cid.clone();
+            storm.push(tokio::spawn(async move {
+                let c = connect(&base, &owner_token).await;
+                let role = if i % 2 == 0 { "observer" } else { "moderator" };
+                call(
+                    &c,
+                    "invite_to_conversation",
+                    json!({"conversation_id": cid, "address": "dani/reader", "role": role}),
+                )
+                .await;
+                let _ = c.cancel().await;
+                Ok::<String, String>(String::new())
+            }));
+        }
+        for task in storm {
+            let outcome = task.await.unwrap();
+            let text = outcome.unwrap_or_else(|landed| panic!("[{backend}] {landed}"));
+            assert!(!text.contains("database error"), "[{backend}] {text}");
+        }
+        assert_eq!(
+            seat("owner").await,
+            owner_seat,
+            "[{backend}] the owner's seat survived the storm"
+        );
+        assert_eq!(
+            seat("owner-2").await,
+            proposed_seat,
+            "[{backend}] so did the proposed one"
+        );
+
+        // The proposal still completes for the window it was made to.
+        call(
+            &successor,
+            "join_conversation",
+            json!({"conversation_id": cid}),
+        )
+        .await;
+        assert_eq!(seat("owner-2").await.1, "active", "[{backend}]");
+        assert_eq!(
+            seat("owner").await.1,
+            "left",
+            "[{backend}] the source is superseded"
+        );
+
+        for c in [agent, owner, successor, reader] {
             let _ = c.cancel().await;
         }
         h.shutdown().await;
