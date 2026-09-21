@@ -9524,3 +9524,55 @@ async fn a_replaced_window_cannot_fetch_the_inbox_of_the_one_that_replaced_it() 
     }
     h.shutdown().await;
 }
+
+/// The attachment cap is decided under the parent's row lock. Counted
+/// outside the transaction, ten uploads racing for the last slots all saw
+/// room and all committed.
+#[tokio::test]
+async fn the_attachment_cap_holds_under_a_race() {
+    use base64::Engine;
+    let h = require_db!("t_attachment_cap_race");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let client = Arc::new(connect(&h.base, &token).await);
+    call(
+        &client,
+        "create_task",
+        json!({"key": "adjuntos", "title": "muchos"}),
+    )
+    .await;
+
+    let data = base64::engine::general_purpose::STANDARD.encode(b"x");
+    let mut handles = Vec::new();
+    for i in 0..12 {
+        let c = Arc::clone(&client);
+        let data = data.clone();
+        handles.push(tokio::spawn(async move {
+            let args: serde_json::Map<String, Value> = serde_json::from_value(json!({
+                "task": "adjuntos", "filename": format!("f{i}.txt"), "data_base64": data
+            }))
+            .unwrap();
+            c.call_tool(CallToolRequestParams::new("attach_file".to_string()).with_arguments(args))
+                .await
+                .map(|r| r.is_error != Some(true))
+                .unwrap_or(false)
+        }));
+    }
+    let mut ok = 0;
+    for h in handles {
+        if h.await.unwrap() {
+            ok += 1;
+        }
+    }
+    let (stored,): (i64,) = sqlx::query_as("SELECT count(*) FROM attachments")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored, 8,
+        "the cap is eight, whatever the race: {stored} stored"
+    );
+    assert_eq!(ok, 8, "and exactly eight callers were told yes");
+
+    let _ = Arc::try_unwrap(client).ok().map(|c| c.cancel());
+    h.shutdown().await;
+}
