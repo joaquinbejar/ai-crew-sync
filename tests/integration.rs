@@ -9386,3 +9386,141 @@ async fn a_mistyped_path_does_not_blame_the_credential() {
 
     h.shutdown().await;
 }
+
+/// The rest of a window's own state is fenced too. A replaced connection
+/// cannot put back the lock its replacement holds, cannot advance the live
+/// window's read cursor past messages it never saw, and cannot pull
+/// references off the live window's inbox.
+#[tokio::test]
+async fn a_replaced_window_cannot_act_as_the_one_that_replaced_it() {
+    use ai_crew_sync::store::{locks, messaging};
+
+    let h = require_db!("t_window_state_fence");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    let agent = connect(&h.base, &token).await;
+    let cred = call(&agent, "register_session", json!({"session": "obrero"})).await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let dani = connect(&h.base, &dani_token).await;
+
+    let got = call(
+        &window,
+        "acquire_lock",
+        json!({"name": "deploy", "ttl_seconds": 300}),
+    )
+    .await;
+    assert_eq!(got["acquired"], true);
+    // A direct message the live window has not read yet.
+    call(
+        &dani,
+        "post_message",
+        json!({"to": "joaquin/obrero", "body": "para la ventana viva"}),
+    )
+    .await;
+
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'joaquin'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "joaquin".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "obrero".into(),
+        session_id: Some(cred["session_id"].as_str().unwrap().parse().unwrap()),
+        session_epoch: Some(cred["epoch"].as_i64().unwrap()),
+        token_id: None,
+    };
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2);
+
+    let err = locks::release_lock(&h.pool, &stale, "deploy")
+        .await
+        .expect_err("a replaced connection released the live window's lock")
+        .to_string();
+    assert!(err.contains("stale"), "{err}");
+
+    let err = messaging::read_messages(
+        &h.pool,
+        &stale,
+        messaging::ReadInput {
+            scope: String::new(),
+            only_new: true,
+            limit: 50,
+            all_sessions: false,
+        },
+    )
+    .await
+    .expect_err("a replaced connection advanced the live window's cursor")
+    .to_string();
+    assert!(err.contains("stale"), "{err}");
+
+    // The live window still holds the lock and still sees its message.
+    let live = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+    let locks_now = call(&live, "list_locks", json!({})).await;
+    assert!(
+        locks_now["locks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["name"] == "deploy"),
+        "the lock is gone: {locks_now}"
+    );
+    let unread = call(&live, "read_messages", json!({})).await;
+    assert!(
+        unread["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["body"] == "para la ventana viva"),
+        "the live window lost a message to a cursor it never moved: {unread}"
+    );
+
+    for c in [agent, window, dani, live] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// And the inbox: a replaced connection does not pull the live window's
+/// references off the consumer.
+#[tokio::test]
+async fn a_replaced_window_cannot_fetch_the_inbox_of_the_one_that_replaced_it() {
+    use ai_crew_sync::store::jetstream::Config;
+    use ai_crew_sync::store::{inbox, routing::Backends};
+
+    let h = require_db_broker!("t_inbox_epoch_fence");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let agent = connect(&h.base, &token).await;
+    let cred = call(&agent, "register_session", json!({"session": "lector"})).await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'joaquin'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "joaquin".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "lector".into(),
+        session_id: Some(cred["session_id"].as_str().unwrap().parse().unwrap()),
+        session_epoch: Some(cred["epoch"].as_i64().unwrap()),
+        token_id: None,
+    };
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2);
+
+    let backends = Backends::with_jetstream(h.pool.clone(), Config::new(nats_url()));
+    let err = inbox::fetch(&h.pool, &backends, &stale, Some(5))
+        .await
+        .expect_err("a replaced connection fetched the live window's inbox")
+        .to_string();
+    assert!(err.contains("stale"), "{err}");
+
+    for c in [agent, window] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

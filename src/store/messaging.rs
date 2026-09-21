@@ -681,6 +681,11 @@ pub async fn read_messages(
 
     let new_cursor = messages.iter().map(|m| m.id).max().unwrap_or(since);
     if input.only_new && new_cursor > since {
+        // The cursor is this window's. Advanced by a connection that has
+        // been replaced, the live window never sees those messages: they
+        // are "already read" by a process that is gone.
+        let mut tx = pool.begin().await?;
+        super::sessions::guard(&mut tx, auth).await?;
         sqlx::query(
             r#"
             INSERT INTO read_cursors (agent_id, scope, last_message_id)
@@ -693,8 +698,9 @@ pub async fn read_messages(
         .bind(auth.agent_id)
         .bind(&cursor_key)
         .bind(new_cursor)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
     }
 
     Ok(MessageList {
