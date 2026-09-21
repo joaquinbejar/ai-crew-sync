@@ -155,10 +155,10 @@ pub async fn heartbeat(
             VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($8, ''), NULLIF($9, ''),
                     now(), now() + make_interval(secs => $7))
             ON CONFLICT (agent_id, session) DO UPDATE SET
-                status     = EXCLUDED.status,
+                status = EXCLUDED.status,
                 -- keep the previous value when the caller omits a field
-                repo       = COALESCE(EXCLUDED.repo, agent_presence.repo),
-                branch     = COALESCE(EXCLUDED.branch, agent_presence.branch),
+                repo = COALESCE(EXCLUDED.repo, agent_presence.repo),
+                branch = COALESCE(EXCLUDED.branch, agent_presence.branch),
                 -- Omitted keeps the previous value; an explicit empty string
                 -- clears it. A session that has just started has not done
                 -- anything yet, and carrying yesterday's line forward is how
@@ -171,11 +171,11 @@ pub async fn heartbeat(
                                  ELSE COALESCE(EXCLUDED.activity, agent_presence.activity)
                              END,
                 -- Same rule for the discovery labels.
-                project    = CASE
+                project = CASE
                                  WHEN $8 = '' THEN NULL
                                  ELSE COALESCE(EXCLUDED.project, agent_presence.project)
                              END,
-                role       = CASE
+                role = CASE
                                  WHEN $9 = '' THEN NULL
                                  ELSE COALESCE(EXCLUDED.role, agent_presence.role)
                              END,

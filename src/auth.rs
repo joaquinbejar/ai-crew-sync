@@ -323,12 +323,12 @@ async fn resolve_session_token(pool: &PgPool, raw: &str) -> Result<AuthCtx, Auth
                tm.id,
                tm.slug,
                (s.revoked_at IS NOT NULL) AS session_revoked,
-               (s.expires_at <= now())    AS session_expired,
+               (s.expires_at <= now()) AS session_expired,
                (t.revoked_at IS NOT NULL) AS parent_revoked
         FROM agent_sessions s
         JOIN api_tokens t ON t.id = s.parent_token
-        JOIN agents a     ON a.id = s.agent_id
-        JOIN teams tm     ON tm.id = a.team_id
+        JOIN agents a ON a.id = s.agent_id
+        JOIN teams tm ON tm.id = a.team_id
         WHERE s.token_hash = $1
         "#,
     )
