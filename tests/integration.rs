@@ -9689,3 +9689,148 @@ async fn a_live_label_is_refused_even_when_it_spells_a_missing_method() {
     }
     h.shutdown().await;
 }
+
+/// Route a team's new conversations to JetStream the way an operator does:
+/// the flag on the team plus provisioned streams. The harness server has the
+/// broker configured whenever `require_db_broker!` was used.
+async fn route_team_to_jetstream(h: &Harness, team: &str) {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    let id = team_id(&h.pool, team).await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(id)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, id).await.unwrap();
+}
+
+/// Re-admitting a removed member is a moderator decision the bus records as
+/// 'member.readmit'. The audit table's check never listed that action, so
+/// the invitation rolled back with a bare "database error" and the member
+/// stayed out (#125). The rule the readmission keeps: nothing said before
+/// it comes back, however the inviter asks.
+#[tokio::test]
+async fn a_removed_member_is_readmitted_without_its_old_history() {
+    for backend in ["postgres", "jetstream"] {
+        let schema = format!("t_readmit_{backend}");
+        let h = require_db_broker!(&schema);
+        let token = seed_agent(&h.pool, "acme", "joaquin").await;
+        let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+        enable_conversations(&h.pool, "acme").await;
+        if backend == "jetstream" {
+            route_team_to_jetstream(&h, "acme").await;
+        }
+        let owner = connect_with_session(&h.base, &token, "impl").await;
+        let dani = connect_with_session(&h.base, &dani_token, "core").await;
+
+        let convo = call(
+            &owner,
+            "create_conversation",
+            json!({"title": "readmission", "private": true}),
+        )
+        .await;
+        let cid = convo["id"].as_str().unwrap().to_owned();
+        let send = |body: &'static str| {
+            let owner = &owner;
+            let cid = cid.clone();
+            async move {
+                call(
+                    owner,
+                    "send_conversation_message",
+                    json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+                )
+                .await["message_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            }
+        };
+        let before = send("before the removal").await;
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/core", "history_from_start": true}),
+        )
+        .await;
+        call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+        let seen = call(
+            &dani,
+            "get_conversation_message",
+            json!({"message_id": before}),
+        )
+        .await;
+        assert_eq!(seen["body"], "before the removal", "[{backend}] {seen}");
+
+        call(
+            &owner,
+            "remove_conversation_member",
+            json!({"conversation_id": cid, "address": "dani/core"}),
+        )
+        .await;
+        let meanwhile = send("said while removed").await;
+
+        // The readmission goes through, whatever history the inviter asks
+        // for, and it is recorded as what it is.
+        call(
+            &owner,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "dani/core", "history_from_start": true}),
+        )
+        .await;
+        let cid_uuid: Uuid = cid.parse().unwrap();
+        let (state, from_seq): (String, Option<i64>) = sqlx::query_as(
+            "SELECT state, history_from_seq FROM conversation_memberships
+              WHERE conversation_id = $1 AND session = 'core'",
+        )
+        .bind(cid_uuid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(state, "invited", "[{backend}]");
+        assert_eq!(
+            from_seq,
+            Some(2),
+            "[{backend}] a readmission starts here, not at the start"
+        );
+        let (readmits,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM conversation_audit
+              WHERE conversation_id = $1 AND action = 'member.readmit'",
+        )
+        .bind(cid_uuid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(readmits, 1, "[{backend}] the readmission is audited as one");
+
+        call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+        for hidden in [&before, &meanwhile] {
+            let err = call_expect_error(
+                &dani,
+                "get_conversation_message",
+                json!({"message_id": hidden}),
+            )
+            .await;
+            assert!(!err.contains("database error"), "[{backend}] {err}");
+        }
+        let after = send("after the readmission").await;
+        let seen = call(
+            &dani,
+            "get_conversation_message",
+            json!({"message_id": after}),
+        )
+        .await;
+        assert_eq!(seen["body"], "after the readmission", "[{backend}] {seen}");
+        let read = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+        assert_eq!(
+            read["messages"].as_array().map(Vec::len),
+            Some(1),
+            "[{backend}] only what was said after the readmission: {read}"
+        );
+
+        for c in [owner, dani] {
+            let _ = c.cancel().await;
+        }
+        h.shutdown().await;
+    }
+}
