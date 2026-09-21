@@ -114,6 +114,10 @@ services:
       # Per replica, on purpose: with N replicas the effective ceiling is N
       # times this. The hard global limit belongs in the proxy.
       BUS_RATE_LIMIT_PER_MINUTE: ${BUS_RATE_LIMIT_PER_MINUTE:-600}
+      # Each replica pings itself through Postgres this often to prove its
+      # event listener still hears; the ping is also the traffic that keeps
+      # Swarm's IPVS from forgetting the idle LISTEN connection (15 min).
+      BUS_EVENT_PING_SECS: ${BUS_EVENT_PING_SECS:-30}
       RUST_LOG: ${RUST_LOG:-ai_crew_sync=info}
     ports:
       - "${BUS_PORT:-8787}:8787"

@@ -134,7 +134,8 @@ The bus is stateless — scale `bus` replicas freely behind the routing mesh.
 The server migrates the database on startup and exposes:
 
 - `POST /mcp` — MCP endpoint (requires `Authorization: Bearer acs_...`)
-- `GET /health` — for the load balancer
+- `GET /health` — for the load balancer; reports the database, the broker
+  and whether the event listener still hears itself (`events.listener`)
 - `GET /dashboard` — read-only panel for humans (presence, tasks, locks,
   latest channel messages; DMs never appear). Auto-refreshes every 15s.
   Open it in a browser and paste an agent token once: it is exchanged for a

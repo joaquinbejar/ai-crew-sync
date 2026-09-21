@@ -108,6 +108,15 @@ async fn spawn_server(
     ct: CancellationToken,
     nats: Option<String>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    spawn_server_with_ping(pool, ct, nats, ai_crew_sync::events::DEFAULT_PING_SECS).await
+}
+
+async fn spawn_server_with_ping(
+    pool: PgPool,
+    ct: CancellationToken,
+    nats: Option<String>,
+    event_ping_secs: u64,
+) -> (String, tokio::task::JoinHandle<()>) {
     let app = build_router(
         pool,
         &ServeOptions {
@@ -125,6 +134,7 @@ async fn spawn_server(
             // a time, so the timing under test is the test's and not a
             // background loop's.
             publication_worker: false,
+            event_ping_secs,
         },
         ct.clone(),
     );
@@ -353,6 +363,7 @@ async fn setup_rate_limited(schema: &str, per_minute: u32) -> Option<Harness> {
             nats_url: None,
             nats_credentials: None,
             publication_worker: false,
+            event_ping_secs: ai_crew_sync::events::DEFAULT_PING_SECS,
         },
         child.clone(),
     );
@@ -10258,4 +10269,250 @@ async fn a_transfer_to_a_window_with_a_seat_changes_nothing() {
         }
         h.shutdown().await;
     }
+}
+
+/// A waiter asking for notes, tasks or locks wakes when a teammate writes
+/// one. Every wait test before this asked for messages, so the other three
+/// kinds were never seen to arrive (#128).
+#[tokio::test]
+async fn wait_for_updates_wakes_on_notes_tasks_and_locks() {
+    let h = require_db!("t_wait_kinds");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let b = seed_agent(&h.pool, "acme", "marta").await;
+    let writer = connect(&h.base, &a).await;
+
+    for (kind, tool, args) in [
+        (
+            "note",
+            "set_note",
+            json!({"key": "wake-note", "value": "x"}),
+        ),
+        (
+            "task",
+            "create_task",
+            json!({"key": "wake-task", "title": "t"}),
+        ),
+        (
+            "lock",
+            "acquire_lock",
+            json!({"name": "wake-lock", "ttl_seconds": 30}),
+        ),
+    ] {
+        let waiter = connect(&h.base, &b).await;
+        let wait = tokio::spawn({
+            let kind = kind.to_owned();
+            async move {
+                let r = call(
+                    &waiter,
+                    "wait_for_updates",
+                    json!({"kinds": [kind], "timeout_seconds": 8}),
+                )
+                .await;
+                let _ = waiter.cancel().await;
+                r
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        call(&writer, tool, args).await;
+        let r = wait.await.unwrap();
+        assert_eq!(r["woke"], true, "{kind}: {r}");
+        assert_eq!(r["events"][0]["kind"], kind, "{kind}: {r}");
+    }
+    let _ = writer.cancel().await;
+    h.shutdown().await;
+}
+
+/// A LISTEN connection can die without a word: Swarm's IPVS forgets an idle
+/// TCP connection after fifteen minutes and tells neither end, and a bus
+/// sat "attached" for hours while no wake arrived (#128). Each replica now
+/// pings itself through Postgres; three unanswered pings and the listener is
+/// dropped and attached afresh, and `/health` says which state it is in.
+#[tokio::test]
+async fn a_listener_that_went_deaf_is_noticed_and_reattached() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut h = require_db!("t_deaf_listener");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = seed_agent(&h.pool, "acme", "marta").await;
+
+    // A TCP proxy in front of Postgres that can turn a connection into a
+    // black hole: bytes are read and dropped in both directions, the socket
+    // stays open, nobody is told. It remembers which connections said
+    // LISTEN, because those are the ones the bus can only wait on.
+    let url = db_url().unwrap();
+    let at = url.rfind('@').unwrap();
+    let slash = at + url[at..].find('/').unwrap();
+    let upstream = url[at + 1..slash].to_owned();
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxied_url = format!(
+        "{}@{}{}",
+        &url[..at],
+        proxy.local_addr().unwrap(),
+        &url[slash..]
+    );
+    let holes: Arc<Mutex<Vec<Arc<AtomicBool>>>> = Arc::default();
+    tokio::spawn({
+        let holes = holes.clone();
+        async move {
+            loop {
+                let Ok((client, _)) = proxy.accept().await else {
+                    break;
+                };
+                let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                let hole = Arc::new(AtomicBool::new(false));
+                let (mut cr, mut cw) = client.into_split();
+                let (mut sr, mut sw) = server.into_split();
+                tokio::spawn({
+                    let hole = hole.clone();
+                    let holes = holes.clone();
+                    async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let n = match cr.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            if buf[..n].windows(6).any(|w| w == b"LISTEN") {
+                                holes.lock().unwrap().push(hole.clone());
+                            }
+                            if hole.load(Ordering::SeqCst) {
+                                continue;
+                            }
+                            if sw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    loop {
+                        let n = match sr.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if hole.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        if cw.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    // A second replica whose every connection goes through the proxy, pinging
+    // itself every second so the test does not wait minutes.
+    let schema = h.schema.clone();
+    let proxied = PgPoolOptions::new()
+        .max_connections(8)
+        .after_connect(move |conn, _| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&proxied_url)
+        .await
+        .unwrap();
+    let (replica, handle) = spawn_server_with_ping(proxied, h.ct.child_token(), None, 1).await;
+    h.servers.push(handle);
+
+    let health = |base: String| async move {
+        reqwest::get(format!("{base}/health"))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+    let wait_until = |pred: fn(&serde_json::Value) -> bool, what: &'static str| {
+        let replica = replica.clone();
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let h = health(replica.clone()).await;
+                if pred(&h["events"]) {
+                    return h;
+                }
+                assert!(std::time::Instant::now() < deadline, "{what}: {h}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    };
+    // The first echo is the proof of readiness the log line never was.
+    let ready = wait_until(|e| e["echoes"].as_u64() >= Some(1), "first echo").await;
+    assert_eq!(ready["events"]["listener"], "live", "{ready}");
+    assert_eq!(ready["events"]["attachments"], 1, "{ready}");
+    assert_eq!(ready["status"], "ok", "{ready}");
+
+    // A wake through the proxied replica works while its listener hears.
+    let wake = |replica: String, writer_base: String, key: &'static str| {
+        let token = token.clone();
+        let marta = marta.clone();
+        async move {
+            let waiter = connect(&replica, &marta).await;
+            let wait = tokio::spawn(async move {
+                let r = call(
+                    &waiter,
+                    "wait_for_updates",
+                    json!({"kinds": ["note"], "timeout_seconds": 10}),
+                )
+                .await;
+                let _ = waiter.cancel().await;
+                r
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let writer = connect(&writer_base, &token).await;
+            call(&writer, "set_note", json!({"key": key, "value": "x"})).await;
+            let _ = writer.cancel().await;
+            wait.await.unwrap()
+        }
+    };
+    let woke = wake(replica.clone(), h.base.clone(), "before").await;
+    assert_eq!(woke["woke"], true, "{woke}");
+
+    // The socket goes dead without a word. Every LISTEN connection the proxy
+    // has seen so far is black-holed; the one the replica opens next is not.
+    let dead: Vec<_> = holes.lock().unwrap().drain(..).collect();
+    assert!(!dead.is_empty(), "the proxy saw the LISTEN connection");
+    for hole in &dead {
+        hole.store(true, Ordering::SeqCst);
+    }
+
+    // The replica notices on its own, and comes back hearing.
+    let back = wait_until(
+        |e| e["attachments"].as_u64() >= Some(2) && e["listener"] == "live",
+        "reattached",
+    )
+    .await;
+    let echoes_at_reattach = back["events"]["echoes"].as_u64().unwrap();
+    wait_until(
+        |e| e["listener"] == "live" && e["last_echo_seconds"].as_i64() <= Some(2),
+        "hearing again",
+    )
+    .await;
+    let after = health(replica.clone()).await;
+    assert!(
+        after["events"]["echoes"].as_u64() >= Some(echoes_at_reattach),
+        "{after}"
+    );
+    assert_eq!(after["status"], "ok", "{after}");
+
+    // And wakes work again, on the fresh connection.
+    let woke = wake(replica.clone(), h.base.clone(), "after").await;
+    assert_eq!(woke["woke"], true, "after the reattach: {woke}");
+
+    h.shutdown().await;
 }
