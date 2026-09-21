@@ -9639,3 +9639,53 @@ async fn the_attachment_cap_holds_under_a_race() {
     let _ = Arc::try_unwrap(client).ok().map(|c| c.cancel());
     h.shutdown().await;
 }
+
+/// A live label is refused even when the refusal spells a missing method.
+/// The conversation id here hashes to the label `s-32601f03e877`; the bus
+/// quotes it when a second process tries to register it without the
+/// window's credential, and the proxy once read that "-32601" as "this bus
+/// has no register_session" and carried on label-only with the parent
+/// token — the one case the conflict exists to stop.
+#[tokio::test]
+async fn a_live_label_is_refused_even_when_it_spells_a_missing_method() {
+    let h = require_db!("t_proxy_32601");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let profiles = [("acme", "acme", "joaquin", token.as_str())];
+    // Two config dirs: the second process has no binding to resume from,
+    // so it can only ask the bus to register the label afresh.
+    let dir_a = proxy_config_dir(&h.base, &profiles);
+    let dir_b = proxy_config_dir(&h.base, &profiles);
+    let mut repos = Vec::new();
+    for dir in [&dir_a, &dir_b] {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+        repos.push(repo);
+    }
+
+    let holder = spawn_proxy(&dir_a, &repos[0], &["--host-session", "conv-1714608"], &[]).await;
+    let s = call(&holder, "session_status", json!({})).await;
+    assert_eq!(
+        s["session"], "s-32601f03e877",
+        "the fixture id moved; pick another: {s}"
+    );
+    assert_eq!(s["agent"], "joaquin");
+
+    let intruder = spawn_proxy(&dir_b, &repos[1], &["--host-session", "conv-1714608"], &[]).await;
+    let s2 = call(&intruder, "session_status", json!({})).await;
+    assert!(
+        s2["agent"].is_null(),
+        "the second process is not connected: {s2}"
+    );
+    let reason = s2["error"].as_str().unwrap_or_default();
+    assert!(reason.contains("still live"), "{s2}");
+    let err = call_expect_error(&intruder, "whoami", json!({})).await;
+    assert!(err.contains("not connected"), "{err}");
+
+    // The window that owns the label is untouched.
+    assert_eq!(call(&holder, "whoami", json!({})).await["agent"], "joaquin");
+    for c in [holder, intruder] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

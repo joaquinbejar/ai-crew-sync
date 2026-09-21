@@ -52,7 +52,7 @@ use anyhow::Context as _;
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer, RunningService, ServiceError},
@@ -365,15 +365,47 @@ fn unauthorized(e: &ServiceError) -> bool {
     sent.error.to_string().contains("Auth required")
 }
 
-/// Marker carried inside an `anyhow` chain by [`call_remote`], so a caller
-/// that only sees `anyhow::Error` can still tell a rejected bearer from a
-/// refusal without reading the message.
-#[derive(Debug, thiserror::Error)]
-#[error("the bus rejected the credential")]
-struct Unauthorized;
+/// The bus has no such tool. rmcp answers an unknown tool with
+/// `invalid_params("tool not found")`, and a JSON-RPC layer without the
+/// method with -32601. A refusal from a tool that exists is neither,
+/// whatever it quotes: the bus's own "not found: …" errors share the code,
+/// and a live-label conflict quotes the label, which a conversation id can
+/// hash to `s-32601…`. Matching that text once kept a window label-only,
+/// forwarding with the parent token, exactly when it had to fail closed.
+fn no_such_tool(e: &ServiceError) -> bool {
+    match e {
+        ServiceError::McpError(err) => {
+            err.code == ErrorCode::METHOD_NOT_FOUND
+                || (err.code == ErrorCode::INVALID_PARAMS
+                    && err.message.trim_start().starts_with("tool not found"))
+        }
+        _ => false,
+    }
+}
 
-fn rejected_bearer(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.is::<Unauthorized>())
+/// What a failed call means, decided from the error's shape, never from its
+/// wording. Carried inside the `anyhow` chain by [`call_remote`] so a caller
+/// that only sees `anyhow::Error` reads the same fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum Verdict {
+    #[error("the bus rejected the credential")]
+    Unauthorized,
+    #[error("the bus has no such tool")]
+    NoSuchTool,
+}
+
+fn verdict(e: &ServiceError) -> Option<Verdict> {
+    if unauthorized(e) {
+        Some(Verdict::Unauthorized)
+    } else if no_such_tool(e) {
+        Some(Verdict::NoSuchTool)
+    } else {
+        None
+    }
+}
+
+fn verdict_of(e: &anyhow::Error) -> Option<Verdict> {
+    e.chain().find_map(|c| c.downcast_ref::<Verdict>().copied())
 }
 
 async fn call_remote(remote: &Remote, name: &str, args: Value) -> anyhow::Result<Value> {
@@ -382,12 +414,9 @@ async fn call_remote(remote: &Remote, name: &str, args: Value) -> anyhow::Result
     let result = remote
         .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments))
         .await
-        .map_err(|e| {
-            if unauthorized(&e) {
-                anyhow::Error::new(Unauthorized).context(format!("{name} failed: {e}"))
-            } else {
-                anyhow::anyhow!("{name} failed: {e}")
-            }
+        .map_err(|e| match verdict(&e) {
+            Some(v) => anyhow::Error::new(v).context(format!("{name} failed: {e}")),
+            None => anyhow::anyhow!("{name} failed: {e}"),
         })?;
     if result.is_error == Some(true) {
         anyhow::bail!("{name} returned an error: {:?}", result.content);
@@ -419,7 +448,7 @@ async fn register_new(remote: &Remote, session: &str) -> anyhow::Result<Option<S
             // Only "this server has no such tool" is a legacy bus. A refusal,
             // a database error or a dropped connection is not, and failing
             // closed is the point.
-            if text.contains("not found") || text.contains("-32601") || text.contains("Method") {
+            if verdict_of(&e) == Some(Verdict::NoSuchTool) {
                 tracing::warn!(
                     "this bus does not issue session credentials; continuing with the label only"
                 );
@@ -484,7 +513,7 @@ async fn establish(
             // The same wording a forwarded 401 gets, so a window started
             // with a rotated token says what to do rather than "the bus did
             // not accept the credential".
-            if rejected_bearer(&e) {
+            if verdict_of(&e) == Some(Verdict::Unauthorized) {
                 anyhow::bail!(
                     "the bus rejected this window's credential — it has been revoked or \
                      rotated{}. Issue a new token (`ai-crew-sync admin token issue --save`) \
@@ -1497,7 +1526,7 @@ pub async fn run(opts: ProxyOptions) -> anyhow::Result<()> {
 mod unauthorized_tests {
     use rmcp::{
         RoleClient,
-        model::ErrorData,
+        model::{ErrorCode, ErrorData},
         transport::{
             DynamicTransportError, StreamableHttpClientTransport,
             streamable_http_client::{AuthRequiredError, StreamableHttpError},
@@ -1536,6 +1565,47 @@ mod unauthorized_tests {
             !unauthorized(&e),
             "not even when it borrows the transport's words"
         );
+    }
+
+    #[test]
+    fn a_missing_tool_is_the_code_saying_so() {
+        // rmcp 3.x, unknown tool.
+        let e = ServiceError::McpError(ErrorData::invalid_params("tool not found", None));
+        assert!(no_such_tool(&e));
+        assert_eq!(verdict(&e), Some(Verdict::NoSuchTool));
+        // A JSON-RPC layer without the method at all.
+        let e = ServiceError::McpError(ErrorData::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "Method not found",
+            None,
+        ));
+        assert!(no_such_tool(&e));
+    }
+
+    #[test]
+    fn a_refusal_that_spells_a_missing_method_is_still_a_refusal() {
+        // The bus's conflict on a live label quotes the label, and a label
+        // can hash to `s-32601…`. Same code as "tool not found".
+        let e = ServiceError::McpError(ErrorData::invalid_params(
+            "conflict: session 's-32601f03e877' is already registered and still live. \
+             Holding the agent token does not make you that window: Method aside, \
+             reconnect it with resume_session",
+            None,
+        ));
+        assert!(!no_such_tool(&e));
+        assert_eq!(verdict(&e), None);
+        // The bus's own not-found errors share the code too.
+        let e = ServiceError::McpError(ErrorData::invalid_params("not found: message 32601", None));
+        assert!(!no_such_tool(&e));
+        assert!(!no_such_tool(&ServiceError::TransportClosed));
+    }
+
+    #[test]
+    fn a_verdict_survives_the_anyhow_chain() {
+        let e = anyhow::Error::new(Verdict::NoSuchTool).context("register_session failed");
+        assert_eq!(verdict_of(&e), Some(Verdict::NoSuchTool));
+        let e = anyhow::anyhow!("register_session failed: tool not found -32601 Method");
+        assert_eq!(verdict_of(&e), None, "words are not a verdict");
     }
 
     #[test]
