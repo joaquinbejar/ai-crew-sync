@@ -220,6 +220,16 @@ pub async fn fetch(
     // being one. Without this, the parent agent token could take its own
     // window's references and record them as delivered on its behalf.
     crate::store::sessions::require_window(pool, auth).await?;
+    // Nor is a replaced connection that window. It would pull references
+    // off the consumer as the live window and leave them handed out to a
+    // process that is gone, which the live window then cannot see for the
+    // whole in-flight grace period. Checked here, once: the hand-outs
+    // record the epoch, and `confirm` rechecks it inside its own write.
+    {
+        let mut tx = pool.begin().await?;
+        crate::store::sessions::guard(&mut tx, auth).await?;
+        tx.rollback().await?;
+    }
     let limit = limit.unwrap_or(DEFAULT_BATCH).clamp(1, MAX_BATCH);
     let key = caller_key(auth);
     let mut references = Vec::new();

@@ -149,6 +149,12 @@ pub async fn acquire_lock(
 pub async fn release_lock(pool: &PgPool, auth: &AuthCtx, name: &str) -> BusResult<Ack> {
     let name = normalize_name(name)?;
 
+    // Fenced like acquiring. The holder predicate matches the agent and the
+    // label, which a resumed window shares with the connection it replaced;
+    // only the epoch tells them apart, and a replaced connection must not
+    // put back a lock its replacement is holding.
+    let mut tx = pool.begin().await?;
+    super::sessions::guard(&mut tx, auth).await?;
     let released = sqlx::query(
         "DELETE FROM locks
               WHERE team_id = $1 AND name = $2 AND holder_agent_id = $3
@@ -158,8 +164,9 @@ pub async fn release_lock(pool: &PgPool, auth: &AuthCtx, name: &str) -> BusResul
     .bind(&name)
     .bind(auth.agent_id)
     .bind(&auth.session)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     if released.rows_affected() > 0 {
         return Ok(Ack {
