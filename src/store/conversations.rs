@@ -1365,6 +1365,12 @@ pub enum BodyState {
         publication: &'static str,
         why: BusError,
     },
+    /// The backend holding this body cannot be reached. Different from
+    /// missing in the way that matters: the message *is* stored, nothing is
+    /// lost, and the body comes back when the backend does. The row keeps
+    /// its own publication state and the reader is told why it cannot see
+    /// the body right now.
+    Unreachable(BusError),
 }
 
 /// The columns resolving a body needs. Read once per message, alongside the
@@ -1432,11 +1438,35 @@ async fn resolve_body(
                     ),
                 });
             };
-            let backend = backends.for_message(&row.backend, team_id).await?;
-            match backend
+            // A backend this process cannot reach is not a message that
+            // does not exist. Losing the broker costs the bodies it holds,
+            // for as long as it is down, and nothing else: not the thread,
+            // not the other messages, not the page.
+            let backend = match backends.for_message(&row.backend, team_id).await {
+                Ok(backend) => backend,
+                Err(why) => {
+                    return Ok(BodyState::Unreachable(BusError::conflict(format!(
+                        "the backend holding this body cannot be reached right now \
+                         ({why}). The message is not lost: its place in the thread, its \
+                         recipients and its receipts are here, and the body comes back \
+                         when the backend does."
+                    ))));
+                }
+            };
+            let fetched = match backend
                 .fetch(&crate::store::backend::Locator(locator), message_id)
-                .await?
+                .await
             {
+                Ok(fetched) => fetched,
+                Err(why) => {
+                    return Ok(BodyState::Unreachable(BusError::conflict(format!(
+                        "this body could not be read from its backend right now ({why}). \
+                         It is not lost: its place in the thread, its recipients and its \
+                         receipts are here."
+                    ))));
+                }
+            };
+            match fetched {
                 Some(body) => Ok(BodyState::Present(body)),
                 None => {
                     // Gone from the backend without a tombstone: record one,
@@ -1504,7 +1534,7 @@ pub async fn body_of(
     .await?;
     match resolved {
         BodyState::Present(body) => Ok(body),
-        BodyState::Missing { why, .. } => Err(why),
+        BodyState::Missing { why, .. } | BodyState::Unreachable(why) => Err(why),
     }
 }
 
@@ -1640,6 +1670,8 @@ pub async fn read(
             BodyState::Missing { publication, why } => {
                 (String::new(), publication.to_owned(), Some(why.to_string()))
             }
+            // Stored, and unreadable for as long as the backend is away.
+            BodyState::Unreachable(why) => (String::new(), publication, Some(why.to_string())),
         };
         messages.push(ConversationMessage {
             message_id: mid.to_string(),
@@ -1865,6 +1897,7 @@ pub async fn get_message(
         BodyState::Missing { publication, why } => {
             (String::new(), publication.to_owned(), Some(why.to_string()))
         }
+        BodyState::Unreachable(why) => (String::new(), publication, Some(why.to_string())),
     };
     Ok(ConversationMessage {
         message_id: message_id.to_string(),
@@ -2380,6 +2413,7 @@ pub async fn recover_history(
             BodyState::Missing { publication, why } => {
                 (String::new(), publication.to_owned(), Some(why.to_string()))
             }
+            BodyState::Unreachable(why) => (String::new(), publication, Some(why.to_string())),
         };
         messages.push(ConversationMessage {
             message_id: mid.to_string(),

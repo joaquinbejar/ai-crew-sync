@@ -8979,3 +8979,126 @@ async fn a_lost_confirmation_is_not_a_failure_when_the_backend_kept_it() {
     }
     h.shutdown().await;
 }
+
+/// Losing the broker costs the bodies it holds, for as long as it is away,
+/// and nothing else. Reproduced on a real deployment by deleting the
+/// broker's volume: the thread stopped reading at all.
+#[tokio::test]
+async fn a_broker_that_is_gone_does_not_take_the_thread_with_it() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db_broker!("t_broker_gone");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+
+    // One thread that stays on Postgres, and one routed to the broker.
+    let local = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "en postgres", "private": true}),
+    )
+    .await;
+    call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": local["id"], "body": "sigue aquí", "request_id": request_id()}),
+    )
+    .await;
+
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "en el broker", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "en el broker", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+    outbox::release_published_bodies(&h.pool, Some(cid.parse().unwrap()), 0)
+        .await
+        .unwrap();
+
+    // The broker loses everything. Not retention, not a tombstone: gone.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+
+    // The thread still reads. The message keeps its place, its sender and
+    // its sequence, and says why the body is not here.
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let msgs = page["messages"]
+        .as_array()
+        .expect("the page is still a page");
+    assert_eq!(msgs.len(), 1, "the thread did not vanish: {page}");
+    assert_eq!(msgs[0]["message_id"], sent["message_id"]);
+    assert_eq!(msgs[0]["seq"], 1);
+    assert_eq!(msgs[0]["from_address"], "joaquin/impl");
+    assert_eq!(msgs[0]["body"], "");
+    assert_eq!(
+        msgs[0]["publication"], "stored",
+        "it *is* stored; what is missing is this process's way to read it"
+    );
+    assert!(
+        msgs[0]["unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be reached"),
+        "and it says so: {}",
+        msgs[0]
+    );
+
+    // Its receipts survive, and so does the rest of the bus.
+    let receipts = call(
+        &owner,
+        "get_message_receipts",
+        json!({"message_id": sent["message_id"]}),
+    )
+    .await;
+    assert_eq!(receipts["total"], 1, "{receipts}");
+    let still = call(
+        &owner,
+        "read_conversation",
+        json!({"conversation_id": local["id"]}),
+    )
+    .await;
+    assert_eq!(
+        still["messages"][0]["body"], "sigue aquí",
+        "a thread on Postgres is untouched by the broker's trouble"
+    );
+
+    // And a send is still accepted: it queues, as it does for any outage.
+    let after = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "después", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(after["stored"], false, "{after}");
+
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
