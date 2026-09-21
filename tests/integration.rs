@@ -9294,3 +9294,95 @@ async fn a_replaced_window_cannot_finish_the_work_of_the_one_that_replaced_it() 
     }
     h.shutdown().await;
 }
+
+/// A path this server does not serve is a path, not a credential problem.
+/// Found on the deployment: a mistyped URL answered "missing bearer token",
+/// and a mistyped /admin path told an operator holding a perfectly good
+/// credential that it was invalid or revoked.
+#[tokio::test]
+async fn a_mistyped_path_does_not_blame_the_credential() {
+    let h = require_db!("t_unknown_paths");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let client = reqwest::Client::new();
+
+    for (path, bearer) in [
+        ("/pepito", None),
+        ("/pepito", Some(token.as_str())),
+        ("/admin/no-existe", None),
+        ("/dashboard/nope", None),
+    ] {
+        let mut req = client.get(format!("{}{path}", h.base));
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            404,
+            "{path} (bearer: {}) answered {status}: {body}",
+            bearer.is_some()
+        );
+        assert!(
+            !body.contains("bearer") && !body.contains("revoked"),
+            "{path} blamed the credential: {body}"
+        );
+        assert!(
+            body.contains("/mcp"),
+            "and it says what this server does serve: {body}"
+        );
+    }
+
+    // A query string can carry a credential, and an error body travels: it
+    // is pasted into issues and scraped out of logs. The 404 names the path
+    // and nothing else.
+    let resp = client
+        .get(format!(
+            "{}/admin/not-a-route?token=acs_do_not_echo_me&other=keep",
+            h.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        !body.contains("do_not_echo_me") && !body.contains("token="),
+        "the 404 repeated a query credential: {body}"
+    );
+    assert!(body.contains("/admin/not-a-route"), "{body}");
+
+    // Anything under /mcp is the MCP endpoint's own namespace, and that one
+    // does ask for a token before it says anything at all.
+    let resp = client
+        .get(format!("{}/mcp/extra", h.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "under /mcp, authentication comes first");
+
+    // The real endpoints still guard themselves.
+    let resp = client
+        .post(format!("{}/mcp", h.base))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "/mcp without a token is still refused");
+    let resp = client
+        .post(format!("{}/mcp", h.base))
+        .bearer_auth("acs_0000000000000000000000000000000000000000000000000000000000000000")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "/mcp with a bad token is still refused");
+
+    let c = connect(&h.base, &token).await;
+    let me = call(&c, "whoami", json!({})).await;
+    assert_eq!(me["agent"], "joaquin", "and a good one still works");
+    let _ = c.cancel().await;
+
+    h.shutdown().await;
+}

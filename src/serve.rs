@@ -425,7 +425,13 @@ pub fn build_router(pool: PgPool, opts: &ServeOptions, ct: CancellationToken) ->
         // Every /mcp request must carry a valid bearer token; the middleware
         // injects the resolved AuthCtx that tool handlers read, and charges
         // the per-token rate limit.
-        .layer(axum::middleware::from_fn_with_state(
+        //
+        // `route_layer`, not `layer`: a layer applies to this router's
+        // fallback too, and merging carried that fallback to the whole
+        // server. A mistyped path anywhere then answered "missing bearer
+        // token" or "invalid or revoked token" — sending whoever typed it
+        // to check a credential that was never the problem.
+        .route_layer(axum::middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,
         ))
@@ -456,6 +462,26 @@ pub fn build_router(pool: PgPool, opts: &ServeOptions, ct: CancellationToken) ->
         });
 
     Router::new()
+        // A path this server does not serve is a path, not a credential
+        // problem. Said before anything asks for a token, and it names what
+        // is actually here.
+        // The path only. A query string can carry a credential — the
+        // dashboard still accepts one that way — and repeating it in an
+        // error body puts it wherever that body is pasted. The tracing
+        // layer below drops query strings for the same reason.
+        .fallback(|uri: axum::http::Uri| async move {
+            let path = uri.path().to_owned();
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({
+                    "error": format!(
+                        "no route for {path} on this server. It serves POST /mcp (the MCP \
+                         endpoint), GET /health, GET /dashboard and /admin/* for \
+                         administrative credentials."
+                    )
+                })),
+            )
+        })
         .merge(health_routes)
         .merge(dashboard_routes)
         .merge(mcp_routes)
