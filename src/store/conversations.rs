@@ -859,11 +859,11 @@ pub async fn invite(
     .bind(&auth.session)
     .fetch_optional(&mut *tx)
     .await?;
-    let inviter_floor = match inviter {
+    let (inviter_role, inviter_floor) = match inviter {
         Some((role, state, floor))
             if state == "active" && (role == "owner" || role == "moderator") =>
         {
-            floor
+            (role, floor)
         }
         _ => {
             return Err(BusError::Forbidden(
@@ -888,8 +888,8 @@ pub async fn invite(
     // decision and stays allowed, but it is recorded as one, and it never
     // hands back the history the removal took away — whatever the inviter
     // asks for.
-    let removed: Option<(String,)> = sqlx::query_as(
-        "SELECT state FROM conversation_memberships
+    let seated: Option<(String, String)> = sqlx::query_as(
+        "SELECT state, role FROM conversation_memberships
           WHERE conversation_id = $1 AND agent_id = $2 AND session = $3
           FOR UPDATE",
     )
@@ -898,7 +898,24 @@ pub async fn invite(
     .bind(&session)
     .fetch_optional(&mut *tx)
     .await?;
-    let readmitting = removed.as_ref().map(|r| r.0.as_str()) == Some("removed");
+    let readmitting = seated.as_ref().map(|r| r.0.as_str()) == Some("removed");
+
+    // An owner's seat is only an owner's to change. Re-inviting someone
+    // already seated changes their role on the spot (a seat that stays
+    // active has nothing to accept), and removal refuses a moderator acting
+    // on an owner; an invitation that demoted the owner first walked
+    // around that refusal. Decided from the locked rows, the target's and
+    // the inviter's, so nothing committed in between can change the answer.
+    if let Some((state, role)) = &seated
+        && (state == "active" || state == "invited")
+        && role == "owner"
+        && inviter_role != "owner"
+    {
+        return Err(BusError::Forbidden(format!(
+            "'{address}' is an owner of this conversation, and only an owner can change or \
+             remove another owner. Nothing was written."
+        )));
+    }
 
     // History boundary: from here on unless the inviter asks for more, and
     // never more than the inviter can read itself. A moderator admitted
@@ -1081,6 +1098,35 @@ pub async fn remove_member(
     }
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
+    // The thread first, then the seats, in the same order as invite and
+    // transfer. The caller's role is what its row says now, under lock,
+    // not what it said before the transaction: a demotion that commits in
+    // between must not leave a former owner removing owners.
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let caller: Option<(String, String)> = sqlx::query_as(
+        "SELECT role, state FROM conversation_memberships
+          WHERE conversation_id = $1 AND agent_id = $2 AND session = $3
+          FOR UPDATE",
+    )
+    .bind(id)
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let caller = caller
+        .as_ref()
+        .map(|(role, state)| (role.as_str(), state.as_str()));
+    if !matches!(caller, Some(("owner" | "moderator", "active"))) {
+        return Err(BusError::Forbidden(
+            "your seat in this conversation changed while you were removing a member: you \
+             no longer moderate it. Nothing was written."
+                .to_owned(),
+        ));
+    }
+    let caller_is_owner = matches!(caller, Some(("owner", "active")));
     let row: Option<(String,)> = sqlx::query_as(
         "UPDATE conversation_memberships
             SET state = 'removed', ended_at = now()
@@ -1098,7 +1144,7 @@ pub async fn remove_member(
             "'{address}' is not in this conversation"
         )));
     };
-    if role == "owner" && !a.is_owner() {
+    if role == "owner" && !caller_is_owner {
         return Err(BusError::Forbidden(
             "only an owner can remove another owner".to_owned(),
         ));

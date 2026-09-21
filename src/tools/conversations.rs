@@ -247,7 +247,9 @@ impl Bus {
                        conscripts someone into its receipts. By default they see the thread \
                        from now on; `history_from_start` gives them the thread from where \
                        you can read it yourself, its start only if you can, which is a \
-                       decision worth making deliberately."
+                       decision worth making deliberately. Inviting someone already seated \
+                       changes their role at once; an owner's seat is only an owner's to \
+                       change."
     )]
     async fn invite_to_conversation(
         &self,
