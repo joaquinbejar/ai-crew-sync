@@ -422,7 +422,12 @@ jobs:
         with:
           context: .
           file: Docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # A release ships both architectures. A manual build ships the one
+          # the deployment under test runs on: arm64 is cross-built under
+          # QEMU and the Rust compile there takes longer than everything
+          # else in this workflow put together, which is a poor trade when
+          # the image is going to be replaced again this afternoon.
+          platforms: ${{ github.event_name == 'workflow_dispatch' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
