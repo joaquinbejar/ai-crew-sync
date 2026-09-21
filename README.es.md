@@ -930,7 +930,7 @@ cuál de las dos cosas es. Cada mensaje lleva un `publication`:
 |---|---|
 | `stored` | El broker lo confirmó. El cuerpo es duradero. |
 | `pending_publication` | Aceptado, aún sin confirmar. El cuerpo se lee todavía de su copia local temporal; el `stored_at` de los receipts es nulo, porque no está almacenado. |
-| `failed` | No se va a publicar. El mensaje conserva su hueco para que la laguna se vea en vez de ser silenciosa. |
+| `failed` | No se va a publicar. El mensaje conserva su hueco, y su cuerpo se sigue sirviendo desde la copia que nunca salió de Postgres: lo que falta es durabilidad en el backend, no el texto. |
 | `tombstoned` | El backend ya no tiene el cuerpo (retención, o un operador). El mensaje conserva su secuencia, sus destinatarios y sus receipts; `unavailable` dice por qué. |
 
 Un cuerpo que el backend no puede servir no tumba la página: el mensaje

@@ -9102,3 +9102,195 @@ async fn a_broker_that_is_gone_does_not_take_the_thread_with_it() {
     }
     h.shutdown().await;
 }
+
+/// A claim has to mean something on the way out too. Found on a deployment:
+/// anyone on the team could mark a task done while its holder was still
+/// working, and the holder learned about it from a refused renewal.
+#[tokio::test]
+async fn completing_a_task_respects_whoever_holds_it() {
+    let h = require_db!("t_complete_claim");
+    let owner = seed_agent(&h.pool, "acme", "joaquin").await;
+    let holder = seed_agent(&h.pool, "acme", "marta").await;
+    let other = seed_agent(&h.pool, "acme", "dani").await;
+    let o = connect(&h.base, &owner).await;
+    let m = connect(&h.base, &holder).await;
+    let d = connect(&h.base, &other).await;
+
+    call(
+        &o,
+        "create_task",
+        json!({"key": "suya", "title": "el trabajo de marta"}),
+    )
+    .await;
+    let claimed = call(
+        &m,
+        "claim_task",
+        json!({"key": "suya", "lease_seconds": 300}),
+    )
+    .await;
+    assert_eq!(claimed["claimed"], true);
+
+    // The holder is working and the lease is live.
+    let err = call_expect_error(&d, "complete_task", json!({"key": "suya"})).await;
+    assert!(err.contains("held by marta"), "{err}");
+    assert!(
+        err.contains("end work somebody else is doing"),
+        "and it says why: {err}"
+    );
+    let still = call(&o, "get_task", json!({"key": "suya"})).await;
+    assert_eq!(
+        still["task"]["status"], "claimed",
+        "nothing was written: {still}"
+    );
+
+    // Its holder finishes it.
+    let done = call(
+        &m,
+        "complete_task",
+        json!({"key": "suya", "result": "hecho"}),
+    )
+    .await;
+    assert_eq!(done["status"], "done");
+
+    // An unclaimed task is anyone's to finish: nobody's work is ended.
+    call(
+        &o,
+        "create_task",
+        json!({"key": "libre", "title": "de nadie"}),
+    )
+    .await;
+    let done = call(&d, "complete_task", json!({"key": "libre"})).await;
+    assert_eq!(done["status"], "done", "{done}");
+
+    // And an expired lease is fair game, which is what a lease is for.
+    call(
+        &o,
+        "create_task",
+        json!({"key": "caducada", "title": "abandonada"}),
+    )
+    .await;
+    call(
+        &m,
+        "claim_task",
+        json!({"key": "caducada", "lease_seconds": 60}),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE tasks SET lease_expires_at = now() - interval '1 minute' WHERE key = 'caducada'",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let done = call(&d, "complete_task", json!({"key": "caducada"})).await;
+    assert_eq!(
+        done["status"], "done",
+        "a claim nobody renewed does not hold the task for ever: {done}"
+    );
+
+    for c in [o, m, d] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Every task write is fenced by the session epoch, not only the claim.
+/// Found in review: a context admitted before a resume could still complete
+/// the replacement window's work, because the holder predicate matches the
+/// agent and the label, which a resumed window shares.
+#[tokio::test]
+async fn a_replaced_window_cannot_finish_the_work_of_the_one_that_replaced_it() {
+    use ai_crew_sync::store::tasks;
+
+    let h = require_db!("t_task_epoch_fence");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let agent = connect(&h.base, &token).await;
+    let cred = call(&agent, "register_session", json!({"session": "obrero"})).await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+
+    call(
+        &window,
+        "create_task",
+        json!({"key": "suya", "title": "en curso"}),
+    )
+    .await;
+    let claimed = call(
+        &window,
+        "claim_task",
+        json!({"key": "suya", "lease_seconds": 600}),
+    )
+    .await;
+    assert_eq!(claimed["claimed"], true);
+
+    // The context that connection was admitted with, kept while the window
+    // is resumed by the process that took over.
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'joaquin'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "joaquin".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "obrero".into(),
+        session_id: Some(cred["session_id"].as_str().unwrap().parse().unwrap()),
+        session_epoch: Some(cred["epoch"].as_i64().unwrap()),
+        token_id: None,
+    };
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2);
+
+    // Same agent, same label, replaced connection. Every write is refused.
+    for (name, result) in [
+        (
+            "complete",
+            tasks::complete_task(&h.pool, &stale, "suya", Some("no soy yo".into()))
+                .await
+                .err(),
+        ),
+        (
+            "renew",
+            tasks::renew_lease(&h.pool, &stale, "suya", Some(600))
+                .await
+                .err(),
+        ),
+        (
+            "release",
+            tasks::release_task(&h.pool, &stale, "suya").await.err(),
+        ),
+        (
+            "claim",
+            tasks::claim_task(&h.pool, &stale, "suya", Some(600))
+                .await
+                .err(),
+        ),
+    ] {
+        let err = result
+            .unwrap_or_else(|| panic!("{name} accepted a replaced connection"))
+            .to_string();
+        assert!(err.contains("stale"), "{name}: {err}");
+        assert!(err.contains("Nothing was written"), "{name}: {err}");
+    }
+
+    // The resume rotated the secret, so the live window is the one holding
+    // the new credential.
+    let live = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+    let still = call(&live, "get_task", json!({"key": "suya"})).await;
+    assert_eq!(
+        still["task"]["status"], "claimed",
+        "the task is still the live window's: {still}"
+    );
+
+    // And that window finishes it.
+    let done = call(
+        &live,
+        "complete_task",
+        json!({"key": "suya", "result": "hecho"}),
+    )
+    .await;
+    assert_eq!(done["status"], "done", "{done}");
+
+    for c in [agent, window, live] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

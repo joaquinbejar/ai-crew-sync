@@ -922,7 +922,7 @@ which. Every message carries a `publication`:
 |---|---|
 | `stored` | The broker acknowledged it. The body is durable. |
 | `pending_publication` | Accepted, not yet confirmed. The body is still readable from its temporary local copy; the receipts' `stored_at` is null, because it is not stored. |
-| `failed` | It will not be published. The message keeps its slot so the gap is visible rather than silent. |
+| `failed` | It will not be published. The message keeps its slot, and its body is still served from the copy that never left Postgres — what is missing is durability on the backend, not the text. |
 | `tombstoned` | The backend no longer holds the body (retention, or an operator). The message keeps its sequence, its recipients and its receipts; `unavailable` says why. |
 
 A body the current backend cannot serve does not fail the page: the message
