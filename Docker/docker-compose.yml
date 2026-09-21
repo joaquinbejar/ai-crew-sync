@@ -40,6 +40,30 @@ services:
         limits:
           memory: ${POSTGRES_MEMORY_LIMIT:-2g}
 
+  # The broker, for teams routed to JetStream (ADR 0001, phases 4 to 7).
+  #
+  # **Zero replicas by default**, so a default deployment runs no broker at
+  # all and the bus never contacts one. An operator who wants the JetStream
+  # path sets NATS_REPLICAS=1 and BUS_NATS_URL, provisions the team's streams
+  # with `ai-crew-sync team stream`, and only then routes a team to it. None
+  # of those steps implies the next.
+  nats:
+    image: ${NATS_IMAGE:-nats:2.12-alpine}
+    command: ["-c", "/etc/nats/nats.conf"]
+    configs:
+      - source: nats_conf
+        target: /etc/nats/nats.conf
+    volumes:
+      - nats-data:/data
+    deploy:
+      replicas: ${NATS_REPLICAS:-0}
+      restart_policy:
+        condition: on-failure
+        delay: 3s
+      resources:
+        limits:
+          memory: ${NATS_MEMORY_LIMIT:-1g}
+
   bus:
     # Published multi-arch image by default. `make up-dev` sets BUS_IMAGE and
     # BUS_VERSION to a local tag and passes --build, so a checkout build never
@@ -60,6 +84,17 @@ services:
       # Empty means "generate at startup": sessions end at restart and are not
       # shared between replicas. Set the same value everywhere in production.
       BUS_DASHBOARD_SECRET: ${BUS_DASHBOARD_SECRET:-}
+      # Empty by default: no broker, no JetStream, nothing to configure. Set
+      # it to nats://nats:4222 together with NATS_REPLICAS=1 to make the
+      # optional path available. It routes nobody on its own.
+      BUS_NATS_URL: ${BUS_NATS_URL:-}
+      BUS_NATS_CREDENTIALS: ${BUS_NATS_CREDENTIALS:-}
+      # Drain the publication outbox here. Turn it off on the replicas that
+      # only serve requests when you run dedicated drainers.
+      BUS_PUBLICATION_WORKER: ${BUS_PUBLICATION_WORKER:-true}
+      # Per replica, on purpose: with N replicas the effective ceiling is N
+      # times this. The hard global limit belongs in the proxy.
+      BUS_RATE_LIMIT_PER_MINUTE: ${BUS_RATE_LIMIT_PER_MINUTE:-600}
       RUST_LOG: ${RUST_LOG:-ai_crew_sync=info}
     ports:
       - "${BUS_PORT:-8787}:8787"
@@ -103,6 +138,12 @@ services:
         # MCP sessions are long-lived streams: do not let the proxy cut them
         traefik.http.services.crew-bus.loadbalancer.responseforwarding.flushinterval: "-1"
 
+configs:
+  # Swarm config objects are immutable: change this file and the stack needs
+  # a new name here (nats_conf_v2 and so on) to pick it up.
+  nats_conf:
+    file: ./Docker/nats.conf
+
 networks:
   default:
   edge:
@@ -111,3 +152,4 @@ networks:
 
 volumes:
   bus-data:
+  nats-data:
