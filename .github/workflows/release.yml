@@ -3,6 +3,19 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Publish (or replace) just the image, without cutting a release.
+  #
+  # A deployment being tested needs an image that can be rebuilt as often as
+  # the code changes; a release is a promise you cannot take back. This path
+  # runs the same gates and the same boot smoke test, pushes the multi-arch
+  # image, and creates no tag, no GitHub release, no binaries and no formula
+  # bump. It never moves `latest`: a deployment pins BUS_VERSION.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image tag to push to GHCR (e.g. 0.7.0). Overwrites it if it exists."
+        required: true
+        default: "0.7.0"
 
 permissions:
   contents: read
@@ -98,6 +111,7 @@ jobs:
   binaries:
     name: build ${{ matrix.target }}
     needs: gates
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -152,6 +166,7 @@ jobs:
   packages:
     name: build and verify os packages
     needs: binaries
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -272,6 +287,7 @@ jobs:
   publish-assets:
     name: attach assets to the release
     needs: packages
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -318,6 +334,7 @@ jobs:
   homebrew:
     name: update the homebrew tap
     needs: publish-assets
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -394,9 +411,13 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
+          # A tag push derives the tags from the tag itself. A manual run has
+          # no tag to derive from, so it takes the version it was given and
+          # pushes exactly that one.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
       - uses: docker/build-push-action@v6
         with:
           context: .
