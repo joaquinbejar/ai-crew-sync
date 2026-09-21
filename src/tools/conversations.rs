@@ -245,7 +245,8 @@ impl Bus {
         description = "Invite a window into a thread. Owners and moderators only. The \
                        invitee is not a member until it accepts, so a thread never \
                        conscripts someone into its receipts. By default they see the thread \
-                       from now on; `history_from_start` gives them everything, which is a \
+                       from now on; `history_from_start` gives them the thread from where \
+                       you can read it yourself, its start only if you can, which is a \
                        decision worth making deliberately."
     )]
     async fn invite_to_conversation(

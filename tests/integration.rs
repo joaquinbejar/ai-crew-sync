@@ -9986,6 +9986,40 @@ async fn a_late_moderator_cannot_grant_history_it_cannot_read() {
             "[{backend}] {seen}"
         );
 
+        // A seat that had the whole history and left does not get it back
+        // from an inviter who cannot read it: the floor is decided now.
+        call(&full, "leave_conversation", json!({"conversation_id": cid})).await;
+        call(
+            &reader,
+            "invite_to_conversation",
+            json!({"conversation_id": cid, "address": "luis/full", "history_from_start": true}),
+        )
+        .await;
+        call(&full, "join_conversation", json!({"conversation_id": cid})).await;
+        let err = call_expect_error(
+            &full,
+            "get_conversation_message",
+            json!({"message_id": withheld}),
+        )
+        .await;
+        assert!(
+            !err.contains("database error"),
+            "[{backend}] left and back: {err}"
+        );
+        let (floor,): (Option<i64>,) = sqlx::query_as(
+            "SELECT history_from_seq FROM conversation_memberships
+              WHERE conversation_id = $1 AND session = 'full'",
+        )
+        .bind(cid_uuid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            floor,
+            Some(1),
+            "[{backend}] the old floor did not come back"
+        );
+
         for c in [owner, reader, outsider, sibling, full] {
             let _ = c.cancel().await;
         }

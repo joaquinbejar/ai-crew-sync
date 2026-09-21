@@ -844,6 +844,35 @@ pub async fn invite(
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
+    // The inviter's own seat, re-read under lock. `readable` answered before
+    // this transaction: a removal that commits in between would leave a
+    // moderator who can no longer read anything still inviting, with a
+    // floor it no longer has. What may be granted is what this row says
+    // now, and only an active owner or moderator grants anything.
+    let inviter: Option<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT role, state, history_from_seq FROM conversation_memberships
+          WHERE conversation_id = $1 AND agent_id = $2 AND session = $3
+          FOR UPDATE",
+    )
+    .bind(id)
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let inviter_floor = match inviter {
+        Some((role, state, floor))
+            if state == "active" && (role == "owner" || role == "moderator") =>
+        {
+            floor
+        }
+        _ => {
+            return Err(BusError::Forbidden(
+                "your seat in this conversation changed while you were inviting: you no \
+                 longer moderate it. Nothing was written."
+                    .to_owned(),
+            ));
+        }
+    };
     let (count,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM conversation_memberships WHERE conversation_id = $1")
             .bind(id)
@@ -877,7 +906,6 @@ pub async fn invite(
     // another window of its own agent — so a full-history grant is clamped
     // to the inviter's floor, and the audit row keeps both what was asked
     // and what was given. A re-admission is always from here on.
-    let inviter_floor = a.membership.as_ref().and_then(|m| m.history_from_seq);
     let from_seq: Option<i64> = if readmitting || !history_from_start {
         Some(last_seq)
     } else {
@@ -891,7 +919,10 @@ pub async fn invite(
             role = EXCLUDED.role,
             state = CASE WHEN conversation_memberships.state IN ('left', 'removed')
                          THEN 'invited' ELSE conversation_memberships.state END,
-            history_from_seq = CASE WHEN conversation_memberships.state = 'removed'
+            -- A seat that is offered again gets the floor decided now: the
+            -- one it had when it left is not this inviter's to give back.
+            -- A seat that stays active or invited keeps its own.
+            history_from_seq = CASE WHEN conversation_memberships.state IN ('left', 'removed')
                                     THEN EXCLUDED.history_from_seq
                                     ELSE conversation_memberships.history_from_seq END,
             -- A seat that is actually being re-offered is not the seat the
