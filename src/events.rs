@@ -163,8 +163,10 @@ impl ListenerHealth {
         self.ping_every * MISSED_ECHOES
     }
 
+    /// A fresh connection has proven nothing yet: it is attached and silent
+    /// until its first ping comes back, on every attach, not only the first.
     fn attached_now(&self) {
-        self.last_echo.store(unix_now(), Ordering::SeqCst);
+        self.last_echo.store(0, Ordering::SeqCst);
         self.attached.store(true, Ordering::SeqCst);
         self.attachments.fetch_add(1, Ordering::SeqCst);
     }
@@ -179,21 +181,23 @@ impl ListenerHealth {
     }
 
     /// `live`: attached and hearing itself. `silent`: attached, but nothing
-    /// heard back within the deadline — what a dead socket looks like until
-    /// the loop drops it. `detached`: no LISTEN connection right now.
+    /// heard back yet on this connection, or not within the deadline — what
+    /// a dead socket looks like until the loop drops it. `detached`: no
+    /// LISTEN connection right now.
     pub fn report(&self) -> serde_json::Value {
         let attached = self.attached.load(Ordering::SeqCst);
-        let age = unix_now() - self.last_echo.load(Ordering::SeqCst);
+        let last_echo = self.last_echo.load(Ordering::SeqCst);
+        let age = (last_echo > 0).then(|| unix_now() - last_echo);
         let listener = if !attached {
             "detached"
-        } else if age <= self.stale_after().as_secs() as i64 {
+        } else if age.is_some_and(|a| a <= self.stale_after().as_secs() as i64) {
             "live"
         } else {
             "silent"
         };
         serde_json::json!({
             "listener": listener,
-            "last_echo_seconds": attached.then_some(age),
+            "last_echo_seconds": age.filter(|_| attached),
             "attachments": self.attachments.load(Ordering::SeqCst),
             "echoes": self.echoes.load(Ordering::SeqCst),
             "ping_seconds": self.ping_every.as_secs(),

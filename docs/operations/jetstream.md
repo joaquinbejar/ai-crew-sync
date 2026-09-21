@@ -215,10 +215,11 @@ the probe would take the bus down to fix nothing.
 `events` is the replica's LISTEN connection, the thing that turns a write
 into a wake. Every `ping_seconds` the replica notifies the channel with its
 own id and expects to read it back; `live` means it does, `silent` means
-three pings went unanswered (a socket that is dead however open it looks:
-Swarm's IPVS drops an idle TCP connection after fifteen minutes and tells
-neither end) and the replica is about to reattach, `detached` means it is
-reattaching now. A replica that is not `live` reports `status: degraded`
+nothing has come back yet on this connection or three pings went unanswered
+(a socket that is dead however open it looks: Swarm's IPVS drops an idle
+TCP connection after fifteen minutes and tells neither end) and the replica
+is about to reattach, `detached` means it is reattaching now. A fresh
+connection is `silent` until its first echo, which takes one ping. A replica that is not `live` reports `status: degraded`
 and keeps serving: writes land, only the wakes on that replica are late
 until it reattaches. Alert on `silent` or `detached` that lasts longer than
 `3 × ping_seconds`.
