@@ -186,7 +186,7 @@ pub async fn conversations_migrate(
              stay exactly where and as they are."
         );
         println!(
-            "Each thread pauses writes only while its own tail is copied and verified;              reads keep working throughout, and the rest of the bus is untouched."
+            "Each thread pauses writes only while its own tail is copied and verified; reads keep working throughout, and the rest of the bus is untouched."
         );
         return Ok(());
     }
@@ -205,14 +205,14 @@ pub async fn conversations_migrate(
             Err(e) => {
                 println!("FAILED: {e}");
                 println!(
-                    "      Nothing was cut over for this thread and its writes are open                      again. Fix the cause and run the same command: what is already                      verified is not copied twice."
+                    "      Nothing was cut over for this thread and its writes are open again. Fix the cause and run the same command: what is already verified is not copied twice."
                 );
             }
         }
     }
     println!();
     println!(
-        "Source bodies are kept. `conversations cleanup` drops them later, once you are          sure you will not roll back."
+        "Source bodies are kept. `conversations cleanup` drops them later, once you are sure you will not roll back."
     );
     Ok(())
 }
@@ -303,12 +303,12 @@ pub async fn team_usage(pool: &PgPool, team: &str) -> anyhow::Result<()> {
 
     println!("team '{team}'");
     println!(
-        "  attachments     {quota} across {} file(s)",
+        "  attachments {quota} across {} file(s)",
         u.attachment_count
     );
-    println!("  messages        {}", u.messages);
+    println!("  messages {}", u.messages);
     println!("  note revisions  {}", u.note_revisions);
-    println!("  task events     {}", u.task_events);
+    println!("  task events {}", u.task_events);
     if let Some(oldest) = u.oldest_message {
         let days = (chrono::Utc::now() - oldest).num_days();
         println!("  oldest message  {days} day(s) ago");
@@ -322,9 +322,9 @@ pub async fn team_usage(pool: &PgPool, team: &str) -> anyhow::Result<()> {
         .await?;
     let outbox = crate::store::outbox::status(pool, id).await?;
     if backend != "postgres" || outbox.pending + outbox.leased + outbox.failed > 0 {
-        println!("  backend         {backend}");
+        println!("  backend {backend}");
         println!(
-            "  publication     {} pending, {} in flight, {} failed ({})",
+            "  publication {} pending, {} in flight, {} failed ({})",
             outbox.pending,
             outbox.leased,
             outbox.failed,

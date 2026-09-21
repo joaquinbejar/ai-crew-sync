@@ -131,14 +131,14 @@ async fn load_totals(pool: &PgPool, team_id: Uuid) -> Result<Totals, sqlx::Error
             -- not three.
             (SELECT count(DISTINCT a.id) FROM agents a
               JOIN agent_presence p ON p.agent_id = a.id
-             WHERE a.team_id = $1 AND p.expires_at > now())          AS agents_online,
+             WHERE a.team_id = $1 AND p.expires_at > now()) AS agents_online,
             (SELECT count(*) FROM tasks
-             WHERE team_id = $1 AND status = 'open')                 AS open_tasks,
+             WHERE team_id = $1 AND status = 'open') AS open_tasks,
             (SELECT count(*) FROM tasks
-             WHERE team_id = $1 AND status = 'claimed')              AS claimed_tasks,
+             WHERE team_id = $1 AND status = 'claimed') AS claimed_tasks,
             (SELECT count(*) FROM messages
              WHERE team_id = $1 AND channel_id IS NOT NULL
-               AND created_at > now() - interval '24 hours')         AS messages_24h
+               AND created_at > now() - interval '24 hours') AS messages_24h
         "#,
     )
     .bind(team_id)
@@ -211,7 +211,7 @@ async fn load_messages(pool: &PgPool, team_id: Uuid) -> Result<Vec<MessageRow>, 
                left(m.body, 240) AS body, m.created_at
         FROM messages m
         JOIN channels ch ON ch.id = m.channel_id
-        JOIN agents s    ON s.id = m.sender_agent_id
+        JOIN agents s ON s.id = m.sender_agent_id
         WHERE m.team_id = $1
         ORDER BY m.id DESC
         LIMIT 20

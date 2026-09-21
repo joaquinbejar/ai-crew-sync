@@ -97,8 +97,8 @@ pub async fn register(
         ON CONFLICT (agent_id, label) DO UPDATE SET
             parent_token = EXCLUDED.parent_token,
             token_hash   = EXCLUDED.token_hash,
-            prefix       = EXCLUDED.prefix,
-            epoch        = agent_sessions.epoch + 1,
+            prefix = EXCLUDED.prefix,
+            epoch = agent_sessions.epoch + 1,
             expires_at   = EXCLUDED.expires_at,
             revoked_at   = NULL,
             last_used_at = NULL
@@ -154,8 +154,8 @@ pub async fn resume(pool: &PgPool, auth: &AuthCtx, ttl_seconds: Option<i64>) -> 
     let row: Option<(i64, chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as(
         "UPDATE agent_sessions
             SET token_hash = $2,
-                prefix     = $3,
-                epoch      = epoch + 1,
+                prefix = $3,
+                epoch = epoch + 1,
                 expires_at = now() + make_interval(secs => $4),
                 last_used_at = NULL
           WHERE id = $1 AND revoked_at IS NULL

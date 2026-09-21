@@ -228,7 +228,7 @@ pub async fn set_project_access(
     .await?;
     if still_mine.is_none() {
         return Err(BusError::Forbidden(
-            "your access to this project has been revoked, so you cannot change anyone              else's. Nothing was written."
+            "your access to this project has been revoked, so you cannot change anyone else's. Nothing was written."
                 .to_owned(),
         ));
     }
@@ -532,7 +532,7 @@ pub async fn create_conversation(
             // grant" at once, and one of the two would be a lie to whoever
             // spoke in it.
             return Err(BusError::invalid(
-                "a conversation is either private or visible to a project, not both. Drop                  `project` for a members-only thread, or `private` for a project one.",
+                "a conversation is either private or visible to a project, not both. Drop `project` for a members-only thread, or `private` for a project one.",
             ));
         }
         (Some(p), false) => Some(project_id_for(pool, auth, p).await?),
@@ -1177,7 +1177,7 @@ pub async fn send(
     );
     if !can_send_now {
         return Err(BusError::Forbidden(
-            "your membership of this conversation is no longer one that can post. Nothing              was written."
+            "your membership of this conversation is no longer one that can post. Nothing was written."
                 .to_owned(),
         ));
     }
@@ -1991,7 +1991,7 @@ pub async fn receipts(
         && seq <= floor
     {
         return Err(BusError::Forbidden(
-            "this message is before the point your membership starts, so its receipts are              not yours to read either"
+            "this message is before the point your membership starts, so its receipts are not yours to read either"
                 .to_owned(),
         ));
     }
@@ -2129,7 +2129,7 @@ pub async fn transfer_membership(
             .await?;
     if source.as_ref().map(|s| s.0.as_str()) != Some("active") {
         return Err(BusError::conflict(
-            "your membership of this conversation is no longer active, so there is nothing              to transfer. Nothing was written.",
+            "your membership of this conversation is no longer active, so there is nothing to transfer. Nothing was written.",
         ));
     }
     let moved: Option<(Uuid,)> = sqlx::query_as(

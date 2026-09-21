@@ -1169,27 +1169,27 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                 return Ok(());
             }
             let s = |k: &str| view[k].as_str().unwrap_or("-").to_owned();
-            println!("endpoint        {}", s("mcp_url"));
+            println!("endpoint {}", s("mcp_url"));
             println!(
-                "credentials     {} ({})",
+                "credentials {} ({})",
                 s("token_prefix"),
                 view["source"].as_str().unwrap_or("?")
             );
-            println!("profile         {}", s("profile"));
+            println!("profile {}", s("profile"));
             match (
                 view["expected_agent"].as_str(),
                 view["expected_team"].as_str(),
             ) {
-                (Some(a), Some(t)) => println!("expected        {a}@{t}"),
-                _ => println!("expected        (explicit credentials: not checked)"),
+                (Some(a), Some(t)) => println!("expected {a}@{t}"),
+                _ => println!("expected (explicit credentials: not checked)"),
             }
             if let Some(f) = view["tokens_file"].as_str() {
-                println!("token entry     {} in {f}", s("token_key"));
+                println!("token entry {} in {f}", s("token_key"));
             }
-            println!("project         {}", s("project"));
-            println!("channel         {}", s("channel"));
-            println!("project root    {}", s("project_root"));
-            println!("session         {}", s("session"));
+            println!("project {}", s("project"));
+            println!("channel {}", s("channel"));
+            println!("project root {}", s("project_root"));
+            println!("session {}", s("session"));
             println!();
             println!("Run `ai-crew-sync context verify` to confirm the identity with the bus.");
         }

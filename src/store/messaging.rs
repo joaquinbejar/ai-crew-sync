@@ -71,9 +71,9 @@ const MESSAGE_SELECT: &str = r#"
            ) AS attachments,
            m.created_at
     FROM messages m
-    JOIN agents s        ON s.id = m.sender_agent_id
+    JOIN agents s ON s.id = m.sender_agent_id
     LEFT JOIN channels ch ON ch.id = m.channel_id
-    LEFT JOIN agents r    ON r.id = m.recipient_agent_id
+    LEFT JOIN agents r ON r.id = m.recipient_agent_id
 "#;
 
 // ---------------------------------------------------------------- channels --
