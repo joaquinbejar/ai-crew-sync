@@ -18,10 +18,11 @@ fn default_limit() -> i64 {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetNoteArgs {
     /// Namespace for the note, typically a repository or project name.
-    /// Defaults to "global".
+    /// Defaults to "global". At most 64 bytes.
     #[serde(default)]
     pub scope: Option<String>,
     /// Short identifier, e.g. "deploy-runbook" or "why-we-dropped-redis".
+    /// At most 256 bytes: a key is a name, the content goes in `value`.
     pub key: String,
     /// The content. Write it for a teammate's agent reading it cold, with no
     /// memory of this conversation. Hard limit 1 MiB.

@@ -1304,6 +1304,7 @@ the limit and what to do instead, because the caller is a language model.
 | `metadata` object | 16 KiB | — |
 | Task title / description / result | 512 B / 64 KiB / 64 KiB | — |
 | Task dependencies | 32 | — |
+| Note scope / key | 64 B / 256 B | — |
 | Note tags | 16 tags, 64 B each | — |
 | Channel topic, presence fields | 256 B | — |
 

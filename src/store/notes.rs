@@ -13,6 +13,11 @@ const MAX_VALUE_BYTES: usize = 1024 * 1024;
 /// Tags are filters, not content: a bounded handful of short labels.
 const MAX_TAGS: usize = 16;
 const MAX_TAG_BYTES: usize = 64;
+/// The scope and the key are names: they travel in the NOTIFY payload (which
+/// Postgres caps at 8000 bytes), in every listing and on the dashboard.
+/// Unbounded, a 9 KB key failed the write as an opaque "database error".
+const MAX_SCOPE_BYTES: usize = 64;
+const MAX_KEY_BYTES: usize = 256;
 const MAX_LIMIT: i64 = 200;
 
 #[derive(sqlx::FromRow)]
@@ -60,9 +65,23 @@ pub struct SetInput {
 
 pub async fn set_note(pool: &PgPool, auth: &AuthCtx, input: SetInput) -> BusResult<NoteInfo> {
     let scope = normalize_scope(input.scope);
+    if scope.len() > MAX_SCOPE_BYTES {
+        return Err(BusError::invalid(format!(
+            "note scope is {} bytes; the limit is {MAX_SCOPE_BYTES}. A scope is a \
+             namespace such as a repository name",
+            scope.len()
+        )));
+    }
     let key = input.key.trim().to_owned();
     if key.is_empty() {
         return Err(BusError::invalid("note key cannot be empty"));
+    }
+    if key.len() > MAX_KEY_BYTES {
+        return Err(BusError::invalid(format!(
+            "note key is {} bytes; the limit is {MAX_KEY_BYTES}. A key is a name such as \
+             \"deploy-runbook\"; the content belongs in `value`",
+            key.len()
+        )));
     }
     if input.value.len() > MAX_VALUE_BYTES {
         return Err(BusError::invalid(format!(

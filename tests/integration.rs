@@ -1054,6 +1054,56 @@ async fn notes_are_shared_memory_with_history() {
     let _ = marta.cancel().await;
 }
 
+/// A note's scope and key are names, not documents: they ride in the NOTIFY
+/// payload that Postgres caps at 8000 bytes, in every listing and on the
+/// dashboard. Unbounded, a 9 KB key failed as an opaque "database error"
+/// and a 3 KB one was stored and listed everywhere.
+#[tokio::test]
+async fn a_note_key_is_a_name_not_a_document() {
+    let h = require_db!("t_note_key");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let c = connect(&h.base, &token).await;
+
+    let err = call_expect_error(
+        &c,
+        "set_note",
+        json!({"key": "k".repeat(9000), "value": "x"}),
+    )
+    .await;
+    assert!(err.contains("note key is 9000 bytes"), "{err}");
+    assert!(err.contains("256"), "{err}");
+    assert!(!err.contains("database error"), "{err}");
+
+    let err = call_expect_error(
+        &c,
+        "set_note",
+        json!({"key": "k".repeat(300), "value": "x"}),
+    )
+    .await;
+    assert!(err.contains("note key is 300 bytes"), "{err}");
+
+    let err = call_expect_error(
+        &c,
+        "set_note",
+        json!({"scope": "s".repeat(65), "key": "fine", "value": "x"}),
+    )
+    .await;
+    assert!(err.contains("note scope is 65 bytes"), "{err}");
+    assert!(err.contains("64"), "{err}");
+
+    // The limit is the limit: a 256-byte key is a (long) name.
+    let ok = call(
+        &c,
+        "set_note",
+        json!({"scope": "s".repeat(64), "key": "k".repeat(256), "value": "x"}),
+    )
+    .await;
+    assert_eq!(ok["key"].as_str().map(str::len), Some(256), "{ok}");
+
+    let _ = c.cancel().await;
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn whoami_reports_pending_work() {
     let h = require_db!("t_whoami");
