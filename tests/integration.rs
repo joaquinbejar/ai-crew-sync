@@ -5696,10 +5696,23 @@ async fn proxy_switches_profiles_only_after_verification_and_never_across_teams(
     )
     .unwrap();
 
-    let p = spawn_proxy(&dir, &repo, &["--role", "implementation"], &[]).await;
+    // This conversation id hashes to the label `s-a7da401d8d70`. The bus
+    // quotes it when marta is refused joaquin's lease below, and the proxy
+    // once read that "401" as its own credential being rejected.
+    let p = spawn_proxy(
+        &dir,
+        &repo,
+        &["--role", "implementation"],
+        &[("BUS_HOST_SESSION", "conv-1617")],
+    )
+    .await;
     let start = call(&p, "session_status", json!({})).await;
     assert_eq!(start["agent"], "joaquin");
     let session = start["session"].as_str().unwrap().to_owned();
+    assert_eq!(
+        session, "s-a7da401d8d70",
+        "the fixture label moved; pick another id"
+    );
 
     // Hold something as joaquin so the switch has something to report.
     call(

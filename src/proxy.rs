@@ -55,9 +55,10 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
     },
-    service::{RequestContext, RoleServer, RunningService},
+    service::{RequestContext, RoleServer, RunningService, ServiceError},
     transport::{
-        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+        StreamableHttpClientTransport,
+        streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpError},
     },
 };
 use schemars::JsonSchema;
@@ -343,13 +344,51 @@ async fn connect_remote(
     Ok(remote)
 }
 
+/// The bus refused this window's bearer. Only the transport can say so: a
+/// 401 never reaches the JSON-RPC layer, and a tool's own error is the bus
+/// talking *to* the model, free to quote a session label, a lease or an id
+/// that happens to spell "401". Matching that text once turned an ordinary
+/// "held by joaquin" refusal into "your credential was revoked".
+fn unauthorized(e: &ServiceError) -> bool {
+    let ServiceError::TransportSend(sent) = e else {
+        return false;
+    };
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&*sent.error);
+    while let Some(err) = cause {
+        if let Some(http) = err.downcast_ref::<StreamableHttpError<reqwest::Error>>() {
+            return matches!(http, StreamableHttpError::AuthRequired(_));
+        }
+        cause = err.source();
+    }
+    // A transport error that is not the reqwest one: fall back to the
+    // wording rmcp gives a rejected bearer, still never a tool's text.
+    sent.error.to_string().contains("Auth required")
+}
+
+/// Marker carried inside an `anyhow` chain by [`call_remote`], so a caller
+/// that only sees `anyhow::Error` can still tell a rejected bearer from a
+/// refusal without reading the message.
+#[derive(Debug, thiserror::Error)]
+#[error("the bus rejected the credential")]
+struct Unauthorized;
+
+fn rejected_bearer(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Unauthorized>())
+}
+
 async fn call_remote(remote: &Remote, name: &str, args: Value) -> anyhow::Result<Value> {
     let arguments: rmcp::model::JsonObject =
         serde_json::from_value(args).context("arguments must be an object")?;
     let result = remote
         .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments))
         .await
-        .map_err(|e| anyhow::anyhow!("{name} failed: {e}"))?;
+        .map_err(|e| {
+            if unauthorized(&e) {
+                anyhow::Error::new(Unauthorized).context(format!("{name} failed: {e}"))
+            } else {
+                anyhow::anyhow!("{name} failed: {e}")
+            }
+        })?;
     if result.is_error == Some(true) {
         anyhow::bail!("{name} returned an error: {:?}", result.content);
     }
@@ -445,7 +484,7 @@ async fn establish(
             // The same wording a forwarded 401 gets, so a window started
             // with a rotated token says what to do rather than "the bus did
             // not accept the credential".
-            if raw.contains("Auth required") || raw.contains("401") {
+            if rejected_bearer(&e) {
                 anyhow::bail!(
                     "the bus rejected this window's credential — it has been revoked or \
                      rotated{}. Issue a new token (`ai-crew-sync admin token issue --save`) \
@@ -1110,11 +1149,10 @@ impl Proxy {
         };
         let outcome = tokio::select! {
             r = remote.call_tool(request) => r.map_err(|e| {
-                let raw = e.to_string();
-                // The transport reports a rejected bearer as "Auth required",
-                // which says nothing about what to do. This is what a revoked
-                // or rotated token looks like from here.
-                if raw.contains("Auth required") || raw.contains("401") {
+                // A rejected bearer says "Auth required" and nothing about
+                // what to do. This is what a revoked or rotated token looks
+                // like from here; see `unauthorized` for what it is not.
+                if unauthorized(&e) {
                     self.mark_unauthorized(&profile);
                     ErrorData::invalid_request(
                         format!(
@@ -1130,7 +1168,7 @@ impl Proxy {
                         None,
                     )
                 } else {
-                    ErrorData::internal_error(format!("{name}: {raw}"), None)
+                    ErrorData::internal_error(format!("{name}: {e}"), None)
                 }
             }),
             _ = ct.cancelled() => Err(ErrorData::invalid_request(
@@ -1453,4 +1491,59 @@ pub async fn run(opts: ProxyOptions) -> anyhow::Result<()> {
     let _ = keepalive.await;
     proxy.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod unauthorized_tests {
+    use rmcp::{
+        RoleClient,
+        model::ErrorData,
+        transport::{
+            DynamicTransportError, StreamableHttpClientTransport,
+            streamable_http_client::{AuthRequiredError, StreamableHttpError},
+        },
+    };
+
+    use super::*;
+
+    fn transport(e: StreamableHttpError<reqwest::Error>) -> ServiceError {
+        ServiceError::TransportSend(DynamicTransportError::new::<
+            StreamableHttpClientTransport<reqwest::Client>,
+            RoleClient,
+        >(e))
+    }
+
+    #[test]
+    fn a_rejected_bearer_is_the_transport_saying_so() {
+        let e = transport(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+            "Bearer".into(),
+        )));
+        assert!(unauthorized(&e));
+    }
+
+    #[test]
+    fn a_refusal_that_spells_401_is_still_a_refusal() {
+        // The bus quoting a session label, a lease or an id that contains
+        // "401" is talking to the model, not rejecting its credential.
+        let e = ServiceError::McpError(ErrorData::invalid_request(
+            "you do not hold the claim on 'api#1': it is held by joaquin (session \
+             's-a7da401d8d70'), the lease expires in 401s",
+            None,
+        ));
+        assert!(!unauthorized(&e));
+        let e = ServiceError::McpError(ErrorData::internal_error("Auth required", None));
+        assert!(
+            !unauthorized(&e),
+            "not even when it borrows the transport's words"
+        );
+    }
+
+    #[test]
+    fn another_transport_failure_is_not_a_rejected_bearer() {
+        let e = transport(StreamableHttpError::UnexpectedContentType(Some(
+            "text/html; 401".into(),
+        )));
+        assert!(!unauthorized(&e));
+        assert!(!unauthorized(&ServiceError::TransportClosed));
+    }
 }
