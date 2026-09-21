@@ -2192,6 +2192,15 @@ pub async fn transfer_membership(
 
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
+    // The thread first, in the same order as `invite`: every change of who
+    // sits where serialises on the conversation row, so two transfers
+    // between the same windows cannot take each other's seats in opposite
+    // orders, and an invitation cannot create the target seat between the
+    // check below and the write.
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     // The source seat is re-read and locked here: it was active when the
     // request arrived, and leaving or being removed in between must stop
     // the transfer rather than hand over a seat that no longer exists.

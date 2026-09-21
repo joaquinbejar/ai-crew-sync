@@ -10083,6 +10083,30 @@ async fn a_transfer_to_a_window_with_a_seat_changes_nothing() {
         .await;
         assert!(!err.contains("database error"), "[{backend}] {err}");
 
+        // A message sent while the observer is seated has receipts for the
+        // seats of that moment; a refused transfer must leave them as they
+        // are, denominator included.
+        let seated = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "while the observer is here",
+                   "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let receipts_before = call(
+            &owner,
+            "get_message_receipts",
+            json!({"message_id": seated}),
+        )
+        .await;
+        assert!(
+            receipts_before["total"].as_u64() >= Some(1),
+            "[{backend}] {receipts_before}"
+        );
+
         let seat = |session: &'static str| {
             let pool = h.pool.clone();
             async move {
@@ -10135,6 +10159,16 @@ async fn a_transfer_to_a_window_with_a_seat_changes_nothing() {
         assert!(
             !err.contains("database error"),
             "[{backend}] still withheld: {err}"
+        );
+        let receipts_after = call(
+            &owner,
+            "get_message_receipts",
+            json!({"message_id": seated}),
+        )
+        .await;
+        assert_eq!(
+            receipts_after, receipts_before,
+            "[{backend}] the receipts and their denominator are untouched"
         );
         let err =
             call_expect_error(&next, "join_conversation", json!({"conversation_id": cid})).await;
