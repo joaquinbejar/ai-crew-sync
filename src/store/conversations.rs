@@ -844,6 +844,35 @@ pub async fn invite(
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
+    // The inviter's own seat, re-read under lock. `readable` answered before
+    // this transaction: a removal that commits in between would leave a
+    // moderator who can no longer read anything still inviting, with a
+    // floor it no longer has. What may be granted is what this row says
+    // now, and only an active owner or moderator grants anything.
+    let inviter: Option<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT role, state, history_from_seq FROM conversation_memberships
+          WHERE conversation_id = $1 AND agent_id = $2 AND session = $3
+          FOR UPDATE",
+    )
+    .bind(id)
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let inviter_floor = match inviter {
+        Some((role, state, floor))
+            if state == "active" && (role == "owner" || role == "moderator") =>
+        {
+            floor
+        }
+        _ => {
+            return Err(BusError::Forbidden(
+                "your seat in this conversation changed while you were inviting: you no \
+                 longer moderate it. Nothing was written."
+                    .to_owned(),
+            ));
+        }
+    };
     let (count,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM conversation_memberships WHERE conversation_id = $1")
             .bind(id)
@@ -871,13 +900,16 @@ pub async fn invite(
     .await?;
     let readmitting = removed.as_ref().map(|r| r.0.as_str()) == Some("removed");
 
-    // History boundary: from the start only when an inviter with the right
-    // to see it says so, otherwise from here on. Recorded either way. A
-    // re-admission is always from here on.
-    let from_seq: Option<i64> = if history_from_start && !readmitting {
-        None
-    } else {
+    // History boundary: from here on unless the inviter asks for more, and
+    // never more than the inviter can read itself. A moderator admitted
+    // without the past cannot hand that past to somebody else — nor to
+    // another window of its own agent — so a full-history grant is clamped
+    // to the inviter's floor, and the audit row keeps both what was asked
+    // and what was given. A re-admission is always from here on.
+    let from_seq: Option<i64> = if readmitting || !history_from_start {
         Some(last_seq)
+    } else {
+        inviter_floor
     };
     sqlx::query(
         "INSERT INTO conversation_memberships
@@ -887,7 +919,10 @@ pub async fn invite(
             role = EXCLUDED.role,
             state = CASE WHEN conversation_memberships.state IN ('left', 'removed')
                          THEN 'invited' ELSE conversation_memberships.state END,
-            history_from_seq = CASE WHEN conversation_memberships.state = 'removed'
+            -- A seat that is offered again gets the floor decided now: the
+            -- one it had when it left is not this inviter's to give back.
+            -- A seat that stays active or invited keeps its own.
+            history_from_seq = CASE WHEN conversation_memberships.state IN ('left', 'removed')
                                     THEN EXCLUDED.history_from_seq
                                     ELSE conversation_memberships.history_from_seq END,
             -- A seat that is actually being re-offered is not the seat the
@@ -920,7 +955,12 @@ pub async fn invite(
             "member.invite"
         },
         Some(agent_id),
-        serde_json::json!({ "address": address, "role": role, "history_from_seq": from_seq }),
+        serde_json::json!({
+            "address": address,
+            "role": role,
+            "history_from_seq": from_seq,
+            "history_from_start_requested": history_from_start,
+        }),
     )
     .await?;
     tx.commit().await?;

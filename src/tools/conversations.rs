@@ -94,8 +94,11 @@ pub struct InviteArgs {
     /// and acknowledges but does not post.
     #[serde(default)]
     pub role: Option<String>,
-    /// Give them the thread from its beginning. Off by default: a new member
-    /// sees what is said from now on, which is what most invitations mean.
+    /// Let the invitee read the thread from its first message instead of
+    /// from this one. Never more than you can read yourself: a moderator
+    /// admitted late grants history from where it was admitted, whatever
+    /// it asks for, and the audit row records both. A re-admission after a
+    /// removal always starts here.
     #[serde(default)]
     pub history_from_start: bool,
 }
@@ -242,7 +245,8 @@ impl Bus {
         description = "Invite a window into a thread. Owners and moderators only. The \
                        invitee is not a member until it accepts, so a thread never \
                        conscripts someone into its receipts. By default they see the thread \
-                       from now on; `history_from_start` gives them everything, which is a \
+                       from now on; `history_from_start` gives them the thread from where \
+                       you can read it yourself, its start only if you can, which is a \
                        decision worth making deliberately."
     )]
     async fn invite_to_conversation(
