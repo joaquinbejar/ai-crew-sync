@@ -402,6 +402,73 @@ out="$(PATH="$WORK/fakebin:$PATH" BUS_TOKEN=acs_legacy BUS_URL=http://127.0.0.1:
 out="$(env -u BUS_TOKEN -u BUS_URL PATH="$WORK/empty"     sh "$WORK/bin/real-bus-call.sh" whoami 2>/dev/null || true)"
 [ -z "$out" ] && ok "no binary and no token means no call"     || bad "unconfigured bus-call" "$out"
 
+# --- lifecycle hooks after a binding lost its credential ---------------------
+# The binary answers `context hook --event status` from an env var so each
+# binding state can be replayed; every other invocation is recorded. A curl
+# on the PATH records too, so a legacy request cannot hide behind the fake
+# bus-call.sh: with the real bus-call.sh both would show.
+mkdir -p "$WORK/statebin"
+cat > "$WORK/statebin/ai-crew-sync" <<'FAKE'
+#!/bin/sh
+printf 'args=%s\n' "$*" >> "$HOOKCALLS"
+case "$*" in
+    *"--event status"*) echo "{\"binding\":\"$2\",\"state\":\"${STUB_STATE:-missing}\"}" ;;
+esac
+FAKE
+cat > "$WORK/statebin/curl" <<'FAKE'
+#!/bin/sh
+printf 'curl %s\n' "$*" >> "$CURLCALLS"
+FAKE
+chmod +x "$WORK/statebin/ai-crew-sync" "$WORK/statebin/curl"
+export HOOKCALLS="$WORK/hookcalls.txt" CURLCALLS="$WORK/curlcalls.txt"
+
+lifecycle() { # <state> <status> <with-token|no-token>
+    : > "$CAPTURE"; : > "$HOOKCALLS"; : > "$CURLCALLS"
+    if [ "$3" = "with-token" ]; then
+        (cd "$REPO_DIR" && printf '{"session_id":"closed-window"}' | env -u BUS_HOST_SESSION \
+            STUB_STATE="$1" PATH="$WORK/statebin:$PATH" BUS_URL=http://127.0.0.1:1/mcp \
+            BUS_TOKEN=acs_parent_placeholder BUS_SESSION=legacy-shared \
+            sh "$WORK/bin/heartbeat.sh" "$2" --from-payload) >/dev/null 2>&1
+    else
+        (cd "$REPO_DIR" && printf '{"session_id":"closed-window"}' | env -u BUS_HOST_SESSION \
+            -u BUS_TOKEN -u BUS_URL -u BUS_SESSION STUB_STATE="$1" PATH="$WORK/statebin:$PATH" \
+            sh "$WORK/bin/heartbeat.sh" "$2" --from-payload) >/dev/null 2>&1
+    fi
+}
+for status in active idle; do
+    for creds in with-token no-token; do
+        lifecycle no-credential "$status" "$creds"
+        if [ ! -s "$CAPTURE" ] && [ ! -s "$CURLCALLS" ] \
+            && ! grep -q -- "--event heartbeat\|--event session_end" "$HOOKCALLS"; then
+            ok "$status heartbeat publishes nothing after no-credential ($creds)"
+        else
+            bad "$status heartbeat fell back after no-credential ($creds)" \
+                "$(cat "$CAPTURE" "$CURLCALLS" "$HOOKCALLS")"
+        fi
+    done
+done
+lifecycle authenticated active with-token
+grep -q -- "--binding closed-window --event heartbeat" "$HOOKCALLS" && [ ! -s "$CAPTURE" ] \
+    && ok "an authenticated binding still heartbeats as its own window" \
+    || bad "authenticated heartbeat" "$(cat "$HOOKCALLS" "$CAPTURE")"
+lifecycle authenticated idle with-token
+grep -q -- "--binding closed-window --event session_end" "$HOOKCALLS" && [ ! -s "$CAPTURE" ] \
+    && ok "an authenticated binding still ends its own session" \
+    || bad "authenticated session_end" "$(cat "$HOOKCALLS" "$CAPTURE")"
+lifecycle missing active with-token
+grep -q '^heartbeat' "$CAPTURE" \
+    && ok "a binding that never existed keeps the legacy heartbeat" \
+    || bad "missing binding lost the legacy path" "$(cat "$CAPTURE" "$HOOKCALLS")"
+
+: > "$CAPTURE"; : > "$HOOKCALLS"; : > "$CURLCALLS"
+out="$(cd "$REPO_DIR" && printf '{"session_id":"closed-window"}' | env -u BUS_HOST_SESSION \
+    STUB_STATE=no-credential PATH="$WORK/statebin:$PATH" BUS_URL=http://127.0.0.1:1/mcp \
+    BUS_TOKEN=acs_parent_placeholder BUS_SESSION=legacy-shared \
+    sh "$WORK/bin/stop-drain.sh" 2>/dev/null || true)"
+[ -z "$out" ] && [ ! -s "$CAPTURE" ] && [ ! -s "$CURLCALLS" ] \
+    && ok "the Stop drain reads nothing after no-credential" \
+    || bad "stop drain fell back after no-credential" "$out $(cat "$CAPTURE" "$CURLCALLS")"
+
 # --- every tool the hooks call exists in the served schema ------------------
 # Cheap coupling check: the tool names the scripts use must appear in the
 # server's tool router. Catches a rename before a user's session breaks.

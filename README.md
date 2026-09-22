@@ -283,7 +283,13 @@ conversation, and that process resolves a credential from your local profiles
 and registers the window as an *authenticated session*. Nothing in the plugin
 config, and nothing in your shell, has to hold a token. A teammate who would
 rather keep the old environment pair can: `mcp proxy` reads `BUS_URL` and
-`BUS_TOKEN` too, and uses them when no profile applies.
+`BUS_TOKEN` too. Mind the precedence, which is the resolver's and not the
+plugin's: an exported `BUS_TOKEN` (like `--token`) **wins over** the
+repository's `.acs.toml` profile and the user default, and given together
+with `--profile` it is an error rather than a silent choice. Migrating from a
+shell wrapper that exports the token per directory means unsetting it (or
+retiring the wrapper) wherever the profile should decide; while it is
+exported, the profile never applies.
 
 The plugin comes fully preconfigured:
 

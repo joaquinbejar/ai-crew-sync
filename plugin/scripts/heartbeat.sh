@@ -53,6 +53,15 @@ if [ -n "${BUS_HOST_SESSION:-}" ] && command -v ai-crew-sync >/dev/null 2>&1; th
                 >/dev/null 2>&1 || true
             exit 0
             ;;
+        *'"no-credential"'*)
+            # This window WAS authenticated and its state is now unusable.
+            # Falling through would publish presence with the parent token
+            # under BUS_SESSION: a closed window reporting as the shared
+            # legacy identity another window may be using. Stay quiet, as
+            # session-start.sh does. A binding that never existed ("missing")
+            # still takes the legacy path below.
+            exit 0
+            ;;
     esac
 fi
 

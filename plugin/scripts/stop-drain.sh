@@ -39,6 +39,15 @@ except Exception:
 sys.stdout.write(str(v) if v else "")' 2>/dev/null || true)"
 [ -n "$HOST_SESSION" ] && export BUS_HOST_SESSION="$HOST_SESSION"
 
+# A window that was authenticated and lost its credential reads nothing on
+# the way out: the legacy path below would look at the shared session's
+# inbox with the parent token, which is another window's, not this one's.
+if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
+    case "$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)" in
+        *'"no-credential"'*) exit 0 ;;
+    esac
+fi
+
 # Scope "all" rather than "inbox": it carries this agent's own sent messages
 # too, which is the only way to tell a question that has already been answered
 # from one still waiting.
