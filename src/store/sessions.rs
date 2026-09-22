@@ -81,7 +81,7 @@ pub async fn register(
     // no window is live and then reads private history; without a lock both
     // of them can be true at once — it sees none, and this inserts one.
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR UPDATE")
+    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR NO KEY UPDATE")
         .bind(auth.agent_id)
         .fetch_one(&mut *tx)
         .await?;
@@ -180,7 +180,7 @@ pub async fn resume(pool: &PgPool, auth: &AuthCtx, ttl_seconds: Option<i64>) -> 
     // request that was in flight while the window was revoked and its label
     // re-registered must not rotate the row the new window now holds.
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR UPDATE")
+    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR NO KEY UPDATE")
         .bind(auth.agent_id)
         .fetch_one(&mut *tx)
         .await?;

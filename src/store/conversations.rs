@@ -2418,7 +2418,7 @@ pub async fn recover_history(
     // writes a new row, conflicts with no held lock, and can slip in between
     // this check and the read below. Registration takes the same lock, so
     // the two serialise on something that is always there.
-    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR UPDATE")
+    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR NO KEY UPDATE")
         .bind(auth.agent_id)
         .fetch_one(&mut *tx)
         .await?;

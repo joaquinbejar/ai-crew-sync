@@ -11190,3 +11190,75 @@ async fn a_revoked_token_takes_its_sessions_with_it() {
     }
     h.shutdown().await;
 }
+
+/// The agent lock the lifecycle paths serialise on must not conflict with
+/// the key share a foreign key takes. A first heartbeat holds `FOR SHARE`
+/// on its session (the epoch guard) and then inserts presence, which needs
+/// `FOR KEY SHARE` on the agent; a revocation holding `FOR UPDATE` on the
+/// agent and waiting on that session row closed the cycle, and Postgres
+/// rolled the revocation back with 40P01. `FOR NO KEY UPDATE` serialises
+/// the lifecycle paths without blocking the key share.
+#[tokio::test]
+async fn a_revocation_does_not_deadlock_with_a_first_heartbeat() {
+    use ai_crew_sync::auth::hash_token;
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_revoke_vs_heartbeat");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let (agent_id, token_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT a.id, t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id
+          WHERE t.token_hash = $1",
+    )
+    .bind(hash_token(&token))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let agent = connect(&h.base, &token).await;
+    let cred = call(&agent, "register_session", json!({"session": "first"})).await;
+    let session_id: Uuid = cred["session_id"].as_str().unwrap().parse().unwrap();
+
+    // The heartbeat's transaction, paused right after the guard.
+    let mut heartbeat = h.pool.begin().await.unwrap();
+    sqlx::query("SELECT epoch FROM agent_sessions WHERE id = $1 FOR SHARE")
+        .bind(session_id)
+        .fetch_one(&mut *heartbeat)
+        .await
+        .unwrap();
+
+    // The revocation takes the agent lock and waits on that session row.
+    let revoke = tokio::spawn({
+        let pool = h.pool.clone();
+        async move { store::revoke_token(&pool, Actor::Cli, None, token_id).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !revoke.is_finished(),
+        "the revocation waits for the guarded transaction"
+    );
+
+    // The heartbeat inserts presence, which needs a key share on the agent.
+    sqlx::query(
+        "INSERT INTO agent_presence (agent_id, session, status, updated_at, expires_at)
+         VALUES ($1, 'first', 'active', now(), now() + interval '15 minutes')",
+    )
+    .bind(agent_id)
+    .execute(&mut *heartbeat)
+    .await
+    .expect("the first heartbeat lands while a revocation waits");
+    heartbeat.commit().await.unwrap();
+
+    revoke
+        .await
+        .unwrap()
+        .expect("the revocation completes once the heartbeat commits");
+    let (revoked,): (bool,) =
+        sqlx::query_as("SELECT revoked_at IS NOT NULL FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(revoked, "and it swept the session");
+
+    let _ = agent.cancel().await;
+    h.shutdown().await;
+}

@@ -665,10 +665,17 @@ pub async fn revoke_token(
     // it, so a window registering under this token right now either lands
     // before the revocation and is swept below, or waits and finds the
     // token gone. Without the lock a session could slip in between.
+    //
+    // NO KEY UPDATE, not UPDATE: a first heartbeat holds the session row
+    // (the epoch guard) and then inserts presence, whose foreign key takes
+    // a key share on this agent. FOR UPDATE blocks that share while this
+    // transaction waits on the session row, and Postgres breaks the cycle
+    // by rolling the revocation back. NO KEY UPDATE serialises the
+    // lifecycle paths with each other and lets the key share through.
     sqlx::query(
         "SELECT a.id FROM agents a JOIN api_tokens t ON t.agent_id = a.id
           WHERE t.id = $1 AND ($2::uuid IS NULL OR a.team_id = $2)
-          FOR UPDATE OF a",
+          FOR NO KEY UPDATE OF a",
     )
     .bind(id)
     .bind(team_id)
