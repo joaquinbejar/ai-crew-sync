@@ -5,7 +5,7 @@ Input: {{input}}
 
 Steps:
 1. Call `list_agents` with `online_only` false.
-2. Call `list_sessions`; if an agent name was given, only that agent's.
+2. Call `list_sessions` (it takes no agent filter: `project`, `role`, `online_only`, `limit` only). If an agent name was given, keep only that agent's rows from the result.
 
 Then print, online first:
 - **name** — status, activity, repo@branch, claimed task if any, last seen.
