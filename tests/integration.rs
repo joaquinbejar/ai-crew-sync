@@ -11918,3 +11918,120 @@ async fn audit_a_stale_session_cannot_revoke_its_replacement() {
     }
     h.shutdown().await;
 }
+
+/// An unconfirmed reference handed out again after the window resumed is
+/// handed to the window as it is now, at its current epoch: kept at the
+/// epoch of the first hand-out, the delivery could never be confirmed
+/// again, because confirmation is fenced on the epoch the row carries
+/// (#147). The replaced process still cannot confirm it.
+#[tokio::test]
+async fn audit_postgres_redelivery_after_resume_can_be_confirmed() {
+    let h = require_db!("t_redelivery_epoch");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let first = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob1 = connect(&h.base, first["session_token"].as_str().unwrap()).await;
+
+    let convo = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "redelivery", "private": true, "invite": ["bob/reader"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&bob1, "join_conversation", json!({"conversation_id": cid})).await;
+    let mid = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "hold this", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Fetched at epoch 1 and left unconfirmed.
+    let batch = call(&bob1, "fetch_conversation_inbox", json!({})).await;
+    let delivery = batch["references"][0]["delivery_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(batch["references"][0]["message_id"], mid, "{batch}");
+
+    // The window resumes: new secret, epoch 2. The grace period elapses.
+    let resumed = call(&bob1, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2, "{resumed}");
+    let bob2 = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+    sqlx::query(
+        "UPDATE inbox_deliveries SET handed_at = now() - interval '6 minutes' WHERE id = $1",
+    )
+    .bind(delivery.parse::<Uuid>().unwrap())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    // Redelivered to the current window, and confirmable by it.
+    let again = call(&bob2, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(
+        again["references"][0]["delivery_id"], delivery,
+        "the same delivery: {again}"
+    );
+    let (epoch,): (Option<i64>,) =
+        sqlx::query_as("SELECT epoch FROM inbox_deliveries WHERE id = $1")
+            .bind(delivery.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(epoch, Some(2), "the row now belongs to epoch 2");
+    let done = call(
+        &bob2,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [delivery]}),
+    )
+    .await;
+    assert_eq!(done["confirmed"], 1, "{done}");
+    let receipts = call(&alice, "get_message_receipts", json!({"message_id": mid})).await;
+    assert!(
+        receipts["receipts"][0]["delivered_at"].is_string(),
+        "{receipts}"
+    );
+
+    // A second message: handed out at epoch 2, and the replaced process
+    // (epoch 1's credential is dead; its context would be stale) cannot
+    // confirm what the live window holds.
+    let mid2 = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "and this", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let batch = call(&bob2, "fetch_conversation_inbox", json!({})).await;
+    let delivery2 = batch["references"][0]["delivery_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(batch["references"][0]["message_id"], mid2, "{batch}");
+    let status = mcp_status(&h.base, first["session_token"].as_str().unwrap()).await;
+    assert_eq!(
+        status, 401,
+        "the replaced credential is refused before it can confirm"
+    );
+    let done = call(
+        &bob2,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [delivery2]}),
+    )
+    .await;
+    assert_eq!(done["confirmed"], 1, "{done}");
+
+    for c in [alice, bob_agent, bob1, bob2] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

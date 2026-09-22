@@ -504,8 +504,14 @@ async fn reconcile_from_postgres(
                 AND (c.visibility <> 'project' OR EXISTS (
                         SELECT 1 FROM project_agent_access a
                          WHERE a.project_id = c.project_id AND a.agent_id = $8))
+             -- A redelivery is handed to the window fetching now, at its
+             -- epoch: kept at the epoch of the first hand-out, the row could
+             -- never be confirmed once that window resumed, because the
+             -- confirmation is fenced on the epoch the reference carries.
              ON CONFLICT (recipient_key, message_id, event_dedup) WHERE confirmed_at IS NULL
-             DO UPDATE SET handed_at = now()
+             DO UPDATE SET handed_at = now(),
+                           session_id = EXCLUDED.session_id,
+                           epoch = EXCLUDED.epoch
              RETURNING id",
         )
         .bind(auth.team_id)
@@ -599,8 +605,14 @@ async fn reconcile_receipt_events(
                 AND (c.visibility <> 'project' OR EXISTS (
                         SELECT 1 FROM project_agent_access a
                          WHERE a.project_id = c.project_id AND a.agent_id = $8))
+             -- A redelivery is handed to the window fetching now, at its
+             -- epoch: kept at the epoch of the first hand-out, the row could
+             -- never be confirmed once that window resumed, because the
+             -- confirmation is fenced on the epoch the reference carries.
              ON CONFLICT (recipient_key, message_id, event_dedup) WHERE confirmed_at IS NULL
-             DO UPDATE SET handed_at = now()
+             DO UPDATE SET handed_at = now(),
+                           session_id = EXCLUDED.session_id,
+                           epoch = EXCLUDED.epoch
              RETURNING id",
         )
         .bind(auth.team_id)
