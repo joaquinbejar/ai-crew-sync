@@ -11715,3 +11715,125 @@ async fn audit_list_skips_an_authenticated_seat_for_parent_label() {
     }
     h.shutdown().await;
 }
+
+/// A cursor read drains the backlog oldest first. Taking the newest page
+/// and moving the cursor past it lost every unread message older than the
+/// page, in every scope (#146). History reads keep returning the last N.
+#[tokio::test]
+async fn audit_only_new_pagination_does_not_skip_unread_messages() {
+    let h = require_db!("t_only_new_pages");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let alice = connect(&h.base, &alice_token).await;
+    let bob = connect(&h.base, &bob_token).await;
+    let bodies = |r: &Value| -> Vec<String> {
+        r["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["body"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Inbox: three DMs, pages of two.
+    for body in ["oldest", "middle", "newest"] {
+        call(&alice, "post_message", json!({"to": "bob", "body": body})).await;
+    }
+    let page = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": true, "limit": 2}),
+    )
+    .await;
+    assert_eq!(bodies(&page), ["oldest", "middle"], "{page}");
+    assert_eq!(page["truncated"], true, "{page}");
+    // A message that arrives between pages lands on a later page, not lost.
+    call(
+        &alice,
+        "post_message",
+        json!({"to": "bob", "body": "latest"}),
+    )
+    .await;
+    let page = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": true, "limit": 2}),
+    )
+    .await;
+    assert_eq!(bodies(&page), ["newest", "latest"], "{page}");
+    let page = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": true, "limit": 2}),
+    )
+    .await;
+    assert!(bodies(&page).is_empty(), "drained: {page}");
+    // History still means the last N, oldest first within the page.
+    let last = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": false, "limit": 2}),
+    )
+    .await;
+    assert_eq!(bodies(&last), ["newest", "latest"], "{last}");
+
+    // Channel and all scopes: five messages, pages of two, nothing skipped.
+    call(&alice, "create_channel", json!({"name": "pages"})).await;
+    for i in 1..=5 {
+        call(
+            &alice,
+            "post_message",
+            json!({"channel": "pages", "body": format!("c{i}")}),
+        )
+        .await;
+    }
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let page = call(
+            &bob,
+            "read_messages",
+            json!({"scope": "pages", "only_new": true, "limit": 2}),
+        )
+        .await;
+        seen.extend(bodies(&page));
+    }
+    assert_eq!(
+        seen,
+        ["c1", "c2", "c3", "c4", "c5"],
+        "every channel message, in order"
+    );
+    // Another window of Bob has its own cursor and starts from the top.
+    let other = connect_with_session(&h.base, &bob_token, "other").await;
+    let page = call(
+        &other,
+        "read_messages",
+        json!({"scope": "pages", "only_new": true, "limit": 2}),
+    )
+    .await;
+    assert_eq!(bodies(&page), ["c1", "c2"], "independent cursor: {page}");
+    // The cross-session view keeps its own cursor too.
+    let all = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "all", "only_new": true, "all_sessions": true, "limit": 3}),
+    )
+    .await;
+    assert_eq!(bodies(&all).len(), 3, "{all}");
+    assert_eq!(all["truncated"], true, "{all}");
+    let all_first = bodies(&all);
+    let all2 = call(
+        &bob,
+        "read_messages",
+        json!({"scope": "all", "only_new": true, "all_sessions": true, "limit": 3}),
+    )
+    .await;
+    assert!(
+        bodies(&all2).iter().all(|b| !all_first.contains(b)),
+        "the next page is new: {all2}"
+    );
+
+    for c in [alice, bob, other] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

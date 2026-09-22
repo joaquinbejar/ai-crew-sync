@@ -614,9 +614,14 @@ pub async fn read_messages(
         0
     };
 
-    // Ordered ascending so the agent reads the conversation in chronological
-    // order; when not filtering by cursor we take the newest `limit` and then
-    // flip them back, so "the last N messages" is what you get.
+    // Two different pages. A cursor read (`only_new`) is a backlog drained
+    // oldest first: the page is the oldest messages past the cursor, and
+    // the cursor moves to the end of that page, so what was not returned
+    // is still ahead of it. Taking the newest page there and moving the
+    // cursor past it silently lost everything older than the page. A
+    // history read (`only_new: false`) is "the last N": the newest page,
+    // flipped back into chronological order.
+    let order = if input.only_new { "ASC" } else { "DESC" };
     let rows: Vec<MessageRow> = match &scope {
         Scope::All => {
             sqlx::query_as(AssertSqlSafe(format!(
@@ -629,7 +634,7 @@ pub async fn read_messages(
                                    OR m.recipient_session IS NULL
                                    OR m.recipient_session = $6))
                           OR m.sender_agent_id = $3)
-                   ORDER BY m.id DESC
+                   ORDER BY m.id {order}
                    LIMIT $4"#
             )))
             .bind(auth.team_id)
@@ -649,7 +654,7 @@ pub async fn read_messages(
                      AND ($4::bool
                           OR m.recipient_session IS NULL
                           OR m.recipient_session = $5)
-                   ORDER BY m.id DESC
+                   ORDER BY m.id {order}
                    LIMIT $3"#
             )))
             .bind(auth.agent_id)
@@ -664,7 +669,7 @@ pub async fn read_messages(
             sqlx::query_as(AssertSqlSafe(format!(
                 r#"{MESSAGE_SELECT}
                    WHERE m.channel_id = $1 AND m.id > $2
-                   ORDER BY m.id DESC
+                   ORDER BY m.id {order}
                    LIMIT $3"#
             )))
             .bind(*id)
@@ -677,7 +682,9 @@ pub async fn read_messages(
 
     let truncated = rows.len() as i64 == limit;
     let mut messages: Vec<MessageInfo> = rows.into_iter().map(Into::into).collect();
-    messages.reverse();
+    if !input.only_new {
+        messages.reverse();
+    }
 
     let new_cursor = messages.iter().map(|m| m.id).max().unwrap_or(since);
     if input.only_new && new_cursor > since {
