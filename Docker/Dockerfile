@@ -18,6 +18,9 @@ RUN mkdir -p src && \
 
 COPY src ./src
 COPY migrations ./migrations
+# The recipes are compiler inputs (`include_str!` in src/recipes.rs): the
+# build fails without them, whatever the checkout looked like.
+COPY recipes ./recipes
 RUN touch src/main.rs src/lib.rs && cargo build --release
 
 # ---- runtime stage ---------------------------------------------------------
