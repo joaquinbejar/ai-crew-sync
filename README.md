@@ -1064,8 +1064,10 @@ which. Every message carries a `publication`:
 A body the current backend cannot serve does not fail the page: the message
 keeps its place and says what happened to it. Every message carries
 `unavailable`, `null` when `body` is the real text and a one-sentence reason
-when it is not; then `body` is an empty placeholder, never an empty message,
-and the reason names no broker internals (those go to the server log).
+when it is not: a backend that cannot be reached right now, a body that was
+never stored, or one the backend no longer holds. Then `body` is an empty
+placeholder, never an empty message, and the reason names no broker
+internals (those go to the server log).
 Thread order is the sequence,
 never the order the broker happened to confirm in, and a reader's cursor
 cannot walk past a message still in flight.

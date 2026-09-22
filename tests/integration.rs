@@ -13257,6 +13257,8 @@ async fn the_sweep_keeps_a_body_its_backend_cannot_confirm() {
     );
     assert_eq!(local_body(second).await, "and me");
 
+    // The fixture broker is shared: give the re-created stream back.
+    let _ = JetStreamBackend::deprovision(&config, team).await;
     for c in [owner, dani] {
         let _ = c.cancel().await;
     }
@@ -13291,6 +13293,14 @@ async fn an_unreadable_body_is_labelled_for_the_model() {
             "{name}: {description}"
         );
         assert!(description.contains("placeholder"), "{name}: {description}");
+        assert!(
+            description.contains("never stored") && description.contains("no longer held"),
+            "the permanent cases are named too: {name}: {description}"
+        );
+        assert!(
+            description.contains("Never quote or summarise"),
+            "both tools carry the same instruction: {name}: {description}"
+        );
     }
 
     sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
@@ -13377,8 +13387,25 @@ async fn an_unreadable_body_is_labelled_for_the_model() {
     let receipts = call(&owner, "get_message_receipts", json!({"message_id": mid})).await;
     assert_eq!(receipts["total"], 1, "{receipts}");
 
-    // The fixture broker is shared: give the re-created stream back.
-    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    // A permanent absence reads as one: a tombstoned body says it is no
+    // longer held, not that the backend is away right now.
+    ai_crew_sync::store::outbox::tombstone(&h.pool, mid.parse().unwrap(), "retention")
+        .await
+        .unwrap();
+    let gone = call(
+        &dani,
+        "get_conversation_message",
+        json!({"message_id": mid}),
+    )
+    .await;
+    assert_eq!(gone["publication"], "tombstoned", "{gone}");
+    let reason = gone["unavailable"].as_str().expect("a reason");
+    assert!(reason.contains("no longer held"), "{reason}");
+    assert!(
+        !reason.contains("right now"),
+        "a permanent gap is not retryable: {reason}"
+    );
+
     for c in [owner, dani] {
         let _ = c.cancel().await;
     }

@@ -1076,9 +1076,11 @@ cuál de las dos cosas es. Cada mensaje lleva un `publication`:
 
 Un cuerpo que el backend no puede servir no tumba la página: el mensaje
 mantiene su sitio y cuenta qué le pasó. Todo mensaje lleva `unavailable`:
-`null` cuando `body` es el texto real, y una frase de motivo cuando no lo es;
-entonces `body` es un marcador vacío, nunca un mensaje vacío, y el motivo no
-nombra internos del broker (esos van al log del servidor). El orden del hilo
+`null` cuando `body` es el texto real, y una frase de motivo cuando no lo es:
+un backend inalcanzable ahora mismo, un cuerpo que nunca se almacenó, o uno
+que el backend ya no guarda. Entonces `body` es un marcador vacío, nunca un
+mensaje vacío, y el motivo no nombra internos del broker (esos van al log del
+servidor). El orden del hilo
 es la secuencia,
 jamás el orden en que el broker fue confirmando, y el cursor de quien lee no
 puede saltarse un mensaje que sigue en vuelo.
