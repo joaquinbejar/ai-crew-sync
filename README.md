@@ -550,8 +550,12 @@ as usual, plus two that never reach the bus:
   what this conversation has already seen.
 
 The proxy does this for you: it registers the session on connect, forwards
-every call with the credential and the epoch, renews it, and clears the secret
-from its private state when the window closes. A bus too old to issue
+every call with the credential and the epoch, renews the credential half-way
+through its lifetime whether the window is busy or idle (`BUS_SESSION_TTL_SECS`
+and `BUS_SESSION_RENEW_LEAD_SECS` tune the lifetime it asks for and the lead),
+and clears the secret from its private state when the window closes. A
+renewal the bus refuses is reported by `session_status` as a rejected
+credential, never papered over with another identity. A bus too old to issue
 credentials simply keeps the label-only connection.
 
 **Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
