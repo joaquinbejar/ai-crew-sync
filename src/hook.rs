@@ -66,8 +66,9 @@ impl std::str::FromStr for Event {
 pub enum Resolution {
     /// A live binding with a usable credential.
     Authenticated(Box<Binding>),
-    /// A binding exists but carries no credential: the window closed, or the
-    /// bus does not issue session credentials.
+    /// A binding exists but is unusable here: the window closed (its
+    /// credential is kept on disk for the proxy's own resume and for nothing
+    /// else), or the bus does not issue session credentials.
     Unauthenticated(Box<Binding>),
     /// No record for this conversation.
     Missing,
@@ -76,6 +77,10 @@ pub enum Resolution {
 pub fn resolve_binding(config_dir: &Path, binding: &str) -> Resolution {
     match context::read_binding(config_dir, binding) {
         None => Resolution::Missing,
+        // A closed record keeps its credential so the proxy can resume the
+        // same window later; a hook of a window that has closed acts as
+        // nobody, whatever the file still holds.
+        Some(b) if b.closed_at.is_some() => Resolution::Unauthenticated(Box::new(b)),
         Some(b) => match b.session_token.as_deref().filter(|t| !t.is_empty()) {
             Some(_) => Resolution::Authenticated(Box::new(b)),
             None => Resolution::Unauthenticated(Box::new(b)),
@@ -397,6 +402,35 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+
+        // A closed window that kept its credential for the proxy's resume:
+        // just as silent, and the secret stays off the status output.
+        let retained = context::binding_path(&dir, "conv-closed-token");
+        context::write_binding_file(
+            &retained,
+            &json!({"session": "s-2", "agent": "joaquin", "team": "acme",
+                    "mcp_url": "http://127.0.0.1:1/mcp", "session_token": "acss_retained",
+                    "session_id": "11111111-1111-1111-1111-111111111111", "epoch": 3,
+                    "closed_at": "2026-09-20T00:00:00Z"})
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            run(&dir, "conv-closed-token", Event::Heartbeat, &cwd, 8)
+                .await
+                .unwrap()
+                .is_none(),
+            "a closed binding must not act, even with a credential on disk"
+        );
+        let out = run(&dir, "conv-closed-token", Event::Status, &cwd, 8)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.contains("no-credential"), "{out}");
+        assert!(
+            !out.contains("acss_retained"),
+            "status must not print a secret"
         );
 
         // `status` explains both cases without inventing an identity.

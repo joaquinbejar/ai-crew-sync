@@ -507,11 +507,15 @@ A partir de ahí la envías como bearer token. Autentica como tu agente, en esa
 - **rechaza una cabecera que la contradiga**: una petición cuyo
   `X-Crew-Session` nombre otra ventana se rechaza, así que una sesión probada
   nunca se amplía a la de otro;
-- **vence a lo que sustituye**: registrar la misma etiqueta otra vez es un
-  *resume*: secreto nuevo, `epoch` incrementado, identidad e historia
-  intactas. Manda el epoch en `X-Crew-Epoch` y un proceso al que han
-  reemplazado se entera (`409`) en vez de escribir como la ventana que lo
-  sustituyó.
+- **no se entrega a quien tenga el token del agente**: registrar una
+  etiqueta viva se *rechaza* (`409`); la única vuelta a una ventana es su
+  propia credencial, vía `resume_session`, que emite secreto nuevo,
+  incrementa `epoch` y deja identidad e historia intactas. Una etiqueta cuya
+  credencial venció o fue revocada sí puede registrarse otra vez, como
+  ventana nueva con el nombre antiguo;
+- **vence a lo que sustituye**: manda el epoch en `X-Crew-Epoch` y un proceso
+  al que han reemplazado se entera (`409`) en vez de escribir como la ventana
+  que lo sustituyó.
 
 `renew_session` alarga la credencial que ya tienes sin tocar su secreto ni su
 epoch. `revoke_session` la cierra, o cierra otra ventana de tu propio agente
@@ -562,9 +566,13 @@ El proxy hace todo esto por ti: registra la sesión al conectar, reenvía cada
 llamada con la credencial y el epoch, renueva la credencial a mitad de su
 vida tanto si la ventana está ocupada como ociosa (`BUS_SESSION_TTL_SECS` y
 `BUS_SESSION_RENEW_LEAD_SECS` ajustan la vida que pide y la antelación), y
-borra el secreto de su estado privado cuando la ventana se cierra. Una
-renovación que el bus rechace la informa `session_status` como credencial
-rechazada; nunca se tapa con otra identidad. Un bus demasiado antiguo para
+al cerrarse la ventana marca su binding como cerrado. La credencial
+**se queda** en ese fichero 0600: es la única forma de reanudar la misma
+ventana tras reiniciar la conversación, porque el bus se niega a entregar una
+sesión viva al token del agente. Un binding cerrado no lo usan los hooks, y la
+credencial conserva solo la vida que el bus le dio; `revoke_session` la
+termina antes. Una renovación que el bus rechace la informa `session_status`
+como credencial rechazada; nunca se tapa con otra identidad. Un bus demasiado antiguo para
 emitir credenciales se queda simplemente con la conexión por etiqueta.
 
 **Identidad de la conversación**, por orden: `--host-session` /
