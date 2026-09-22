@@ -12326,3 +12326,124 @@ async fn audit_an_admitted_fetch_cannot_move_a_delivery_backwards() {
     }
     h.shutdown().await;
 }
+
+/// A proxy renews its session credential before it expires, busy or idle,
+/// without rotating secret or epoch, and records the new expiry in its
+/// binding; a revoked credential is refused at renewal and reported, never
+/// replaced by another identity (#153).
+#[tokio::test]
+async fn audit_proxy_renews_its_credential_before_expiry() {
+    let h = require_db!("t_proxy_renewal");
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &bob_token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    // A 60 s credential renewed 50 s before it expires: the first renewal is
+    // due 10 s in, and retries are 12 s apart.
+    let knobs = [
+        ("BUS_SESSION_TTL_SECS", "60"),
+        ("BUS_SESSION_RENEW_LEAD_SECS", "50"),
+    ];
+    let busy = spawn_proxy(&dir, &repo, &["--host-session", "conv-busy"], &knobs).await;
+    let idle = spawn_proxy(&dir, &repo, &["--host-session", "conv-idle"], &knobs).await;
+    let started = std::time::Instant::now();
+    let session_of = |status: Value| status["session"].as_str().unwrap().to_owned();
+    let busy_label = session_of(call(&busy, "session_status", json!({})).await);
+    let idle_label = session_of(call(&idle, "session_status", json!({})).await);
+    let row = |label: String| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_as::<_, (i64, Vec<u8>, chrono::DateTime<chrono::Utc>)>(
+                "SELECT epoch, token_hash, expires_at FROM agent_sessions WHERE label = $1 AND revoked_at IS NULL",
+            )
+            .bind(label)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (busy_epoch, busy_hash, busy_expiry) = row(busy_label.clone()).await;
+    let (idle_epoch, idle_hash, idle_expiry) = row(idle_label.clone()).await;
+    assert!(
+        (busy_expiry - chrono::Utc::now()).num_seconds() <= 60,
+        "the proxy asked for the short lifetime: {busy_expiry}"
+    );
+
+    // Busy: keeps calling. Idle: nothing but its keepalive. Both must be
+    // renewed by the time the first deadline plus a retry has passed.
+    let deadline = started + std::time::Duration::from_secs(40);
+    loop {
+        let me = call(&busy, "whoami", json!({})).await;
+        assert_eq!(me["agent"], "bob", "{me}");
+        let (_, _, b) = row(busy_label.clone()).await;
+        let (_, _, i) = row(idle_label.clone()).await;
+        if b > busy_expiry && i > idle_expiry {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no renewal within 40 s: busy {b} (was {busy_expiry}), idle {i} (was {idle_expiry})"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let (epoch, hash, expiry) = row(busy_label.clone()).await;
+    assert_eq!(
+        (epoch, &hash),
+        (busy_epoch, &busy_hash),
+        "renewal rotates nothing"
+    );
+    assert!(expiry > busy_expiry);
+    let (epoch, hash, expiry) = row(idle_label.clone()).await;
+    assert_eq!(
+        (epoch, &hash),
+        (idle_epoch, &idle_hash),
+        "renewal rotates nothing"
+    );
+    assert!(expiry > idle_expiry);
+    // The binding carries the renewed expiry, so a hook of this window
+    // reads the same lifetime the bus holds.
+    let binding = std::fs::read_to_string(ai_crew_sync::context::binding_path(&dir, "conv-idle"))
+        .expect("the idle window has a binding");
+    let recorded = serde_json::from_str::<Value>(&binding).unwrap()["expires_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let recorded = chrono::DateTime::parse_from_rfc3339(&recorded)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(
+        recorded > idle_expiry,
+        "binding stamped: {recorded} vs {idle_expiry}"
+    );
+    let status = call(&idle, "session_status", json!({})).await;
+    assert!(status["error"].is_null(), "{status}");
+
+    // Revocation wins: the parent revokes the idle window by label; its
+    // next renewal is refused and the proxy says so instead of switching
+    // identities.
+    let parent = connect(&h.base, &bob_token).await;
+    call(&parent, "revoke_session", json!({"session": idle_label})).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    loop {
+        let status = call(&idle, "session_status", json!({})).await;
+        if status["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("rejected the credential"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refusal was never reported: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let (_, _, still) = row(busy_label).await;
+    assert!(still > busy_expiry, "the other window is unaffected");
+
+    let _ = busy.cancel().await;
+    let _ = idle.cancel().await;
+    let _ = parent.cancel().await;
+    h.shutdown().await;
+}

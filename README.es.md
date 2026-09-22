@@ -559,8 +559,12 @@ tools remotos y dos que nunca llegan al bus:
   credencial no puede borrar lo que esta conversación ya ha visto.
 
 El proxy hace todo esto por ti: registra la sesión al conectar, reenvía cada
-llamada con la credencial y el epoch, la renueva, y borra el secreto de su
-estado privado cuando la ventana se cierra. Un bus demasiado antiguo para
+llamada con la credencial y el epoch, renueva la credencial a mitad de su
+vida tanto si la ventana está ocupada como ociosa (`BUS_SESSION_TTL_SECS` y
+`BUS_SESSION_RENEW_LEAD_SECS` ajustan la vida que pide y la antelación), y
+borra el secreto de su estado privado cuando la ventana se cierra. Una
+renovación que el bus rechace la informa `session_status` como credencial
+rechazada; nunca se tapa con otra identidad. Un bus demasiado antiguo para
 emitir credenciales se queda simplemente con la conexión por etiqueta.
 
 **Identidad de la conversación**, por orden: `--host-session` /

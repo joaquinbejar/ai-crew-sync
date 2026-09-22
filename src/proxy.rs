@@ -81,6 +81,14 @@ const SESSION_HEX: usize = 32;
 /// Presence lease the proxy keeps alive, and how often it renews it.
 const PRESENCE_TTL_SECS: i64 = 900;
 const KEEPALIVE_EVERY: Duration = Duration::from_secs(300);
+/// Credential lifetime the proxy asks the bus for, in seconds, when
+/// `BUS_SESSION_TTL_SECS` is set; unset takes the bus default. The bus
+/// bounds it (60 s to 24 h).
+const SESSION_TTL_ENV: &str = "BUS_SESSION_TTL_SECS";
+/// How long before its expiry the credential is renewed, in seconds, when
+/// `BUS_SESSION_RENEW_LEAD_SECS` is set; unset renews half-way through the
+/// lifetime, so a transient failure has the other half to retry in.
+const RENEW_LEAD_ENV: &str = "BUS_SESSION_RENEW_LEAD_SECS";
 /// How long a context switch waits for in-flight calls to the old context
 /// after cancelling them, before swapping anyway.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -141,6 +149,28 @@ fn random_session() -> String {
     )
 }
 
+fn env_secs(name: &str) -> Option<i64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+}
+
+/// The lifetime the proxy asks for on register, resume and renew; `None`
+/// leaves it to the bus.
+fn requested_session_ttl() -> Option<i64> {
+    env_secs(SESSION_TTL_ENV)
+}
+
+/// Seconds before expiry at which the credential is renewed, for a
+/// credential of `lifetime` seconds: the override when set, else half the
+/// lifetime, and always inside the lifetime so the deadline is never
+/// already past on issue.
+fn renewal_lead_secs(lifetime: i64, override_secs: Option<i64>) -> i64 {
+    let lifetime = lifetime.max(2);
+    override_secs.unwrap_or(lifetime / 2).clamp(1, lifetime - 1)
+}
+
 /// The credential this window proved itself with, when the bus issues them.
 #[derive(Clone, Debug)]
 pub struct SessionProof {
@@ -150,6 +180,17 @@ pub struct SessionProof {
     pub session_id: String,
     pub epoch: i64,
     pub expires_at: String,
+}
+
+/// What one renewal attempt did.
+enum Renewal {
+    Renewed,
+    /// The bus rejected the credential: revoked, expired or replaced.
+    Refused,
+    /// Transient: try again before the credential lapses.
+    Retry,
+    /// Nothing to renew, or the answer no longer applies to this context.
+    Nothing,
 }
 
 /// The verified, connected context of this instance.
@@ -451,7 +492,11 @@ async fn call_remote(remote: &Remote, name: &str, args: Value) -> anyhow::Result
 /// failure is fatal, because continuing would forward with the parent token
 /// under an asserted label while reporting a proven identity.
 async fn register_new(remote: &Remote, session: &str) -> anyhow::Result<Option<SessionProof>> {
-    match call_remote(remote, "register_session", json!({ "session": session })).await {
+    let mut args = json!({ "session": session });
+    if let Some(ttl) = requested_session_ttl() {
+        args["ttl_seconds"] = json!(ttl);
+    }
+    match call_remote(remote, "register_session", args).await {
         Ok(v) => match v["session_token"].as_str() {
             Some(token) => Ok(Some(SessionProof {
                 token: token.to_owned(),
@@ -494,7 +539,11 @@ async fn resume_with(
     let remote = connect_remote(url, &prior.token, session, Some(prior.epoch))
         .await
         .context("the stored session credential could not open a connection")?;
-    let outcome = call_remote(&remote, "resume_session", json!({})).await;
+    let mut args = json!({});
+    if let Some(ttl) = requested_session_ttl() {
+        args["ttl_seconds"] = json!(ttl);
+    }
+    let outcome = call_remote(&remote, "resume_session", args).await;
     let _ = remote.cancel().await;
     let v =
         outcome.context("this window's session could not be resumed; it may have been revoked")?;
@@ -1306,13 +1355,182 @@ impl Proxy {
         lines.join("\n")
     }
 
-    /// Periodic presence, until cancelled.
+    /// Periodic presence, and the credential renewed before it expires,
+    /// until cancelled. Presence is on a fixed cadence; the renewal is
+    /// scheduled from the expiry the bus last stated, so an idle window is
+    /// renewed exactly as a busy one.
     pub async fn keepalive(self, ct: CancellationToken) {
+        let mut next_heartbeat = tokio::time::Instant::now() + KEEPALIVE_EVERY;
+        // Earliest next renewal attempt, whatever the deadline says: keeps a
+        // deadline already in the past (a bus that will not renew, a reply
+        // without an expiry) from becoming a tight loop.
+        let mut not_before: Option<tokio::time::Instant> = None;
         loop {
+            let renew_at = self
+                .renewal_deadline()
+                .await
+                .map(|at| not_before.map_or(at, |nb| at.max(nb)));
+            let renew_sleep = tokio::time::sleep_until(
+                renew_at.unwrap_or_else(|| tokio::time::Instant::now() + KEEPALIVE_EVERY),
+            );
             tokio::select! {
                 _ = ct.cancelled() => return,
-                _ = tokio::time::sleep(KEEPALIVE_EVERY) => self.heartbeat("active").await,
+                _ = tokio::time::sleep_until(next_heartbeat) => {
+                    self.heartbeat("active").await;
+                    next_heartbeat = tokio::time::Instant::now() + KEEPALIVE_EVERY;
+                }
+                _ = renew_sleep, if renew_at.is_some() => {
+                    let pause = match self.renew_credential().await {
+                        // A refused credential is refused again a moment
+                        // later; look again on the presence cadence, in
+                        // case a profile switch brought a live one.
+                        Renewal::Refused => KEEPALIVE_EVERY,
+                        Renewal::Renewed | Renewal::Retry | Renewal::Nothing => self.renewal_retry().await,
+                    };
+                    not_before = Some(tokio::time::Instant::now() + pause);
+                }
             }
+        }
+    }
+
+    /// When the credential this window holds should be renewed: its expiry
+    /// less the lead, never earlier than now. `None` without a credential.
+    async fn renewal_deadline(&self) -> Option<tokio::time::Instant> {
+        let expires_at = {
+            let st = self.state.read().await;
+            st.connected
+                .as_ref()
+                .and_then(|c| c.proof.as_ref())
+                .map(|p| p.expires_at.clone())?
+        };
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at).ok()?;
+        let remaining = (expires_at.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .num_seconds()
+            .max(0);
+        let due_in = (remaining - self.renewal_lead().await).max(0) as u64;
+        Some(tokio::time::Instant::now() + Duration::from_secs(due_in))
+    }
+
+    async fn renewal_lead(&self) -> i64 {
+        let lifetime = requested_session_ttl().unwrap_or(crate::auth::SESSION_TTL_SECS);
+        renewal_lead_secs(lifetime, env_secs(RENEW_LEAD_ENV))
+    }
+
+    /// Gap between renewal attempts: a quarter of the lead, so a transient
+    /// failure gets several tries before the credential lapses.
+    async fn renewal_retry(&self) -> Duration {
+        Duration::from_secs((self.renewal_lead().await / 4).clamp(2, 60) as u64)
+    }
+
+    /// Extend the credential this window holds, without rotating its secret
+    /// or epoch. Raced against the connected context's cancellation and
+    /// fenced on the generation, so a profile switch under way discards the
+    /// answer rather than applying it to the wrong identity.
+    async fn renew_credential(&self) -> Renewal {
+        let (remote, proof, generation, ct, profile) = {
+            let st = self.state.read().await;
+            let Some(c) = &st.connected else {
+                return Renewal::Nothing;
+            };
+            let Some(p) = &c.proof else {
+                return Renewal::Nothing;
+            };
+            (
+                c.remote.clone(),
+                p.clone(),
+                st.generation,
+                c.ct.clone(),
+                c.resolved.profile.clone(),
+            )
+        };
+        let mut args = json!({});
+        if let Some(ttl) = requested_session_ttl() {
+            args["ttl_seconds"] = json!(ttl);
+        }
+        let outcome = tokio::select! {
+            _ = ct.cancelled() => return Renewal::Nothing,
+            r = call_remote(&remote, "renew_session", args) => r,
+        };
+        match outcome {
+            Ok(v) => {
+                let Some(expires_at) = v["expires_at"].as_str().map(str::to_owned) else {
+                    tracing::warn!("renew_session answered without an expiry; keeping the old one");
+                    return Renewal::Retry;
+                };
+                if v["epoch"].as_i64().is_some_and(|e| e != proof.epoch) {
+                    // A renewal never rotates; an answer that says otherwise
+                    // is not applied to a credential it does not describe.
+                    tracing::warn!(
+                        "renew_session answered for another epoch; keeping the credential this \
+                         window holds"
+                    );
+                    return Renewal::Retry;
+                }
+                {
+                    let mut st = self.state.write().await;
+                    if st.generation != generation {
+                        return Renewal::Nothing;
+                    }
+                    let Some(current) = st.connected.as_mut().and_then(|c| c.proof.as_mut()) else {
+                        return Renewal::Nothing;
+                    };
+                    if current.session_id != proof.session_id || current.epoch != proof.epoch {
+                        return Renewal::Nothing;
+                    }
+                    current.expires_at = expires_at.clone();
+                }
+                self.stamp_binding_expiry(&proof, &expires_at).await;
+                tracing::debug!(expires_at = %expires_at, "session credential renewed");
+                Renewal::Renewed
+            }
+            Err(e) => match verdict_of(&e) {
+                Some(Verdict::Unauthorized) => {
+                    tracing::warn!(error = %e, "the bus refused to renew this window's credential");
+                    self.mark_unauthorized(&profile);
+                    Renewal::Refused
+                }
+                Some(Verdict::NoSuchTool) => {
+                    tracing::debug!("this bus does not renew credentials");
+                    Renewal::Nothing
+                }
+                None => {
+                    tracing::warn!(error = %e, "could not renew this window's credential; retrying");
+                    Renewal::Retry
+                }
+            },
+        }
+    }
+
+    /// Persist a renewed expiry into the binding, **only if the record still
+    /// describes this credential**: a successor's record is left alone, as
+    /// in `mark_closed`.
+    async fn stamp_binding_expiry(&self, proof: &SessionProof, expires_at: &str) {
+        let key = {
+            let st = self.state.read().await;
+            st.host_id.clone().unwrap_or_else(|| st.session.clone())
+        };
+        let path = context::binding_path(&self.opts.state_dir, &key);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        let same = value["session_id"].as_str() == Some(proof.session_id.as_str())
+            && value["epoch"].as_i64() == Some(proof.epoch);
+        if !same {
+            tracing::debug!(binding = %key, "another instance owns this binding now; not stamping");
+            return;
+        }
+        if let Some(map) = value.as_object_mut() {
+            map.insert("expires_at".into(), json!(expires_at));
+            map.insert(
+                "updated_at".into(),
+                json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            );
+        }
+        if let Err(e) = context::write_binding_file(&path, &value.to_string()) {
+            tracing::warn!(error = %e, binding = %key, "could not record the renewed expiry");
         }
     }
 
@@ -1544,6 +1762,26 @@ pub async fn run(opts: ProxyOptions) -> anyhow::Result<()> {
     let _ = keepalive.await;
     proxy.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod renewal_tests {
+    #[test]
+    fn renewal_lead_is_half_the_lifetime_unless_overridden_and_inside_it() {
+        assert_eq!(super::renewal_lead_secs(24 * 3600, None), 12 * 3600);
+        assert_eq!(super::renewal_lead_secs(60, None), 30);
+        assert_eq!(super::renewal_lead_secs(60, Some(50)), 50);
+        assert_eq!(
+            super::renewal_lead_secs(60, Some(600)),
+            59,
+            "never past the lifetime"
+        );
+        assert_eq!(
+            super::renewal_lead_secs(1, None),
+            1,
+            "a degenerate lifetime still yields a lead"
+        );
+    }
 }
 
 #[cfg(test)]
