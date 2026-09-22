@@ -967,11 +967,29 @@ Lo que hay, probado contra un broker real en la suite:
 El `max_message_size` del stream no basta: el `max_payload` del **servidor**
 vale 1 MiB por defecto, y un cuerpo de 1 MiB más sus cabeceras de sobre son
 unos 1.048.800 bytes. Un despliegue que suba solo el límite del stream
-rechaza exactamente los mensajes que el contrato permite. Arranca el broker
-con `--max_payload 2MB` (el fixture de test lo hace). Un cuerpo por encima
-del límite del broker falla **fatal** en vez de reintentarse para siempre,
-igual que un stream lleno o una autorización denegada; un timeout o una
-conexión caída siguen siendo reintentables.
+rechaza exactamente los mensajes que el contrato permite. `nats-server` solo
+acepta `max_payload` en su fichero de configuración (no existe el flag;
+`--max_payload` hace que la imagen fijada `nats:2.12-alpine` no arranque),
+así que el broker se arranca con un fichero:
+
+```text
+# nats.conf
+max_payload: 2MB
+jetstream {
+    store_dir: /data
+}
+```
+
+```sh
+nats-server -c nats.conf
+```
+
+`Docker/nats-test.conf` es el fixture que ejecuta `make test`, y el servicio
+`nats` de `Docker/docker-compose.yml` escribe ese mismo fichero antes de
+arrancar. Con él, un cuerpo en el techo del contrato no lo rechaza ninguno de
+los dos límites. Un cuerpo por encima del límite del broker falla **fatal** en
+vez de reintentarse para siempre, igual que un stream lleno o una autorización
+denegada; un timeout o una conexión caída siguen siendo reintentables.
 
 El fixture de integración es **obligatorio**: `make test` levanta un NATS
 2.12 real con JetStream, y si falta, la suite falla de forma visible. Un test

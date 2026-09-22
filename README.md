@@ -959,11 +959,28 @@ is about 1,048,800 bytes — refused by a couple of hundred bytes. A deployment
 that raises only the stream limit rejects exactly the messages the body
 contract allows.
 
-Run the broker with `--max_payload 2MB` (the test fixture does), and a body
-at the contract's ceiling is refused by neither. Bodies past the broker's
-limit fail **fatally** rather than retrying for ever, along with a full
-stream and a refused authorization; a timeout or a dropped connection stays
-retryable.
+`nats-server` takes `max_payload` only from its configuration file (there is
+no command-line flag; `--max_payload` makes the pinned `nats:2.12-alpine`
+refuse to start), so the broker is started with a file:
+
+```text
+# nats.conf
+max_payload: 2MB
+jetstream {
+    store_dir: /data
+}
+```
+
+```sh
+nats-server -c nats.conf
+```
+
+`Docker/nats-test.conf` is the fixture `make test` runs, and the `nats`
+service in `Docker/docker-compose.yml` writes the same file before starting.
+With it, a body at the contract's ceiling is refused by neither limit. Bodies
+past the broker's limit fail **fatally** rather than retrying for ever, along
+with a full stream and a refused authorization; a timeout or a dropped
+connection stays retryable.
 
 The integration fixture is **required** from this phase: `make test` starts a
 real NATS 2.12 with JetStream, and a missing broker fails the suite visibly.
