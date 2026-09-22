@@ -12791,3 +12791,303 @@ async fn audit_stop_drain_reads_the_bound_window_whatever_the_environment_says()
     }
     h.shutdown().await;
 }
+
+/// The listing's race guard, exercised for real: a revocation that commits
+/// between candidate selection and the per-conversation read leaves the
+/// project thread out and the private thread in, with no error (#167).
+#[tokio::test]
+async fn audit_listing_skips_a_seat_revoked_after_candidate_selection() {
+    use ai_crew_sync::store::conversations as convo_store;
+    let h = require_db!("t_listing_race");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let cred = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    call(&alice, "create_project", json!({"project": "audit"})).await;
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob"}),
+    )
+    .await;
+    let project_thread = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "project", "project": "audit", "invite": ["bob/reader"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let private_thread = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "private", "private": true, "invite": ["bob/reader"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    for id in [project_thread, private_thread] {
+        call(&bob, "join_conversation", json!({"conversation_id": id})).await;
+    }
+    let bob_ctx = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'bob'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "bob".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "reader".into(),
+        session_id: Some(
+            cred["session_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        ),
+        session_epoch: Some(1),
+        token_id: None,
+    };
+
+    // Candidates chosen while the grant stands: both threads.
+    let candidates = convo_store::list_candidates(&h.pool, &bob_ctx, false)
+        .await
+        .unwrap();
+    assert!(candidates.contains(&project_thread), "{candidates:?}");
+    assert!(candidates.contains(&private_thread), "{candidates:?}");
+
+    // The revocation commits in the window between the two halves.
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob", "grant": false}),
+    )
+    .await;
+
+    // The second half copes: the project thread is skipped, the private
+    // one is listed, and nothing errors.
+    let listed = convo_store::list_conversations_among(&h.pool, &bob_ctx, candidates)
+        .await
+        .expect("a revoked candidate must not fail the listing");
+    let ids: Vec<String> = listed.iter().map(|c| c.id.clone()).collect();
+    assert!(ids.contains(&private_thread.to_string()), "{ids:?}");
+    assert!(!ids.contains(&project_thread.to_string()), "{ids:?}");
+
+    // The tool agrees once the candidate query itself runs after the revoke.
+    let through_api = call(&bob, "list_conversations", json!({})).await;
+    let api_ids: Vec<&str> = through_api["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert_eq!(
+        api_ids,
+        vec![private_thread.to_string().as_str()],
+        "{through_api}"
+    );
+
+    for c in [alice, bob_agent, bob] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A receipt event handed out from the bus's own records is rehanded at the
+/// fetching window's epoch after a resume, exactly as a message reference
+/// is, the live window confirms it, and a context still at the old epoch
+/// cannot (#167). The Postgres reconciliation also tops up a batch while
+/// the broker is healthy; here the team's streams are deleted, so the
+/// reference can only have come from Postgres.
+#[tokio::test]
+async fn audit_receipt_event_redelivery_after_resume_on_the_postgres_path() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::{inbox, outbox};
+    let h = require_db_broker!("t_receipt_redelivery");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    JetStreamBackend::provision_inbox(&config, team)
+        .await
+        .unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    let publish = || async {
+        assert_eq!(
+            outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+            Some(outbox::Settled::Stored)
+        );
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap()
+    };
+    // Both sides are registered windows: the sender's inbox is where the
+    // receipt event lands, and only a window has an inbox.
+    let alice_agent = connect(&h.base, &alice_token).await;
+    let alice_cred = call(&alice_agent, "register_session", json!({"session": "lead"})).await;
+    let alice1 = connect(&h.base, alice_cred["session_token"].as_str().unwrap()).await;
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let bob_cred = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob = connect(&h.base, bob_cred["session_token"].as_str().unwrap()).await;
+
+    let cid = call(
+        &alice1,
+        "create_conversation",
+        json!({"title": "receipts", "private": true, "invite": ["bob/reader"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(&bob, "join_conversation", json!({"conversation_id": cid})).await;
+    let mid = call(
+        &alice1,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "look again", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(publish().await, 1, "one reference for Bob");
+    let batch = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    let bob_delivery = batch["references"][0]["delivery_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(
+        &bob,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [bob_delivery]}),
+    )
+    .await;
+    // The acknowledgement queues Alice's receipt event; publishing it marks
+    // it `published`, which is what the Postgres hand-out reconciles from.
+    call(
+        &bob,
+        "ack_message",
+        json!({"conversation_id": cid, "message_id": mid, "resolved": false}),
+    )
+    .await;
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        1,
+        "Alice's receipt event is published"
+    );
+
+    // The team's streams are deleted (not a broker outage: the resources
+    // are gone), so the broker read fails and what Alice is owed can only
+    // come from the bus's records.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    let batch = call(&alice1, "fetch_conversation_inbox", json!({})).await;
+    let refs = batch["references"].as_array().unwrap();
+    assert_eq!(refs.len(), 1, "{batch}");
+    assert_eq!(refs[0]["kind"], "receipt", "{batch}");
+    assert_eq!(refs[0]["source"], "bus", "{batch}");
+    assert_eq!(refs[0]["message_id"], mid, "{batch}");
+    assert_eq!(batch["from_broker"], 0, "{batch}");
+    assert!(
+        batch["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("could not be read")),
+        "the fetch says the broker was not the source: {batch}"
+    );
+    let delivery = refs[0]["delivery_id"].as_str().unwrap().to_owned();
+
+    // Fetched at epoch 1 and left unconfirmed; the window resumes and the
+    // hand-out grace elapses.
+    let resumed = call(&alice1, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2, "{resumed}");
+    let alice2 = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+    sqlx::query(
+        "UPDATE inbox_deliveries SET handed_at = now() - interval '6 minutes' WHERE id = $1",
+    )
+    .bind(delivery.parse::<Uuid>().unwrap())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    // Rehanded to the live window at its epoch, and confirmable by it.
+    let again = call(&alice2, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(
+        again["references"][0]["delivery_id"], delivery,
+        "the same delivery: {again}"
+    );
+    assert_eq!(again["references"][0]["kind"], "receipt", "{again}");
+    let (epoch,): (Option<i64>,) =
+        sqlx::query_as("SELECT epoch FROM inbox_deliveries WHERE id = $1")
+            .bind(delivery.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(epoch, Some(2), "the row now belongs to epoch 2");
+
+    // A context still at epoch 1 cannot confirm what the live window holds:
+    // the store refuses it as stale before touching the row.
+    let stale = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'alice'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "alice".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: "lead".into(),
+        session_id: Some(
+            alice_cred["session_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        ),
+        session_epoch: Some(1),
+        token_id: None,
+    };
+    let backends =
+        ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone());
+    let err =
+        match inbox::confirm(&h.pool, &backends, &stale, std::slice::from_ref(&delivery)).await {
+            Ok(_) => panic!("a stale context must not confirm the live window's delivery"),
+            Err(e) => e.to_string(),
+        };
+    assert!(err.contains("stale"), "{err}");
+    let (still,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT confirmed_at FROM inbox_deliveries WHERE id = $1")
+            .bind(delivery.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(
+        still.is_none(),
+        "nothing was confirmed by the stale context"
+    );
+
+    let done = call(
+        &alice2,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [delivery]}),
+    )
+    .await;
+    assert_eq!(done["confirmed"], 1, "{done}");
+
+    for c in [alice_agent, alice1, alice2, bob_agent, bob] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

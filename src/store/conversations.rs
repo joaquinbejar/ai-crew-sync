@@ -803,12 +803,28 @@ pub async fn list_conversations(
     include_archived: bool,
 ) -> BusResult<Vec<ConversationInfo>> {
     require_capability(pool, auth).await?;
-    // The candidates obey the same rules as `access`: a seat taken by a
-    // registered window belongs to that window (the parent token wearing
-    // the label does not sit in it), and a project grant opens project
-    // threads only, never a private thread that happens to name a project.
-    // Listing a seat the caller could not then open failed the whole
-    // listing with "no such conversation".
+    let ids = list_candidates(pool, auth, include_archived).await?;
+    list_conversations_among(pool, auth, ids).await
+}
+
+/// The conversations the caller may list, by id: the first half of
+/// [`list_conversations`]. Not part of the documented API: it is exposed so
+/// the integration suite (the only database-backed harness this crate has)
+/// can commit a revocation between the two halves and prove the second
+/// copes. `list_conversations` keeps the capability check in front of both.
+///
+/// The candidates obey the same rules as `access`: a seat taken by a
+/// registered window belongs to that window (the parent token wearing the
+/// label does not sit in it), and a project grant opens project threads
+/// only, never a private thread that happens to name a project. Listing a
+/// seat the caller could not then open failed the whole listing with "no
+/// such conversation".
+#[doc(hidden)]
+pub async fn list_candidates(
+    pool: &PgPool,
+    auth: &AuthCtx,
+    include_archived: bool,
+) -> BusResult<Vec<Uuid>> {
     let ids: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT DISTINCT c.id
            FROM conversations c
@@ -835,11 +851,22 @@ pub async fn list_conversations(
     .bind(auth.session_id)
     .fetch_all(pool)
     .await?;
+    Ok(ids.into_iter().map(|(id,)| id).collect())
+}
+
+/// Resolve listed candidates into what the caller may see now: the second
+/// half of [`list_conversations`], exposed for the same reason as
+/// [`list_candidates`]. Permissions can change between the candidate query
+/// and this read: a seat removed or a grant revoked meanwhile is simply not
+/// listed, and does not take the rest of the listing with it.
+#[doc(hidden)]
+pub async fn list_conversations_among(
+    pool: &PgPool,
+    auth: &AuthCtx,
+    ids: Vec<Uuid>,
+) -> BusResult<Vec<ConversationInfo>> {
     let mut out = Vec::with_capacity(ids.len());
-    for (id,) in ids {
-        // Permissions can change between the candidate query and this
-        // read: a seat removed or a grant revoked meanwhile is simply not
-        // listed, and does not take the rest of the listing with it.
+    for id in ids {
         match conversation_info(pool, auth, id).await {
             Ok(info) => out.push(info),
             Err(BusError::NotFound(_)) | Err(BusError::Forbidden(_)) => continue,
