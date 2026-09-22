@@ -1,0 +1,14 @@
+# ~/.codex/config.toml, or <repo>/.codex/config.toml in a trusted project.
+#
+# Codex starts the binary, which connects to the bus as one authenticated
+# session per conversation. No token lives in this file: the proxy resolves
+# one from your local profiles (`ai-crew-sync context profile add`), and
+# `ai-crew-sync context show` says which one applies where you are.
+[mcp_servers.ai-crew-sync]
+command = "ai-crew-sync"
+args = ["mcp", "proxy"]
+
+# Optional: the role every window started from this config announces, so
+# teammates can find it with list_sessions. The project label normally comes
+# from the repository's .acs.toml instead.
+# args = ["mcp", "proxy", "--role", "review"]

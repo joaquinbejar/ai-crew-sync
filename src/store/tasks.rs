@@ -131,7 +131,9 @@ const TASK_SELECT: &str = r#"
            t.claimed_session,
            t.claimed_at,
            t.lease_expires_at,
-           (t.status = 'claimed' AND t.lease_expires_at <= now()) AS lease_expired,
+           -- A claim with no expiry (a row from before leases had one) is a
+           -- live claim, not a lapsed one: NULL here would not decode.
+           COALESCE(t.status = 'claimed' AND t.lease_expires_at <= now(), false) AS lease_expired,
            t.result,
            t.metadata,
            COALESCE(
@@ -389,7 +391,7 @@ pub async fn list_tasks(
              -- lapsed lease is nobody's.
              AND (NOT $3::bool
                   OR (t.claimed_by = $4 AND COALESCE(t.claimed_session, '') = $6
-                      AND t.lease_expires_at > now()))
+                      AND COALESCE(t.lease_expires_at > now(), true)))
            ORDER BY
              CASE ({EFFECTIVE_STATUS}) WHEN 'claimed' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
              t.updated_at DESC

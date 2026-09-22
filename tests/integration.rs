@@ -10931,6 +10931,25 @@ async fn a_lapsed_lease_reads_as_open_everywhere() {
     assert_eq!(now["lease_expired"], false, "{now}");
     assert!(now["lapsed_holder"].is_null(), "{now}");
 
+    // A claim with no expiry at all (a row from before leases had one) is a
+    // live claim: it reads as claimed, counts as its holder's, and never
+    // trips the lapse logic.
+    sqlx::query("UPDATE tasks SET lease_expires_at = NULL WHERE key = 'lapse'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let legacy = call(&dani, "get_task", json!({"key": "lapse"})).await["task"].clone();
+    assert_eq!(legacy["status"], "claimed", "{legacy}");
+    assert_eq!(legacy["claimed_by"], "dani", "{legacy}");
+    assert_eq!(legacy["lease_expired"], false, "{legacy}");
+    let mine = call(
+        &dani,
+        "list_tasks",
+        json!({"mine_only": true, "status": "claimed"}),
+    )
+    .await;
+    assert_eq!(mine["tasks"].as_array().map(Vec::len), Some(1), "{mine}");
+
     for c in [marta, dani] {
         let _ = c.cancel().await;
     }
