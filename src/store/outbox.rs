@@ -594,9 +594,22 @@ pub async fn resolve_uncertain<B: MessagingBackend>(
     Ok(resolved)
 }
 
-/// Drop the temporary body once its backend holds it. Until this runs, the
-/// body lives in both places on purpose: losing it to a failed publish would
-/// be worse than storing it twice for a moment.
+/// How many bodies one sweep pass confirms with the backend before clearing
+/// them. Bounded so a large backlog costs a bounded number of broker reads
+/// per minute; the next pass takes the next slice.
+pub const RELEASE_BATCH: i64 = 200;
+
+/// Drop the temporary body once its backend **confirms** it holds it. Until
+/// this runs, the body lives in both places on purpose: losing it to a
+/// failed publish would be worse than storing it twice for a moment.
+///
+/// The confirmation is read at sweep time, never from the flags written at
+/// publish time: the canonical locator must resolve on the backend now and
+/// the body it returns must hash to what was published. A broker that is
+/// unreachable, or one that lost or re-created the stream, confirms
+/// nothing, and the local copy stays, since it is then the last readable
+/// one. Releasing resumes by itself when the broker is back; no operator
+/// action is involved.
 ///
 /// Only touches messages whose backend is not Postgres — there, the row *is*
 /// the storage, and clearing it would delete the history.
@@ -606,15 +619,30 @@ pub async fn resolve_uncertain<B: MessagingBackend>(
 /// round trip to the broker.
 pub async fn release_published_bodies(
     pool: &PgPool,
+    backends: &crate::store::routing::Backends,
     conversation: Option<Uuid>,
     min_age_secs: i64,
 ) -> BusResult<u64> {
-    let done = sqlx::query(
-        "UPDATE conversation_messages m
-            SET body = ''
-           FROM conversations c
+    // The cheap question first. Without a reachable broker nothing can be
+    // confirmed, and the answer would be "keep everything" row by row.
+    match backends.broker_reachable().await {
+        Some(true) => {}
+        Some(false) => {
+            tracing::debug!("the broker is unreachable; no published body is released");
+            return Ok(0);
+        }
+        None => {
+            // No broker configured on this replica. Bodies on a broker exist
+            // only if one was configured once; whether it comes back is
+            // not this process's to decide, so nothing is released.
+            return Ok(0);
+        }
+    }
+    let candidates: Vec<(Uuid, Uuid, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT m.id, c.team_id, c.backend, m.canonical_locator, m.body_sha256
+           FROM conversation_messages m
+           JOIN conversations c ON c.id = m.conversation_id
           WHERE ($1::uuid IS NULL OR m.conversation_id = $1)
-            AND c.id = m.conversation_id
             AND c.backend <> 'postgres'
             AND m.publication_state = 'stored'
             AND m.canonical_locator IS NOT NULL
@@ -627,10 +655,75 @@ pub async fn release_published_bodies(
             AND NOT EXISTS (
                 SELECT 1 FROM conversation_migration_items i
                   JOIN conversation_migrations g ON g.id = i.migration_id
-                 WHERE i.message_id = m.id AND g.state = 'cut_over')",
+                 WHERE i.message_id = m.id AND g.state = 'cut_over')
+          ORDER BY m.created_at
+          LIMIT $3",
     )
     .bind(conversation)
     .bind(min_age_secs as f64)
+    .bind(RELEASE_BATCH)
+    .fetch_all(pool)
+    .await?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    // Confirmed means: the backend answered, the locator named a body, and
+    // that body is byte for byte the one that was published. Anything else
+    // keeps the local copy, and a backend that stops answering ends the
+    // pass, since every later answer would be the same.
+    let mut confirmed: Vec<Uuid> = Vec::with_capacity(candidates.len());
+    for (message_id, team_id, backend_name, locator, digest) in candidates {
+        let Some(digest) = digest else {
+            // Published before the digest was recorded: nothing to compare
+            // against, so nothing to release. Rare, and safe.
+            tracing::debug!(%message_id, "no digest to confirm against; keeping the local body");
+            continue;
+        };
+        let backend = match backends.for_message(&backend_name, team_id).await {
+            Ok(backend) => backend,
+            Err(e) => {
+                tracing::debug!(error = %e, "the backend cannot be opened; keeping local bodies");
+                break;
+            }
+        };
+        match backend
+            .fetch(&crate::store::backend::Locator(locator), message_id)
+            .await
+        {
+            Ok(Some(body)) if crate::store::conversations::body_digest(&body) == digest => {
+                confirmed.push(message_id);
+            }
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    %message_id,
+                    "the backend holds a different body under this locator; keeping the local copy"
+                );
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    %message_id,
+                    "the backend no longer holds this body; keeping the local copy"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, %message_id, "the backend did not answer; ending this pass");
+                break;
+            }
+        }
+    }
+    if confirmed.is_empty() {
+        return Ok(0);
+    }
+    let done = sqlx::query(
+        "UPDATE conversation_messages
+            SET body = ''
+          WHERE id = ANY($1)
+            AND publication_state = 'stored'
+            AND canonical_locator IS NOT NULL
+            AND body <> ''",
+    )
+    .bind(&confirmed)
     .execute(pool)
     .await?;
     Ok(done.rows_affected())
