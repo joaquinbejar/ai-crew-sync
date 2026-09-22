@@ -157,9 +157,11 @@ fn env_secs(name: &str) -> Option<i64> {
 }
 
 /// The lifetime the proxy asks for on register, resume and renew; `None`
-/// leaves it to the bus.
+/// leaves it to the bus. Clamped to the bounds the bus applies, so the
+/// renewal schedule is computed from the lifetime actually issued rather
+/// than from a number the bus would have cut down.
 fn requested_session_ttl() -> Option<i64> {
-    env_secs(SESSION_TTL_ENV)
+    env_secs(SESSION_TTL_ENV).map(|v| v.clamp(60, crate::auth::MAX_SESSION_TTL_SECS))
 }
 
 /// Seconds before expiry at which the credential is renewed, for a
@@ -1363,13 +1365,17 @@ impl Proxy {
         let mut next_heartbeat = tokio::time::Instant::now() + KEEPALIVE_EVERY;
         // Earliest next renewal attempt, whatever the deadline says: keeps a
         // deadline already in the past (a bus that will not renew, a reply
-        // without an expiry) from becoming a tight loop.
-        let mut not_before: Option<tokio::time::Instant> = None;
+        // without an expiry) from becoming a tight loop. Tied to the context
+        // generation it was set for: a profile switch brings a credential of
+        // its own, whose first renewal must not wait out the old one's
+        // backoff.
+        let mut not_before: Option<(u64, tokio::time::Instant)> = None;
         loop {
-            let renew_at = self
-                .renewal_deadline()
-                .await
-                .map(|at| not_before.map_or(at, |nb| at.max(nb)));
+            let deadline = self.renewal_deadline().await;
+            let renew_at = deadline.map(|(generation, at)| match not_before {
+                Some((for_generation, nb)) if for_generation == generation => at.max(nb),
+                _ => at,
+            });
             let renew_sleep = tokio::time::sleep_until(
                 renew_at.unwrap_or_else(|| tokio::time::Instant::now() + KEEPALIVE_EVERY),
             );
@@ -1387,28 +1393,36 @@ impl Proxy {
                         Renewal::Refused => KEEPALIVE_EVERY,
                         Renewal::Renewed | Renewal::Retry | Renewal::Nothing => self.renewal_retry().await,
                     };
-                    not_before = Some(tokio::time::Instant::now() + pause);
+                    if let Some((generation, _)) = deadline {
+                        not_before = Some((generation, tokio::time::Instant::now() + pause));
+                    }
                 }
             }
         }
     }
 
     /// When the credential this window holds should be renewed: its expiry
-    /// less the lead, never earlier than now. `None` without a credential.
-    async fn renewal_deadline(&self) -> Option<tokio::time::Instant> {
-        let expires_at = {
+    /// less the lead, never earlier than now, with the context generation
+    /// the credential belongs to. `None` without a credential.
+    async fn renewal_deadline(&self) -> Option<(u64, tokio::time::Instant)> {
+        let (generation, expires_at) = {
             let st = self.state.read().await;
-            st.connected
+            let expires_at = st
+                .connected
                 .as_ref()
                 .and_then(|c| c.proof.as_ref())
-                .map(|p| p.expires_at.clone())?
+                .map(|p| p.expires_at.clone())?;
+            (st.generation, expires_at)
         };
         let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at).ok()?;
         let remaining = (expires_at.with_timezone(&chrono::Utc) - chrono::Utc::now())
             .num_seconds()
             .max(0);
         let due_in = (remaining - self.renewal_lead().await).max(0) as u64;
-        Some(tokio::time::Instant::now() + Duration::from_secs(due_in))
+        Some((
+            generation,
+            tokio::time::Instant::now() + Duration::from_secs(due_in),
+        ))
     }
 
     async fn renewal_lead(&self) -> i64 {
@@ -1510,27 +1524,41 @@ impl Proxy {
             st.host_id.clone().unwrap_or_else(|| st.session.clone())
         };
         let path = context::binding_path(&self.opts.state_dir, &key);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
-            return;
-        };
-        let same = value["session_id"].as_str() == Some(proof.session_id.as_str())
-            && value["epoch"].as_i64() == Some(proof.epoch);
-        if !same {
-            tracing::debug!(binding = %key, "another instance owns this binding now; not stamping");
-            return;
-        }
-        if let Some(map) = value.as_object_mut() {
-            map.insert("expires_at".into(), json!(expires_at));
-            map.insert(
-                "updated_at".into(),
-                json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-            );
-        }
-        if let Err(e) = context::write_binding_file(&path, &value.to_string()) {
-            tracing::warn!(error = %e, binding = %key, "could not record the renewed expiry");
+        // Read, check and write under the configuration lock every writer
+        // of this directory takes: a successor that replaces the record
+        // between the check and the write would otherwise be overwritten
+        // with this instance's older credential.
+        let stamped = context::with_config_lock(&self.opts.state_dir, || {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return Ok(false);
+            };
+            let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+                return Ok(false);
+            };
+            let same = value["session_id"].as_str() == Some(proof.session_id.as_str())
+                && value["epoch"].as_i64() == Some(proof.epoch);
+            if !same {
+                return Ok(false);
+            }
+            if let Some(map) = value.as_object_mut() {
+                map.insert("expires_at".into(), json!(expires_at));
+                map.insert(
+                    "updated_at".into(),
+                    json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                );
+            }
+            context::write_binding_file(&path, &value.to_string())?;
+            Ok(true)
+        });
+        match stamped {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                binding = %key,
+                "another instance owns this binding now, or it is gone; not stamping"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, binding = %key, "could not record the renewed expiry")
+            }
         }
     }
 
