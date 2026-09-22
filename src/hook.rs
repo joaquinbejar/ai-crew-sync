@@ -47,9 +47,18 @@ pub enum Event {
     Status,
     /// One MCP tool call as the bound window (`--tool`, `--args`), printing
     /// the tool's structured content. Silent, like the presence events,
-    /// when the binding is missing or carries no credential.
+    /// when the binding is missing or carries no credential. Only the tools
+    /// in [`HOOK_CALL_TOOLS`] are served: a hook must not be able to issue,
+    /// rotate or revoke a credential, nor act on the bus beyond what its
+    /// scripts need.
     Call,
 }
+
+/// The tools `--event call` serves: exactly what the hook scripts call
+/// through `bus-call.sh`. Anything else is refused before the binding is
+/// even read, so `resume_session` through a hook cannot rotate the proxy's
+/// credential and print the new secret.
+pub const HOOK_CALL_TOOLS: &[&str] = &["whoami", "read_messages", "team_digest", "heartbeat"];
 
 impl std::str::FromStr for Event {
     type Err = anyhow::Error;
@@ -292,6 +301,19 @@ pub async fn run(
     digest_hours: i64,
     call: Option<(String, Value)>,
 ) -> anyhow::Result<Option<String>> {
+    // Refused before anything is read or contacted: the allowlist is the
+    // contract, not the binding's state.
+    if event == Event::Call
+        && let Some((tool, _)) = &call
+        && !HOOK_CALL_TOOLS.contains(&tool.as_str())
+    {
+        bail!(
+            "'{tool}' is not a hook operation: --event call serves {} only, so a hook can \
+             neither issue, rotate nor revoke a credential, nor act on the bus beyond what \
+             its scripts need",
+            HOOK_CALL_TOOLS.join(", ")
+        );
+    }
     let resolved = resolve_binding(config_dir, binding_id);
     if event == Event::Status {
         let value = match &resolved {
@@ -451,6 +473,35 @@ mod tests {
             !out.contains("acss_retained"),
             "status must not print a secret"
         );
+
+        // A lifecycle or write tool is refused before the binding is even
+        // read, live or not: a hook that could resume the session would
+        // rotate the proxy's credential and print the new secret.
+        let live = context::binding_path(&dir, "conv-live");
+        context::write_binding_file(
+            &live,
+            &json!({"session": "s-3", "agent": "joaquin", "team": "acme",
+                    "mcp_url": "http://127.0.0.1:1/mcp", "session_token": "acss_live",
+                    "session_id": "22222222-2222-2222-2222-222222222222", "epoch": 1})
+            .to_string(),
+        )
+        .unwrap();
+        for tool in [
+            "resume_session",
+            "register_session",
+            "renew_session",
+            "revoke_session",
+            "recover_conversation_history",
+            "post_message",
+        ] {
+            let call = Some((tool.to_owned(), json!({})));
+            let err = run(&dir, "conv-live", Event::Call, &cwd, 8, call)
+                .await
+                .expect_err(tool)
+                .to_string();
+            assert!(err.contains("not a hook operation"), "{tool}: {err}");
+            assert!(!err.contains("acss_"), "{tool}: {err}");
+        }
 
         // A call as the window is just as silent without a usable binding:
         // it must never reach a bus as a shared identity.

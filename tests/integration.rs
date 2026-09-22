@@ -12723,6 +12723,68 @@ async fn audit_stop_drain_reads_the_bound_window_whatever_the_environment_says()
         "{out}"
     );
 
+    // The call event cannot be turned against the window it serves: a
+    // hook asking to resume the session is refused before the bus is
+    // contacted, prints no secret, and the proxy stays authenticated at
+    // its epoch.
+    let (epoch_before,): (i64,) = sqlx::query_as(
+        "SELECT epoch FROM agent_sessions WHERE label = $1 AND revoked_at IS NULL
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&label)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ai-crew-sync").to_owned();
+    let cfg = dir.clone();
+    let attempt = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(bin)
+            .args([
+                "context",
+                "hook",
+                "--binding",
+                "audit-hook-window",
+                "--event",
+                "call",
+                "--tool",
+                "resume_session",
+                "--args",
+                "{}",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("BUS_CONFIG_DIR", cfg)
+            .output()
+            .expect("the binary runs")
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&attempt.stdout);
+    let stderr = String::from_utf8_lossy(&attempt.stderr);
+    assert_eq!(stdout.trim(), "", "a refused call prints nothing: {stdout}");
+    assert!(stderr.contains("not a hook operation"), "{stderr}");
+    assert!(
+        !stdout.contains("acss_") && !stderr.contains("acss_"),
+        "no secret in any output"
+    );
+    let (epoch_after,): (i64,) = sqlx::query_as(
+        "SELECT epoch FROM agent_sessions WHERE label = $1 AND revoked_at IS NULL
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&label)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(epoch_after, epoch_before, "the window's epoch is untouched");
+    let me = call(&window, "whoami", json!({})).await;
+    assert_eq!(
+        me["agent"], "bobby",
+        "the proxy is still authenticated: {me}"
+    );
+    let status = call(&window, "session_status", json!({})).await;
+    assert!(status["error"].is_null(), "{status}");
+
     let _ = window.cancel().await;
     for c in [legacy, alice] {
         let _ = c.cancel().await;

@@ -13,9 +13,12 @@
 #      credential and epoch the proxy recorded, whatever else the environment
 #      holds: an exported BUS_TOKEN would otherwise route a Stop drain to the
 #      shared session's inbox and inject another window's question here. The
-#      credential never passes through this script. A binding whose
-#      credential is gone stays silent, like the lifecycle hooks; a
-#      conversation with no binding at all falls through to the modes below.
+#      credential never passes through this script, and the binary serves
+#      only the tools these scripts use (whoami, read_messages, team_digest,
+#      heartbeat): a hook cannot issue, rotate or revoke a credential. A
+#      binding whose credential is gone stays silent, like the lifecycle
+#      hooks; a conversation with no binding at all falls through to the
+#      modes below.
 #
 #   1. Local binary + profiles. When `ai-crew-sync` is on the PATH and no
 #      BUS_TOKEN is exported, credentials come from the local profiles and the
