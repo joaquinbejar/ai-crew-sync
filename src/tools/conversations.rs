@@ -505,10 +505,14 @@ impl Bus {
         Parameters(args): Parameters<InboxConfirmArgs>,
     ) -> Result<Json<serde_json::Value>, ErrorData> {
         let auth = auth_of(&ctx)?;
-        let confirmed = inbox::confirm(&self.db, &self.backends, &auth, &args.delivery_ids).await?;
+        let done = inbox::confirm(&self.db, &self.backends, &auth, &args.delivery_ids).await?;
         Ok(Json(serde_json::json!({
-            "confirmed": confirmed,
+            "confirmed": done.confirmed.len(),
             "of": args.delivery_ids.len(),
+            // Which ids, so a caller that lost the previous answer can tell
+            // what it may forget from what it is still owed.
+            "confirmed_ids": done.confirmed,
+            "already_confirmed": done.already_confirmed,
         })))
     }
 

@@ -679,6 +679,18 @@ async fn reconcile_receipt_events(
     Ok(out)
 }
 
+/// What a confirmation did: the ids committed now, and the ids of this
+/// caller's deliveries that were already confirmed, at whatever epoch of
+/// this window they were confirmed (a process resumed since then owes
+/// nothing for them either, which is the point of telling it). An id that
+/// is not the caller's appears in neither list, and neither does one this
+/// call could not confirm because it was handed out at another epoch.
+#[derive(Debug)]
+pub struct Confirmed {
+    pub confirmed: Vec<Uuid>,
+    pub already_confirmed: Vec<Uuid>,
+}
+
 /// The caller says it holds these references durably. Only now is
 /// `delivered_at` written, and only after that is the broker acknowledged.
 ///
@@ -690,7 +702,7 @@ pub async fn confirm(
     backends: &crate::store::routing::Backends,
     auth: &AuthCtx,
     delivery_ids: &[String],
-) -> BusResult<i64> {
+) -> BusResult<Confirmed> {
     crate::store::conversations::require_capability(pool, auth).await?;
     crate::store::sessions::require_window(pool, auth).await?;
     if delivery_ids.is_empty() {
@@ -733,11 +745,34 @@ pub async fn confirm(
     .bind(auth.session_id)
     .fetch_all(&mut *tx)
     .await?;
+    // The caller's own deliveries that were confirmed before this call: a
+    // retry after a lost response, or after a crash between the bus's
+    // commit and the local record of it, must converge instead of
+    // counting zero for ever. Scoped to the caller, never anyone else's.
+    let already_confirmed: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM inbox_deliveries
+          WHERE id = ANY($1) AND recipient_key = $2 AND team_id = $3
+            AND confirmed_at IS NOT NULL",
+    )
+    .bind(&ids)
+    .bind(&key)
+    .bind(auth.team_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let confirmed: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    // The query above runs after this call's own update, so what it just
+    // confirmed is not "already" anything.
+    let already_confirmed: Vec<Uuid> = already_confirmed
+        .into_iter()
+        .filter(|id| !confirmed.contains(id))
+        .collect();
     if rows.is_empty() {
         tx.commit().await?;
-        return Ok(0);
+        return Ok(Confirmed {
+            confirmed,
+            already_confirmed,
+        });
     }
-    let confirmed: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
     // Delivered means the reference reached the process, and nothing more.
     // It never overwrites a stronger observation, and never invents one.
     sqlx::query(
@@ -775,7 +810,10 @@ pub async fn confirm(
             }
         }
     }
-    Ok(rows.len() as i64)
+    Ok(Confirmed {
+        confirmed,
+        already_confirmed,
+    })
 }
 
 /// What this window's inbox holds, from both sides, with the difference
