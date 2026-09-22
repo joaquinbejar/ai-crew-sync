@@ -85,6 +85,24 @@ pub async fn register(
         .bind(auth.agent_id)
         .fetch_one(&mut *tx)
         .await?;
+    // The token that made this request, re-read under the same lock a
+    // revocation takes. A request authenticated a moment before its token
+    // was revoked reaches this point after the revocation committed; a
+    // session hung off that token would be a credential authentication
+    // refuses on first use, and a row that reads as live for a day.
+    let parent_live: Option<(bool,)> =
+        sqlx::query_as("SELECT revoked_at IS NULL FROM api_tokens WHERE id = $1 AND agent_id = $2")
+            .bind(parent_token)
+            .bind(auth.agent_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if !matches!(parent_live, Some((true,))) {
+        return Err(BusError::Unauthenticated(
+            "the token that made this request was revoked while it was in flight; nothing \
+             was registered. Issue a new token and register again."
+                .to_owned(),
+        ));
+    }
 
     // One row per (agent, label), and the row is only *taken over* when the
     // one there is dead: revoked, or past its expiry. A live one belongs to
@@ -157,27 +175,43 @@ pub async fn resume(pool: &PgPool, auth: &AuthCtx, ttl_seconds: Option<i64>) -> 
     let ttl = ttl_of(ttl_seconds);
     let raw = generate_session_token();
     let prefix = token_prefix(&raw);
+    // Same lock order as registration, revocation and recovery, and the
+    // rotation is fenced on the epoch this credential authenticated with: a
+    // request that was in flight while the window was revoked and its label
+    // re-registered must not rotate the row the new window now holds.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR UPDATE")
+        .bind(auth.agent_id)
+        .fetch_one(&mut *tx)
+        .await?;
     let row: Option<(i64, chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as(
-        "UPDATE agent_sessions
+        "UPDATE agent_sessions s
             SET token_hash = $2,
                 prefix = $3,
-                epoch = epoch + 1,
+                epoch = s.epoch + 1,
                 expires_at = now() + make_interval(secs => $4),
                 last_used_at = NULL
-          WHERE id = $1 AND revoked_at IS NULL
-          RETURNING epoch, expires_at, label",
+          WHERE s.id = $1 AND s.revoked_at IS NULL AND s.epoch = $5
+            AND NOT EXISTS (SELECT 1 FROM api_tokens t
+                             WHERE t.id = s.parent_token AND t.revoked_at IS NOT NULL)
+          RETURNING s.epoch, s.expires_at, s.label",
     )
     .bind(session_id)
     .bind(hash_token(&raw))
     .bind(&prefix)
     .bind(ttl as f64)
-    .fetch_optional(pool)
+    .bind(auth.session_epoch.unwrap_or(0))
+    .fetch_optional(&mut *tx)
     .await?;
     let Some((epoch, expires_at, label)) = row else {
-        return Err(BusError::not_found(
-            "this session has been revoked; register a new one with your agent token",
+        return Err(BusError::Unauthenticated(
+            "this session credential is no longer the window's: it was revoked, or the \
+             window was resumed or re-registered after this connection. Nothing was \
+             rotated; register a new session with your agent token."
+                .to_owned(),
         ));
     };
+    tx.commit().await?;
     Ok(Issued {
         id: session_id,
         token: raw,
@@ -198,14 +232,17 @@ pub async fn renew(pool: &PgPool, auth: &AuthCtx, ttl_seconds: Option<i64>) -> B
         ));
     };
     let ttl = ttl_of(ttl_seconds);
+    // Fenced on the epoch too: a stale connection does not extend the
+    // window that replaced it.
     let row: Option<(i64, chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as(
         "UPDATE agent_sessions
             SET expires_at = now() + make_interval(secs => $2)
-          WHERE id = $1 AND revoked_at IS NULL
+          WHERE id = $1 AND revoked_at IS NULL AND epoch = $3
           RETURNING epoch, expires_at, label",
     )
     .bind(session_id)
     .bind(ttl as f64)
+    .bind(auth.session_epoch.unwrap_or(0))
     .fetch_optional(pool)
     .await?;
     let Some((epoch, expires_at, label)) = row else {

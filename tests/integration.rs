@@ -11076,8 +11076,117 @@ async fn a_revoked_token_takes_its_sessions_with_it() {
     .await;
     assert!(err.contains("still live"), "{err}");
 
-    for c in [a, window, b] {
-        let _ = c.cancel().await;
+    // The races, replayed deterministically at the store: a request that
+    // authenticated with token A before the revocation and runs after it.
+    use ai_crew_sync::auth::AuthCtx;
+    use ai_crew_sync::store::sessions;
+    let team = team_id(&h.pool, "acme").await;
+    let stale_agent = AuthCtx {
+        agent_id,
+        agent_name: "joaquin".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: String::new(),
+        session_id: None,
+        session_epoch: None,
+        token_id: Some(token_a_id),
+    };
+    let err = match sessions::register(&h.pool, &stale_agent, token_a_id, "late-window", None).await
+    {
+        Ok(_) => panic!("a registration under a revoked token must not land"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("revoked while it was in flight"),
+        "{err}"
+    );
+    let (late,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM agent_sessions WHERE agent_id = $1 AND label = 'late-window'",
+    )
+    .bind(agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(late, 0, "no row was written");
+
+    // And a request that authenticated with the old window's credential,
+    // running after B re-registered the label: it must not rotate B's row.
+    let (row_id, epoch_now): (Uuid, i64) = sqlx::query_as(
+        "SELECT id, epoch FROM agent_sessions WHERE agent_id = $1 AND label = 'only-window'",
+    )
+    .bind(agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let stale_window = AuthCtx {
+        agent_id,
+        agent_name: "joaquin".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: "only-window".into(),
+        session_id: Some(row_id),
+        session_epoch: Some(epoch_now - 1),
+        token_id: None,
+    };
+    let err = match sessions::resume(&h.pool, &stale_window, None).await {
+        Ok(_) => panic!("a stale connection must not rotate the new window's credential"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("re-registered"), "{err}");
+    let err = match sessions::renew(&h.pool, &stale_window, None).await {
+        Ok(_) => panic!("a stale connection must not extend the new window's credential"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("revoked"), "{err}");
+    assert_eq!(
+        mcp_status(&h.base, again["session_token"].as_str().unwrap()).await,
+        200,
+        "B's window still works"
+    );
+
+    // Revocation over the admin API, with a team-scoped credential, sweeps
+    // the sessions the same way; another team's credential cannot reach it.
+    let token_c = generate_token();
+    let (token_c_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO api_tokens (agent_id, token_hash, prefix) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(agent_id)
+    .bind(hash_token(&token_c))
+    .bind(token_prefix(&token_c))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let c = connect(&h.base, &token_c).await;
+    let other = call(&c, "register_session", json!({"session": "other-window"})).await;
+    let other_token = other["session_token"].as_str().unwrap().to_owned();
+    seed_agent(&h.pool, "rivals", "eve").await;
+    let rivals = team_id(&h.pool, "rivals").await;
+    let foreign = store::grant_admin(&h.pool, Actor::Cli, Some(rivals), None)
+        .await
+        .unwrap();
+    let (status, _) = Admin::new(&h.base, &foreign.token)
+        .delete(&format!("/teams/acme/tokens/{token_c_id}"))
+        .await;
+    assert_eq!(status, 403, "another team's credential is refused");
+    let ours = store::grant_admin(&h.pool, Actor::Cli, Some(team), None)
+        .await
+        .unwrap();
+    let (status, _) = Admin::new(&h.base, &ours.token)
+        .delete(&format!("/teams/acme/tokens/{token_c_id}"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(mcp_status(&h.base, &other_token).await, 401);
+    let (swept,): (bool,) = sqlx::query_as(
+        "SELECT revoked_at IS NOT NULL FROM agent_sessions WHERE agent_id = $1 AND label = 'other-window'",
+    )
+    .bind(agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(swept, "the session row is revoked with its parent");
+
+    for cl in [a, window, b, c] {
+        let _ = cl.cancel().await;
     }
     h.shutdown().await;
 }
