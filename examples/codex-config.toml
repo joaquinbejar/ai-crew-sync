@@ -1,3 +1,6 @@
+# The bus procedures (catch up, claim, hand off, review…) are prose recipes:
+# `ai-crew-sync recipes <name>`, or recipes/<name>.md in the ai-crew-sync repo.
+# Point AGENTS.md at them so Codex follows the same moves as the Claude plugin.
 # ~/.codex/config.toml, or <repo>/.codex/config.toml in a trusted project.
 #
 # Codex starts the binary, which connects to the bus as one authenticated

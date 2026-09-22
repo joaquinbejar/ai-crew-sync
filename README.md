@@ -341,6 +341,19 @@ that must not wait, use a task or a channel message.
   `wait_for_updates` to wait for replies), which Claude loads only when
   coordination is needed.
 
+#### The same procedures for any other host
+
+The commands are generated from `recipes/`, one Markdown file per procedure
+written for an agent that has the bus tools and nothing else: no frontmatter,
+no host assumptions, `{{input}}` where the caller's arguments go. Codex reads
+them from `AGENTS.md` ("for the routine moves follow `recipes/<name>.md`"),
+Kimi Code, Grok or any MCP client can be handed one verbatim, and a machine
+with the binary and not the repository gets them from
+`ai-crew-sync recipes` (list) and `ai-crew-sync recipes catchup` (one).
+`make recipes` regenerates the slash commands; `make check` and the unit
+tests fail when a command drifts from its recipe, so a procedure is edited in
+one place only.
+
 The hooks run in one of two modes, and pick per conversation:
 
 - **Authenticated** — the window has a proxy, so the hooks call
