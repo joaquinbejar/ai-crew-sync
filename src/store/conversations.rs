@@ -468,6 +468,41 @@ pub async fn access(pool: &PgPool, auth: &AuthCtx, conversation: Uuid) -> BusRes
     })
 }
 
+/// Re-read the caller's project grant for `conversation` **inside** `tx`,
+/// share-locked. Every mutation of a project thread admits its caller with
+/// `access()` before its transaction opens; a revocation that commits in
+/// between would otherwise let the revoked caller write once more. Locked
+/// here, a revocation that committed first is seen, and one in flight waits
+/// for this transaction to land or be refused (`set_project_access` deletes
+/// the row, which waits on the share lock). Not a project thread: open.
+async fn require_project_open(
+    tx: &mut sqlx::PgConnection,
+    auth: &AuthCtx,
+    conversation: Uuid,
+) -> BusResult<()> {
+    let open: Option<(bool,)> = sqlx::query_as(
+        "SELECT c.visibility <> 'project'
+                OR EXISTS (SELECT 1 FROM project_agent_access a
+                            WHERE a.project_id = c.project_id AND a.agent_id = $2
+                            FOR SHARE)
+           FROM conversations c WHERE c.id = $1 AND c.team_id = $3",
+    )
+    .bind(conversation)
+    .bind(auth.agent_id)
+    .bind(auth.team_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match open {
+        Some((true,)) => Ok(()),
+        Some((false,)) => Err(BusError::Forbidden(
+            "your access to this project has been revoked, so this conversation is closed to \
+             you. Nothing was written; ask someone with access to grant it again."
+                .to_owned(),
+        )),
+        None => Err(BusError::not_found("no such conversation")),
+    }
+}
+
 /// Resolve and require read access in one step.
 /// What a retry is compared against. The body is staged in this row only
 /// until its backend confirms it; the digest stays.
@@ -576,6 +611,26 @@ pub async fn create_conversation(
 
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
+    // The creator's grant, re-read and share-locked here: a project thread
+    // is not opened by someone whose access was revoked while this request
+    // was on its way.
+    if let Some(project_id) = project_id {
+        let granted: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT project_id FROM project_agent_access
+              WHERE project_id = $1 AND agent_id = $2 FOR SHARE",
+        )
+        .bind(project_id)
+        .bind(auth.agent_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if granted.is_none() {
+            return Err(BusError::Forbidden(
+                "your access to this project has been revoked, so you cannot open a thread in \
+                 it. Nothing was written."
+                    .to_owned(),
+            ));
+        }
+    }
     // The backend is the team's current routing, captured at creation: a
     // thread never changes backend once it holds messages, because half a
     // history in each place is the one shape nobody can read.
@@ -790,6 +845,7 @@ pub async fn archive_conversation(
     }
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
+    require_project_open(&mut tx, auth, id).await?;
     sqlx::query(
         "UPDATE conversations SET archived_at = now() WHERE id = $1 AND archived_at IS NULL",
     )
@@ -858,6 +914,7 @@ pub async fn invite(
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
+    require_project_open(&mut tx, auth, id).await?;
     // The inviter's own seat, re-read under lock. `readable` answered before
     // this transaction: a removal that commits in between would leave a
     // moderator who can no longer read anything still inviting, with a
@@ -1012,32 +1069,8 @@ pub async fn join(pool: &PgPool, auth: &AuthCtx, id: Uuid) -> BusResult<Conversa
     crate::store::sessions::guard(&mut tx, auth).await?;
     // A project thread's invitation is only worth accepting while the
     // project is still granted, decided inside this transaction with the
-    // grant row share-locked: a revocation that commits first is seen, and
-    // one that is in flight waits for this accept to land or be refused,
-    // so no seat is taken behind a revocation.
-    let project_gate: Option<(bool,)> = sqlx::query_as(
-        "SELECT c.visibility <> 'project'
-                OR EXISTS (SELECT 1 FROM project_agent_access a
-                            WHERE a.project_id = c.project_id AND a.agent_id = $2
-                            FOR SHARE)
-           FROM conversations c WHERE c.id = $1 AND c.team_id = $3",
-    )
-    .bind(id)
-    .bind(auth.agent_id)
-    .bind(auth.team_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    match project_gate {
-        Some((true,)) => {}
-        Some((false,)) => {
-            return Err(BusError::Forbidden(
-                "your access to this project has been revoked, so this invitation cannot be \
-                 accepted. Ask someone with access to grant it again first."
-                    .to_owned(),
-            ));
-        }
-        None => return Err(BusError::not_found("no such conversation")),
-    }
+    // grant row share-locked, so no seat is taken behind a revocation.
+    require_project_open(&mut tx, auth, id).await?;
     let updated: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE conversation_memberships
             SET state = 'active', accepted_at = now(), session_id = $4
@@ -1148,6 +1181,7 @@ pub async fn remove_member(
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    require_project_open(&mut tx, auth, id).await?;
     let caller: Option<(String, String)> = sqlx::query_as(
         "SELECT role, state FROM conversation_memberships
           WHERE conversation_id = $1 AND agent_id = $2 AND session = $3
@@ -1282,6 +1316,9 @@ pub async fn send(
              nothing you have sent was lost."
         )));
     }
+    // The sender's project grant as it is *now*, locked, for the same
+    // reason as the membership below.
+    require_project_open(&mut tx, auth, id).await?;
     // Membership as it is *now*. It was checked before this transaction
     // opened, and a removal that committed in between must take effect on
     // this call rather than the next one.
@@ -1411,9 +1448,14 @@ pub async fn send(
           WHERE m.conversation_id = $2
             AND m.state = 'active'
             AND NOT (m.agent_id = $3 AND m.session = $4)
+            -- Share-locked: a revocation in flight waits for this message
+            -- to commit (and the recipient is owed it), or committed first
+            -- and the recipient is not listed. Never a snapshot that
+            -- becomes an obligation after the grant is gone.
             AND (c.visibility <> 'project' OR EXISTS (
                     SELECT 1 FROM project_agent_access a
-                     WHERE a.project_id = c.project_id AND a.agent_id = m.agent_id))",
+                     WHERE a.project_id = c.project_id AND a.agent_id = m.agent_id
+                     FOR SHARE))",
     )
     .bind(message_id)
     .bind(id)
@@ -2079,6 +2121,7 @@ pub async fn ack(
 
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
+    require_project_open(&mut tx, auth, conversation_id).await?;
     // Only a recipient has a receipt row. Someone who joined after the
     // message was sent was not asked, and saying they acknowledged it would
     // put them in a denominator they were never in.
@@ -2224,6 +2267,10 @@ pub async fn activity(pool: &PgPool, auth: &AuthCtx) -> BusResult<Vec<Conversati
            JOIN conversation_memberships m
                 ON m.conversation_id = c.id AND m.agent_id = $2 AND m.session = $3
           WHERE c.team_id = $1 AND c.archived_at IS NULL AND m.state = 'active'
+            -- A project thread wakes nobody whose grant is gone.
+            AND (c.visibility <> 'project' OR EXISTS (
+                    SELECT 1 FROM project_agent_access a
+                     WHERE a.project_id = c.project_id AND a.agent_id = m.agent_id))
           ORDER BY c.last_seq DESC",
     )
     .bind(auth.team_id)
@@ -2297,6 +2344,7 @@ pub async fn transfer_membership(
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    require_project_open(&mut tx, auth, id).await?;
     // The source seat is re-read and locked here: it was active when the
     // request arrived, and leaving or being removed in between must stop
     // the transfer rather than hand over a seat that no longer exists.
