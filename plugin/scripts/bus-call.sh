@@ -20,7 +20,11 @@
 #      installed.
 set -eu
 TOOL="$1"
-ARGS="${2:-{\}}"
+# A plain assignment, not a default inside a parameter expansion: macOS's
+# /bin/sh keeps the backslash that escapes the closing brace there, and
+# `{\}` is not JSON. An omitted or empty second argument is an empty object.
+ARGS="${2:-}"
+[ -n "$ARGS" ] || ARGS='{}'
 
 # ---------------------------------------------------------------- mode 1 --
 if [ -z "${BUS_TOKEN:-}" ] && command -v ai-crew-sync >/dev/null 2>&1; then

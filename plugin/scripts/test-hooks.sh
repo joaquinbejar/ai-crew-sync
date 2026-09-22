@@ -402,6 +402,43 @@ out="$(PATH="$WORK/fakebin:$PATH" BUS_TOKEN=acs_legacy BUS_URL=http://127.0.0.1:
 out="$(env -u BUS_TOKEN -u BUS_URL PATH="$WORK/empty"     sh "$WORK/bin/real-bus-call.sh" whoami 2>/dev/null || true)"
 [ -z "$out" ] && ok "no binary and no token means no call"     || bad "unconfigured bus-call" "$out"
 
+# --- omitted arguments are an empty object, on every sh ------------------------
+# The real bus-call.sh, with the recording curl on the PATH: the JSON it sends
+# for `whoami` with no arguments, an empty argument and an explicit object
+# must parse, and must carry an empty object.
+mkdir -p "$WORK/argbin"
+cat > "$WORK/argbin/curl" <<'FAKE'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+    if [ "$1" = "--data" ]; then printf '%s' "$2" > "$SENT"; fi
+    shift
+done
+FAKE
+chmod +x "$WORK/argbin/curl"
+export SENT="$WORK/sent.json"
+for variant in omitted empty explicit; do
+    : > "$SENT"
+    case "$variant" in
+        omitted)  (PATH="$WORK/argbin:$PATH" BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_x sh "$ROOT/bus-call.sh" whoami) >/dev/null 2>&1 || true ;;
+        empty)    (PATH="$WORK/argbin:$PATH" BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_x sh "$ROOT/bus-call.sh" whoami "") >/dev/null 2>&1 || true ;;
+        explicit) (PATH="$WORK/argbin:$PATH" BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_x sh "$ROOT/bus-call.sh" whoami '{}') >/dev/null 2>&1 || true ;;
+    esac
+    SENT="$SENT" python3 -c '
+import json, os
+body = json.load(open(os.environ["SENT"]))
+assert body["params"]["name"] == "whoami", body
+assert body["params"]["arguments"] == {}, body
+' 2>/dev/null && ok "bus-call sends an empty object for $variant arguments" \
+        || bad "bus-call arguments ($variant)" "$(cat "$SENT")"
+done
+# The binary mode passes the same empty object on to the client.
+: > "$CALLS"
+out="$(env -u BUS_TOKEN -u BUS_URL PATH="$WORK/fakebin:$PATH" sh "$WORK/bin/real-bus-call.sh" whoami 2>/dev/null)"
+case "$(cat "$CALLS")" in
+    *"call whoami --args {}"*) ok "binary mode passes an empty object for omitted arguments" ;;
+    *) bad "binary mode arguments" "$(cat "$CALLS")" ;;
+esac
+
 # --- lifecycle hooks after a binding lost its credential ---------------------
 # The binary answers `context hook --event status` from an env var so each
 # binding state can be replayed; every other invocation is recorded. A curl
