@@ -407,6 +407,13 @@ out="$(env -u BUS_TOKEN -u BUS_URL PATH="$WORK/empty"     sh "$WORK/bin/real-bus
 # binding state can be replayed; every other invocation is recorded. A curl
 # on the PATH records too, so a legacy request cannot hide behind the fake
 # bus-call.sh: with the real bus-call.sh both would show.
+# The drain tests above replaced the recording bus-call.sh with one that
+# answers; put the recorder back, or a legacy request would leave no trace.
+cat > "$WORK/bin/bus-call.sh" <<'FAKE'
+#!/bin/sh
+printf '%s\t%s\n' "$1" "${2:-{\}}" >> "$CAPTURE"
+FAKE
+chmod +x "$WORK/bin/bus-call.sh"
 mkdir -p "$WORK/statebin"
 cat > "$WORK/statebin/ai-crew-sync" <<'FAKE'
 #!/bin/sh
