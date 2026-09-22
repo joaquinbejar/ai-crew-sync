@@ -12796,7 +12796,7 @@ async fn audit_stop_drain_reads_the_bound_window_whatever_the_environment_says()
 /// between candidate selection and the per-conversation read leaves the
 /// project thread out and the private thread in, with no error (#167).
 #[tokio::test]
-async fn audit_listing_skips_a_seat_revoked_after_candidate_selection() {
+async fn audit_listing_skips_a_grant_revoked_after_candidate_selection() {
     use ai_crew_sync::store::conversations as convo_store;
     let h = require_db!("t_listing_race");
     let alice_token = seed_agent(&h.pool, "acme", "alice").await;
