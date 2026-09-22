@@ -340,12 +340,22 @@ pub struct Membership {
 }
 
 impl Access {
+    /// A project thread is open to a caller only while the caller has the
+    /// project. A seat in it is not a second door: the grant governs the
+    /// project, revoking it is promised to take effect at once, including
+    /// for threads being read, and an active membership that outlived the
+    /// grant used to read on regardless.
+    fn project_open(&self) -> bool {
+        self.visibility != "project" || self.by_project
+    }
+
     pub fn can_read(&self) -> bool {
-        self.by_project
-            || matches!(
-                self.membership.as_ref().map(|m| m.state.as_str()),
-                Some("active") | Some("invited")
-            )
+        self.project_open()
+            && (self.by_project
+                || matches!(
+                    self.membership.as_ref().map(|m| m.state.as_str()),
+                    Some("active") | Some("invited")
+                ))
     }
     /// Reading the thread's *contents*, which an invitation does not grant.
     ///
@@ -355,38 +365,42 @@ impl Access {
     /// private thread without ever joining it, which is the opposite of
     /// what "a thread cannot conscript a window" means.
     pub fn can_read_messages(&self) -> bool {
-        self.by_project
-            || matches!(
-                self.membership.as_ref().map(|m| m.state.as_str()),
-                Some("active")
-            )
+        self.project_open()
+            && (self.by_project
+                || matches!(
+                    self.membership.as_ref().map(|m| m.state.as_str()),
+                    Some("active")
+                ))
     }
     /// Observers read and acknowledge; they do not write.
     pub fn can_send(&self) -> bool {
-        matches!(
-            self.membership
-                .as_ref()
-                .map(|m| (m.state.as_str(), m.role.as_str())),
-            Some(("active", "owner"))
-                | Some(("active", "moderator"))
-                | Some(("active", "participant"))
-        )
+        self.project_open()
+            && matches!(
+                self.membership
+                    .as_ref()
+                    .map(|m| (m.state.as_str(), m.role.as_str())),
+                Some(("active", "owner"))
+                    | Some(("active", "moderator"))
+                    | Some(("active", "participant"))
+            )
     }
     pub fn can_moderate(&self) -> bool {
-        matches!(
-            self.membership
-                .as_ref()
-                .map(|m| (m.state.as_str(), m.role.as_str())),
-            Some(("active", "owner")) | Some(("active", "moderator"))
-        )
+        self.project_open()
+            && matches!(
+                self.membership
+                    .as_ref()
+                    .map(|m| (m.state.as_str(), m.role.as_str())),
+                Some(("active", "owner")) | Some(("active", "moderator"))
+            )
     }
     pub fn is_owner(&self) -> bool {
-        matches!(
-            self.membership
-                .as_ref()
-                .map(|m| (m.state.as_str(), m.role.as_str())),
-            Some(("active", "owner"))
-        )
+        self.project_open()
+            && matches!(
+                self.membership
+                    .as_ref()
+                    .map(|m| (m.state.as_str(), m.role.as_str())),
+                Some(("active", "owner"))
+            )
     }
 }
 
@@ -994,6 +1008,17 @@ pub async fn join(pool: &PgPool, auth: &AuthCtx, id: Uuid) -> BusResult<Conversa
     // acknowledge as it — without the audit trail that the documented
     // recovery path carries.
     crate::store::sessions::require_window(pool, auth).await?;
+    // A project thread's invitation is only worth accepting while the
+    // project is still granted; accepting it afterwards would seat someone
+    // the grant no longer covers.
+    let before = access(pool, auth, id).await?;
+    if before.visibility == "project" && !before.by_project {
+        return Err(BusError::Forbidden(
+            "your access to this project has been revoked, so this invitation cannot be \
+             accepted. Ask someone with access to grant it again first."
+                .to_owned(),
+        ));
+    }
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
     let updated: Option<(Uuid,)> = sqlx::query_as(
@@ -1356,14 +1381,22 @@ pub async fn send(
     .await?;
 
     // The snapshot: who this message was addressed to, as of now. Everyone
-    // active except the sender — a sender does not acknowledge itself.
+    // active except the sender — a sender does not acknowledge itself — and,
+    // in a project thread, only those who still have the project: a seat
+    // whose grant was revoked gets no new obligation, in the same
+    // transaction that stores the message, so a revocation that committed
+    // first is honoured and one that commits later finds nothing to undo.
     sqlx::query(
         "INSERT INTO message_recipients (message_id, membership_id, agent_id, session)
          SELECT $1, m.id, m.agent_id, m.session
            FROM conversation_memberships m
+           JOIN conversations c ON c.id = m.conversation_id
           WHERE m.conversation_id = $2
             AND m.state = 'active'
-            AND NOT (m.agent_id = $3 AND m.session = $4)",
+            AND NOT (m.agent_id = $3 AND m.session = $4)
+            AND (c.visibility <> 'project' OR EXISTS (
+                    SELECT 1 FROM project_agent_access a
+                     WHERE a.project_id = c.project_id AND a.agent_id = m.agent_id))",
     )
     .bind(message_id)
     .bind(id)

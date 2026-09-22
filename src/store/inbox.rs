@@ -448,9 +448,15 @@ async fn reconcile_from_postgres(
                FROM message_receipts r
                JOIN conversation_memberships cm ON cm.id = r.membership_id
                JOIN conversation_messages m ON m.id = r.message_id
+               JOIN conversations c ON c.id = m.conversation_id
                JOIN agents ag ON ag.id = m.sender_agent
               WHERE cm.agent_id = $1 AND cm.session = $2 AND cm.state = 'active'
                 AND r.delivered_at IS NULL
+                -- A project thread hands nothing to a seat whose grant is
+                -- gone, whatever the receipt said when it was written.
+                AND (c.visibility <> 'project' OR EXISTS (
+                        SELECT 1 FROM project_agent_access a
+                         WHERE a.project_id = c.project_id AND a.agent_id = cm.agent_id))
                 AND m.deleted_at IS NULL
                 AND m.publication_state = 'stored'
                 AND NOT EXISTS (
