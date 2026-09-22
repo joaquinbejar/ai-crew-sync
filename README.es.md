@@ -289,8 +289,14 @@ HTTP con un token dentro: arranca `ai-crew-sync mcp proxy`, un proceso por
 conversación, y ese proceso resuelve una credencial de tus perfiles locales y
 registra la ventana como *sesión autenticada*. Ni la configuración del plugin
 ni tu shell tienen que guardar un token. Quien prefiera el par de siempre
-puede seguir: `mcp proxy` también lee `BUS_URL` y `BUS_TOKEN`, y los usa
-cuando no aplica ningún perfil.
+puede seguir: `mcp proxy` también lee `BUS_URL` y `BUS_TOKEN`. Ojo a la
+precedencia, que es la del resolver y no la del plugin: un `BUS_TOKEN`
+exportado (igual que `--token`) **gana** al perfil del `.acs.toml` del
+repositorio y al perfil por defecto, y junto con `--profile` es un error, no
+una elección silenciosa. Migrar desde una función de shell que exporta el
+token por directorio significa dejar de exportarlo (o retirar la función)
+allí donde deba decidir el perfil; mientras esté exportado, el perfil nunca
+aplica.
 
 El plugin trae todo preconfigurado:
 
