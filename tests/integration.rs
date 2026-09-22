@@ -8030,9 +8030,14 @@ async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
     // The temporary local copy is released, and history then reads from the
     // broker by locator.
     assert_eq!(
-        outbox::release_published_bodies(&h.pool, Some(cuuid), 0)
-            .await
-            .unwrap(),
+        outbox::release_published_bodies(
+            &h.pool,
+            &ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone()),
+            Some(cuuid),
+            0
+        )
+        .await
+        .unwrap(),
         1
     );
     let (local,): (String,) =
@@ -8115,9 +8120,14 @@ async fn opted_in_conversations_publish_to_jetstream_and_read_back() {
             .unwrap(),
         outbox::Settled::Stored
     );
-    outbox::release_published_bodies(&h.pool, Some(cuuid), 0)
-        .await
-        .unwrap();
+    outbox::release_published_bodies(
+        &h.pool,
+        &ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone()),
+        Some(cuuid),
+        0,
+    )
+    .await
+    .unwrap();
     let history = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
     let bodies: Vec<&str> = history["messages"]
         .as_array()
@@ -8756,9 +8766,14 @@ async fn a_conversation_moves_between_backends_and_back_without_losing_anything(
     // bodies the outbox staged; a migration source copy is the rollback,
     // and only `conversations cleanup` may drop it.
     assert_eq!(
-        outbox::release_published_bodies(&h.pool, None, 0)
-            .await
-            .unwrap(),
+        outbox::release_published_bodies(
+            &h.pool,
+            &ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone()),
+            None,
+            0
+        )
+        .await
+        .unwrap(),
         0,
         "the five minute sweep must not eat the rollback source"
     );
@@ -8824,9 +8839,14 @@ async fn a_conversation_moves_between_backends_and_back_without_losing_anything(
 
     // An interrupted run resumes instead of copying twice. Half the
     // evidence is thrown away and the same move is run again.
-    outbox::release_published_bodies(&h.pool, Some(cuuid), 0)
-        .await
-        .unwrap();
+    outbox::release_published_bodies(
+        &h.pool,
+        &ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone()),
+        Some(cuuid),
+        0,
+    )
+    .await
+    .unwrap();
     let back = migrate::run(&h.pool, &jetstream, team, cuuid, Direction::ToPostgres)
         .await
         .unwrap();
@@ -9132,9 +9152,14 @@ async fn a_broker_that_is_gone_does_not_take_the_thread_with_it() {
         outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
         Some(outbox::Settled::Stored)
     );
-    outbox::release_published_bodies(&h.pool, Some(cid.parse().unwrap()), 0)
-        .await
-        .unwrap();
+    outbox::release_published_bodies(
+        &h.pool,
+        &ai_crew_sync::store::routing::Backends::with_jetstream(h.pool.clone(), config.clone()),
+        Some(cid.parse().unwrap()),
+        0,
+    )
+    .await
+    .unwrap();
 
     // The broker loses everything. Not retention, not a tombstone: gone.
     JetStreamBackend::deprovision(&config, team).await.unwrap();
@@ -13093,6 +13118,153 @@ async fn audit_receipt_event_redelivery_after_resume_on_the_postgres_path() {
     h.shutdown().await;
 }
 
+/// The body sweep must not drop the only readable copy of a body while its
+/// backend cannot confirm it still holds it. Postgres is the last copy
+/// during a broker outage and after the broker lost its stream; releasing
+/// it there turns a recoverable outage into an unreadable thread, and a
+/// lost stream into permanent loss. A healthy broker still releases, and
+/// releasing resumes by itself once the broker is back (#170).
+#[tokio::test]
+async fn the_sweep_keeps_a_body_its_backend_cannot_confirm() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+    use ai_crew_sync::store::routing::Backends;
+
+    let h = require_db_broker!("t_sweep_guard");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    let healthy = Backends::with_jetstream(h.pool.clone(), config.clone());
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "on the broker", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let cuuid: Uuid = cid.parse().unwrap();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    let send = |body: &'static str| {
+        let owner = &owner;
+        let cid = cid.clone();
+        async move {
+            call(
+                owner,
+                "send_conversation_message",
+                json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+            )
+            .await["message_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let local_body = |mid: String| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT body FROM conversation_messages WHERE id = $1")
+                .bind(mid.parse::<Uuid>().unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. The broker is unreachable (a process that is down): nothing is
+    //    released, whatever the flags say.
+    let first = send("keep me").await;
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+    let unreachable = Backends::with_jetstream(
+        h.pool.clone(),
+        Config::new("nats://127.0.0.1:1").with_limits(1_000, 16 * 1024 * 1024),
+    );
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, &unreachable, Some(cuuid), 0)
+            .await
+            .unwrap(),
+        0,
+        "the sweep released a body while the broker was unreachable"
+    );
+    assert_eq!(local_body(first.clone()).await, "keep me");
+
+    // 2. The broker is back: the same body is confirmed and released, with
+    //    no operator action in between, and history reads it by locator.
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, &healthy, Some(cuuid), 0)
+            .await
+            .unwrap(),
+        1,
+        "a healthy broker still releases"
+    );
+    assert_eq!(local_body(first.clone()).await, "");
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(page["messages"][0]["body"], "keep me", "{page}");
+
+    // 3. The broker loses the stream BEFORE the sweep runs on a second
+    //    body. Postgres still holds it: that copy is now the only one there
+    //    is, and the sweep leaves it alone.
+    let second = send("and me").await;
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, &healthy, Some(cuuid), 0)
+            .await
+            .unwrap(),
+        0,
+        "the sweep released a body while its backend could not confirm holding it"
+    );
+    assert_eq!(
+        local_body(second.clone()).await,
+        "and me",
+        "the last readable copy of the body was destroyed by the bus itself"
+    );
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    assert_eq!(page["messages"][1]["body"], "and me", "{page}");
+    // The body released while healthy and then lost still reads as
+    // unavailable, with its receipts intact: this path is unchanged.
+    assert_eq!(page["messages"][0]["body"], "");
+    assert_eq!(page["messages"][0]["publication"], "stored");
+    assert!(page["messages"][0]["unavailable"].is_string(), "{page}");
+    let receipts = call(&owner, "get_message_receipts", json!({"message_id": first})).await;
+    assert_eq!(receipts["total"], 1, "{receipts}");
+
+    // 4. A stream re-created empty (a restore older than the publication)
+    //    answers, but not with this body: still kept.
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, &healthy, Some(cuuid), 0)
+            .await
+            .unwrap(),
+        0,
+        "a stream that does not hold the body confirms nothing"
+    );
+    assert_eq!(local_body(second).await, "and me");
+
+    // The fixture broker is shared: give the re-created stream back.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
 /// Small teams fit on a small broker: three teams provisioned with explicit
 /// quotas on the fixture's 512 MiB store, each stream carrying exactly the
 /// limits asked for, and a quota the store cannot reserve refused with the
@@ -13392,5 +13564,200 @@ async fn existing_quotas_are_kept_unless_updated_explicitly() {
         let _ = c.cancel().await;
     }
     JetStreamBackend::deprovision(&config, team).await.unwrap();
+    h.shutdown().await;
+}
+
+/// A body the backend cannot confirm holds up nothing else: the pass steps
+/// over it and releases what comes after, and a team whose stream is gone
+/// does not keep another team's bodies staged. A migration in flight is
+/// left alone entirely (#170).
+#[tokio::test]
+async fn an_unconfirmable_body_does_not_hold_up_the_sweep() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+    use ai_crew_sync::store::routing::Backends;
+
+    let h = require_db_broker!("t_sweep_fairness");
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    let backends = Backends::with_jetstream(h.pool.clone(), config.clone());
+    let local_body = |mid: String| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT body FROM conversation_messages WHERE id = $1")
+                .bind(mid.parse::<Uuid>().unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // Two teams, both routed to the broker, each with its own stream.
+    let mut sent = Vec::new();
+    let mut clients = Vec::new();
+    for slug in ["alpha", "beta"] {
+        let token = seed_agent(&h.pool, slug, "joaquin").await;
+        enable_conversations(&h.pool, slug).await;
+        let team = team_id(&h.pool, slug).await;
+        sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+            .bind(team)
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        JetStreamBackend::provision(&config, team).await.unwrap();
+        let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+        let client = connect_with_session(&h.base, &token, "impl").await;
+        let cid = call(
+            &client,
+            "create_conversation",
+            json!({"title": slug, "private": true}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // Two bodies per team, oldest first.
+        let mut ids = Vec::new();
+        for body in ["first", "second"] {
+            let mid = call(
+                &client,
+                "send_conversation_message",
+                json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+            )
+            .await["message_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+                Some(outbox::Settled::Stored)
+            );
+            ids.push(mid);
+        }
+        sent.push((slug, team, cid, ids));
+        clients.push(client);
+    }
+
+    // Alpha's oldest body can never be confirmed: the digest recorded for
+    // it does not match what the broker holds. It must not keep alpha's
+    // newer body staged behind it.
+    let (_, alpha_team, _, alpha_ids) = &sent[0];
+    sqlx::query("UPDATE conversation_messages SET body_sha256 = $2 WHERE id = $1")
+        .bind(alpha_ids[0].parse::<Uuid>().unwrap())
+        .bind("0".repeat(64))
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    // And beta's stream is gone entirely: its bodies stay, and that must
+    // not stop alpha's from being released. Beta's messages are backdated
+    // so the broken backend is the one this pass meets FIRST: a sweep that
+    // gave up on the first failure would never reach alpha.
+    let (_, beta_team, _, beta_ids) = &sent[1];
+    for id in beta_ids {
+        sqlx::query(
+            "UPDATE conversation_messages SET created_at = now() - interval '1 day' WHERE id = $1",
+        )
+        .bind(id.parse::<Uuid>().unwrap())
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+    JetStreamBackend::deprovision(&config, *beta_team)
+        .await
+        .unwrap();
+
+    let released = outbox::release_published_bodies(&h.pool, &backends, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(released, 1, "exactly alpha's confirmable body");
+    assert_eq!(
+        local_body(alpha_ids[0].clone()).await,
+        "first",
+        "a body whose digest does not match stays"
+    );
+    assert_eq!(
+        local_body(alpha_ids[1].clone()).await,
+        "",
+        "the body behind it was released in the same pass"
+    );
+    for id in beta_ids {
+        assert!(
+            !local_body(id.clone()).await.is_empty(),
+            "beta's stream is gone; its bodies stay"
+        );
+    }
+
+    // A message a migration is working on is not a candidate at all: the
+    // move writes the body back into the row before its cutover.
+    let (_, _, gamma_cid, gamma_ids) = {
+        let token = seed_agent(&h.pool, "gamma", "joaquin").await;
+        enable_conversations(&h.pool, "gamma").await;
+        let team = team_id(&h.pool, "gamma").await;
+        sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+            .bind(team)
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        JetStreamBackend::provision(&config, team).await.unwrap();
+        let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+        let client = connect_with_session(&h.base, &token, "impl").await;
+        let cid = call(
+            &client,
+            "create_conversation",
+            json!({"title": "moving", "private": true}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mid = call(
+            &client,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "mid move", "request_id": request_id()}),
+        )
+        .await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+            Some(outbox::Settled::Stored)
+        );
+        clients.push(client);
+        ("gamma", team, cid, vec![mid])
+    };
+    let migration: Uuid = sqlx::query_scalar(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ((SELECT team_id FROM conversations WHERE id = $1), $1, 'to_postgres', 'copying')
+         RETURNING id",
+    )
+    .bind(gamma_cid.parse::<Uuid>().unwrap())
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_migration_items (migration_id, message_id, checksum, bytes)
+         VALUES ($1, $2, 'x', 8)",
+    )
+    .bind(migration)
+    .bind(gamma_ids[0].parse::<Uuid>().unwrap())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        outbox::release_published_bodies(&h.pool, &backends, Some(gamma_cid.parse().unwrap()), 0)
+            .await
+            .unwrap(),
+        0,
+        "a body a migration is copying back must not be cleared"
+    );
+    assert_eq!(local_body(gamma_ids[0].clone()).await, "mid move");
+
+    for team in [*alpha_team, *beta_team] {
+        let _ = JetStreamBackend::deprovision(&config, team).await;
+    }
+    let _ = JetStreamBackend::deprovision(&config, team_id(&h.pool, "gamma").await).await;
+    for c in clients {
+        let _ = c.cancel().await;
+    }
     h.shutdown().await;
 }

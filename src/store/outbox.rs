@@ -594,43 +594,186 @@ pub async fn resolve_uncertain<B: MessagingBackend>(
     Ok(resolved)
 }
 
-/// Drop the temporary body once its backend holds it. Until this runs, the
-/// body lives in both places on purpose: losing it to a failed publish would
-/// be worse than storing it twice for a moment.
+/// How many bodies one sweep pass clears at most. Bounded so a large
+/// backlog costs a bounded amount of work per minute.
+pub const RELEASE_BATCH: usize = 200;
+/// How many candidates one pass examines at most, which is also the
+/// ceiling on broker reads per pass. Higher than [`RELEASE_BATCH`] so a run
+/// of bodies the backend cannot confirm is stepped over within the pass
+/// instead of holding the front of the queue for ever.
+pub const SCAN_LIMIT: usize = 1_000;
+/// Candidates read from Postgres at a time while scanning.
+const PAGE: i64 = 200;
+
+/// Drop the temporary body once its backend **confirms** it holds it. Until
+/// this runs, the body lives in both places on purpose: losing it to a
+/// failed publish would be worse than storing it twice for a moment.
+///
+/// The confirmation is read at sweep time, never from the flags written at
+/// publish time: the canonical locator must resolve on the backend now and
+/// the body it returns must hash to what was published. A broker that is
+/// unreachable, or one that lost or re-created the stream, confirms
+/// nothing, and the local copy stays, since it is then the last readable
+/// one. Releasing resumes by itself when the broker is back; no operator
+/// action is involved.
 ///
 /// Only touches messages whose backend is not Postgres — there, the row *is*
-/// the storage, and clearing it would delete the history.
+/// the storage, and clearing it would delete the history — and never a
+/// message any migration is touching: a move to Postgres writes the body
+/// back into the row before its cutover, and clearing that copy would make
+/// an empty row authoritative.
 /// `conversation` narrows it to one thread; `None` sweeps everything the
 /// installation holds. `min_age_secs` is the grace period: a reader that
 /// arrives right after the PubAck still gets the local copy rather than a
 /// round trip to the broker.
 pub async fn release_published_bodies(
     pool: &PgPool,
+    backends: &crate::store::routing::Backends,
     conversation: Option<Uuid>,
     min_age_secs: i64,
 ) -> BusResult<u64> {
+    // The cheap question first. Without a reachable broker nothing can be
+    // confirmed, and the answer would be "keep everything" row by row.
+    match backends.broker_reachable().await {
+        Some(true) => {}
+        Some(false) => {
+            tracing::debug!("the broker is unreachable; no published body is released");
+            return Ok(0);
+        }
+        None => {
+            // No broker configured on this replica. Bodies on a broker exist
+            // only if one was configured once; whether it comes back is
+            // not this process's to decide, so nothing is released.
+            return Ok(0);
+        }
+    }
+
+    // Scanned oldest first, with a cursor, so a body the backend cannot
+    // confirm is stepped over within this pass rather than being re-read at
+    // the front of every pass while newer bodies wait behind it.
+    let mut cursor: Option<(chrono::DateTime<chrono::Utc>, Uuid)> = None;
+    let mut examined = 0usize;
+    let mut confirmed: Vec<Uuid> = Vec::new();
+    // A backend that fails belongs to one team. Other teams' bodies are
+    // still confirmable, so only this one is skipped for the rest of the
+    // pass, and it is retried on the next one.
+    let mut unusable: std::collections::HashSet<(String, Uuid)> = std::collections::HashSet::new();
+
+    'scan: while examined < SCAN_LIMIT && confirmed.len() < RELEASE_BATCH {
+        #[allow(clippy::type_complexity)]
+        let page: Vec<(
+            Uuid,
+            Uuid,
+            String,
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+        )> = sqlx::query_as(
+            "SELECT m.id, c.team_id, c.backend, m.canonical_locator, m.body_sha256, m.created_at
+               FROM conversation_messages m
+               JOIN conversations c ON c.id = m.conversation_id
+              WHERE ($1::uuid IS NULL OR m.conversation_id = $1)
+                AND c.backend <> 'postgres'
+                AND m.publication_state = 'stored'
+                AND m.canonical_locator IS NOT NULL
+                AND m.body <> ''
+                -- Without a recorded digest there is nothing to confirm
+                -- against, so such a row is not a candidate at all. Left
+                -- eligible it would sit at the front of this ordering for
+                -- ever and starve everything behind it.
+                AND m.body_sha256 IS NOT NULL
+                AND m.created_at <= now() - make_interval(secs => $2)
+                AND ($4::timestamptz IS NULL OR (m.created_at, m.id) > ($4, $5))
+                -- Never a body a migration is touching. A move to Postgres
+                -- writes the body back into this row before its cutover,
+                -- and the copy a finished move left is the rollback source,
+                -- released by `conversations cleanup` with the window an
+                -- operator states, not by a sweep five minutes later.
+                AND NOT EXISTS (
+                    SELECT 1 FROM conversation_migration_items i
+                      JOIN conversation_migrations g ON g.id = i.migration_id
+                     WHERE i.message_id = m.id
+                       AND g.state IN ('planned', 'copying', 'verified', 'cut_over'))
+              ORDER BY m.created_at, m.id
+              LIMIT $3",
+        )
+        .bind(conversation)
+        .bind(min_age_secs as f64)
+        .bind(PAGE)
+        .bind(cursor.map(|c| c.0))
+        .bind(cursor.map(|c| c.1))
+        .fetch_all(pool)
+        .await?;
+        if page.is_empty() {
+            break;
+        }
+        for (message_id, team_id, backend_name, locator, digest, created_at) in page {
+            cursor = Some((created_at, message_id));
+            examined += 1;
+            if unusable.contains(&(backend_name.clone(), team_id)) {
+                continue;
+            }
+            let backend = match backends.for_message(&backend_name, team_id).await {
+                Ok(backend) => backend,
+                Err(e) => {
+                    tracing::debug!(error = %e, %team_id, "this backend cannot be opened; its bodies stay");
+                    unusable.insert((backend_name, team_id));
+                    continue;
+                }
+            };
+            match backend
+                .fetch(&crate::store::backend::Locator(locator), message_id)
+                .await
+            {
+                Ok(Some(body)) if crate::store::conversations::body_digest(&body) == digest => {
+                    confirmed.push(message_id);
+                }
+                Ok(Some(_)) => tracing::warn!(
+                    %message_id,
+                    "the backend holds a different body under this locator; keeping the local copy"
+                ),
+                Ok(None) => tracing::warn!(
+                    %message_id,
+                    "the backend no longer holds this body; keeping the local copy"
+                ),
+                Err(e) => {
+                    // The backend answered with a failure: this body is not
+                    // confirmed, and asking it again in this pass would
+                    // repeat the same failure. Other backends carry on.
+                    tracing::debug!(error = %e, %message_id, "the backend did not answer; its bodies stay");
+                    unusable.insert((backend_name, team_id));
+                }
+            }
+            if confirmed.len() >= RELEASE_BATCH || examined >= SCAN_LIMIT {
+                break 'scan;
+            }
+        }
+    }
+    if confirmed.is_empty() {
+        return Ok(0);
+    }
+
+    // The whole predicate again, at the moment of clearing: a cutover that
+    // committed while this pass was talking to the broker may have made
+    // this row Postgres-authoritative and written the body back into it,
+    // and that copy is the history.
     let done = sqlx::query(
         "UPDATE conversation_messages m
             SET body = ''
            FROM conversations c
-          WHERE ($1::uuid IS NULL OR m.conversation_id = $1)
+          WHERE m.id = ANY($1)
             AND c.id = m.conversation_id
             AND c.backend <> 'postgres'
             AND m.publication_state = 'stored'
             AND m.canonical_locator IS NOT NULL
             AND m.body <> ''
-            AND m.created_at <= now() - make_interval(secs => $2)
-            -- Never a body a supervised move copied. That one is the
-            -- rollback source, and it is released by `conversations
-            -- cleanup` with the window an operator states, not by a sweep
-            -- five minutes later.
             AND NOT EXISTS (
                 SELECT 1 FROM conversation_migration_items i
                   JOIN conversation_migrations g ON g.id = i.migration_id
-                 WHERE i.message_id = m.id AND g.state = 'cut_over')",
+                 WHERE i.message_id = m.id
+                   AND g.state IN ('planned', 'copying', 'verified', 'cut_over'))",
     )
-    .bind(conversation)
-    .bind(min_age_secs as f64)
+    .bind(&confirmed)
     .execute(pool)
     .await?;
     Ok(done.rows_affected())

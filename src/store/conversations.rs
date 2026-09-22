@@ -506,7 +506,7 @@ async fn require_project_open(
 /// Resolve and require read access in one step.
 /// What a retry is compared against. The body is staged in this row only
 /// until its backend confirms it; the digest stays.
-fn body_digest(body: &str) -> String {
+pub fn body_digest(body: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(body.as_bytes()))
 }

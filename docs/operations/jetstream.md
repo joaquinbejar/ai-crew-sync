@@ -341,7 +341,14 @@ purpose.
   lives in the row *and* on the broker until the publication is confirmed
   and the local copy released (five minutes by default). That is deliberate
   — losing a body to a failed publish is worse — and it means WAL, dumps and
-  replication carry those bodies for that window. After a migration, the
+  replication carry those bodies for that window. The release is decided
+  at sweep time, not from the flags written at publish time: the sweep asks
+  the broker for each body by its locator and clears the local copy only
+  when the broker returns the very bytes that were published. A broker that
+  is unreachable, that lost the stream, or that was restored from a snapshot
+  older than the publication confirms nothing, so the Postgres copy stays
+  (it is the last readable one) and the thread keeps reading. Releasing
+  resumes on its own when the broker is back. After a migration, the
   source bodies stay until `conversations cleanup` runs, which is why the
   rollback window has a storage cost.
 - **A pause is a pause.** A supervised move refuses writes on that thread

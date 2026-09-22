@@ -235,6 +235,7 @@ async fn run_outbox_worker(
             next_sweep = now + BODY_SWEEP_INTERVAL;
             match crate::store::outbox::release_published_bodies(
                 &pool,
+                &backends,
                 None,
                 BODY_RELEASE_GRACE_SECS,
             )
