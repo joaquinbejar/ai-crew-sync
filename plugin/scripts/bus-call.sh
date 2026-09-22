@@ -5,7 +5,17 @@
 # whichever path answered. Silently no-ops when nothing is configured, so the
 # plugin never breaks a session that has no bus.
 #
-# Two modes, in this order:
+# Three modes, in this order:
+#
+#   0. Authenticated binding. When BUS_HOST_SESSION names a conversation whose
+#      proxy registered a session, the call goes through
+#      `ai-crew-sync context hook --event call` as THAT window, with the
+#      credential and epoch the proxy recorded, whatever else the environment
+#      holds: an exported BUS_TOKEN would otherwise route a Stop drain to the
+#      shared session's inbox and inject another window's question here. The
+#      credential never passes through this script. A binding whose
+#      credential is gone stays silent, like the lifecycle hooks; a
+#      conversation with no binding at all falls through to the modes below.
 #
 #   1. Local binary + profiles. When `ai-crew-sync` is on the PATH and no
 #      BUS_TOKEN is exported, credentials come from the local profiles and the
@@ -25,6 +35,20 @@ TOOL="$1"
 # `{\}` is not JSON. An omitted or empty second argument is an empty object.
 ARGS="${2:-}"
 [ -n "$ARGS" ] || ARGS='{}'
+
+# ---------------------------------------------------------------- mode 0 --
+if [ -n "${BUS_HOST_SESSION:-}" ] && command -v ai-crew-sync >/dev/null 2>&1; then
+    case "$(ai-crew-sync context hook --binding "$BUS_HOST_SESSION" --event status 2>/dev/null)" in
+        *'"authenticated"'*)
+            OUT="$(ai-crew-sync context hook --binding "$BUS_HOST_SESSION" --event call \
+                --tool "$TOOL" --args "$ARGS" 2>/dev/null || true)"
+            [ -n "$OUT" ] || exit 0
+            printf '{"jsonrpc":"2.0","id":1,"result":{"structuredContent":%s}}\n' "$OUT"
+            exit 0
+            ;;
+        *'"no-credential"'*) exit 0 ;;
+    esac
+fi
 
 # ---------------------------------------------------------------- mode 1 --
 if [ -z "${BUS_TOKEN:-}" ] && command -v ai-crew-sync >/dev/null 2>&1; then

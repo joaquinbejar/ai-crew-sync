@@ -18,7 +18,10 @@
 //!    the window it belongs to.
 //! 3. **Presence only, no reads that move a cursor.** The events here
 //!    publish presence and read context; the Stop drain still runs in the
-//!    shell script, which is where its loop guard lives.
+//!    shell script, which is where its loop guard lives. Its reads go
+//!    through `--event call`, one tool call as the bound window, so an
+//!    exported `BUS_TOKEN`/`BUS_SESSION` can never redirect them to a
+//!    sibling window's inbox.
 
 use std::path::Path;
 
@@ -42,6 +45,10 @@ pub enum Event {
     SessionEnd,
     /// What this binding is, for troubleshooting. Never prints a secret.
     Status,
+    /// One MCP tool call as the bound window (`--tool`, `--args`), printing
+    /// the tool's structured content. Silent, like the presence events,
+    /// when the binding is missing or carries no credential.
+    Call,
 }
 
 impl std::str::FromStr for Event {
@@ -53,9 +60,10 @@ impl std::str::FromStr for Event {
             "stop" => Ok(Self::Stop),
             "session_end" | "sessionend" => Ok(Self::SessionEnd),
             "status" => Ok(Self::Status),
+            "call" => Ok(Self::Call),
             other => bail!(
                 "unknown hook event '{other}'; use session_start, heartbeat, stop, \
-                 session_end or status"
+                 session_end, status or call"
             ),
         }
     }
@@ -273,13 +281,16 @@ async fn session_start_context(binding: &Binding, digest_hours: i64) -> anyhow::
 }
 
 /// Run one hook event. Returns what to print on stdout: the host's JSON for
-/// `session_start`, nothing for the presence events.
+/// `session_start`, the tool's structured content for `call`, nothing for
+/// the presence events. `call` names the tool and its arguments for
+/// `Event::Call` and is ignored by every other event.
 pub async fn run(
     config_dir: &Path,
     binding_id: &str,
     event: Event,
     cwd: &Path,
     digest_hours: i64,
+    call: Option<(String, Value)>,
 ) -> anyhow::Result<Option<String>> {
     let resolved = resolve_binding(config_dir, binding_id);
     if event == Event::Status {
@@ -347,6 +358,13 @@ pub async fn run(
             publish_presence(&binding, cwd, "idle", false, 120).await?;
             Ok(None)
         }
+        Event::Call => {
+            let Some((tool, args)) = call else {
+                bail!("--event call needs --tool <name> and, optionally, --args <json object>");
+            };
+            let value = call_as_window(&binding, &tool, args).await?;
+            Ok(Some(value.to_string()))
+        }
     }
 }
 
@@ -364,6 +382,7 @@ mod tests {
             ("Stop", Event::Stop),
             ("session_end", Event::SessionEnd),
             ("status", Event::Status),
+            ("call", Event::Call),
         ] {
             assert_eq!(raw.parse::<Event>().unwrap(), expected, "{raw}");
         }
@@ -380,7 +399,7 @@ mod tests {
         // Nothing at all: silence, and no attempt to reach any bus.
         for event in [Event::SessionStart, Event::Heartbeat, Event::SessionEnd] {
             assert!(
-                run(&dir, "conv-unknown", event, &cwd, 8)
+                run(&dir, "conv-unknown", event, &cwd, 8, None)
                     .await
                     .unwrap()
                     .is_none(),
@@ -398,7 +417,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            run(&dir, "conv-closed", Event::Heartbeat, &cwd, 8)
+            run(&dir, "conv-closed", Event::Heartbeat, &cwd, 8, None)
                 .await
                 .unwrap()
                 .is_none()
@@ -417,13 +436,13 @@ mod tests {
         )
         .unwrap();
         assert!(
-            run(&dir, "conv-closed-token", Event::Heartbeat, &cwd, 8)
+            run(&dir, "conv-closed-token", Event::Heartbeat, &cwd, 8, None)
                 .await
                 .unwrap()
                 .is_none(),
             "a closed binding must not act, even with a credential on disk"
         );
-        let out = run(&dir, "conv-closed-token", Event::Status, &cwd, 8)
+        let out = run(&dir, "conv-closed-token", Event::Status, &cwd, 8, None)
             .await
             .unwrap()
             .unwrap();
@@ -433,13 +452,26 @@ mod tests {
             "status must not print a secret"
         );
 
+        // A call as the window is just as silent without a usable binding:
+        // it must never reach a bus as a shared identity.
+        for id in ["conv-unknown", "conv-closed", "conv-closed-token"] {
+            let call = Some(("whoami".to_owned(), json!({})));
+            assert!(
+                run(&dir, id, Event::Call, &cwd, 8, call)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "call spoke for {id}"
+            );
+        }
+
         // `status` explains both cases without inventing an identity.
-        let out = run(&dir, "conv-unknown", Event::Status, &cwd, 8)
+        let out = run(&dir, "conv-unknown", Event::Status, &cwd, 8, None)
             .await
             .unwrap()
             .unwrap();
         assert!(out.contains("\"state\": \"missing\""), "{out}");
-        let out = run(&dir, "conv-closed", Event::Status, &cwd, 8)
+        let out = run(&dir, "conv-closed", Event::Status, &cwd, 8, None)
             .await
             .unwrap()
             .unwrap();

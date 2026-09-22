@@ -368,6 +368,10 @@ Los hooks funcionan en dos modos, y eligen por conversación:
   `ai-crew-sync context hook`, que lee el binding privado de esa ventana y
   actúa como esa sesión. La credencial no pasa por ningún script, argumento ni
   variable de entorno. Necesita el binario en el PATH, que el plugin ya exige.
+  Una ventana con binding sigue siéndolo diga lo que diga el entorno: un
+  `BUS_TOKEN`/`BUS_SESSION` exportado no desvía su drenaje de Stop al inbox de
+  otra sesión. Solo una conversación sin binding alguno toma la vía legacy de
+  abajo.
 - **Legacy** — no hay proxy ni binding, pero `BUS_URL`/`BUS_TOKEN` están
   exportados. Los hooks caen a `curl` + `python3` pelados y a la etiqueta
   `X-Crew-Session`, exactamente como antes. No se asume nada más instalado.

@@ -513,6 +513,69 @@ out="$(cd "$REPO_DIR" && printf '{"session_id":"closed-window"}' | env -u BUS_HO
     && ok "the Stop drain reads nothing after no-credential" \
     || bad "stop drain fell back after no-credential" "$out $(cat "$CAPTURE" "$CURLCALLS")"
 
+# --- an authenticated binding beats an exported token --------------------------
+# The stub answers status from STUB_STATE and, for `--event call`, records
+# the call and answers like the binary: the tool's structured content. With
+# BUS_TOKEN and a conflicting BUS_SESSION exported, the real bus-call.sh must
+# still go through the binding's window, and the Stop drain must read that
+# window's inbox. The credential is never on the command line.
+cat > "$WORK/statebin/ai-crew-sync" <<'FAKE'
+#!/bin/sh
+printf 'args=%s\n' "$*" >> "$HOOKCALLS"
+case "$*" in
+    *"--event status"*) echo "{\"binding\":\"$2\",\"state\":\"${STUB_STATE:-missing}\"}" ;;
+    *"--event call"*"--tool whoami"*) echo '{"agent":"bob","team":"acme","session":"s-window"}' ;;
+    *"--event call"*"--tool read_messages"*) echo '{"messages":[]}' ;;
+    *"--event call"*) echo '{}' ;;
+esac
+FAKE
+chmod +x "$WORK/statebin/ai-crew-sync"
+: > "$HOOKCALLS"; : > "$CURLCALLS"
+out="$(STUB_STATE=authenticated PATH="$WORK/statebin:$PATH" BUS_HOST_SESSION=conv-9 \
+    BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_parent BUS_SESSION=legacy-other \
+    sh "$ROOT/bus-call.sh" whoami 2>/dev/null)"
+case "$(cat "$HOOKCALLS")" in
+    *"--binding conv-9 --event call --tool whoami --args {}"*) ok "an authenticated binding beats an exported token" ;;
+    *) bad "binding not preferred" "$(cat "$HOOKCALLS")" ;;
+esac
+grep -q "acs_" "$HOOKCALLS" && bad "a credential reached the binary's command line" "$(cat "$HOOKCALLS")" \
+    || ok "no credential on the command line"
+[ ! -s "$CURLCALLS" ] && ok "no legacy request when the binding is authenticated" || bad "legacy request with a binding" "$(cat "$CURLCALLS")"
+case "$out" in
+    *'"structuredContent"'*'"bob"'*) ok "the binding path answers in the JSON-RPC envelope" ;;
+    *) bad "binding path envelope" "$out" ;;
+esac
+: > "$HOOKCALLS"; : > "$CURLCALLS"
+out="$(STUB_STATE=no-credential PATH="$WORK/statebin:$PATH" BUS_HOST_SESSION=conv-9 \
+    BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_parent BUS_SESSION=legacy-other \
+    sh "$ROOT/bus-call.sh" whoami 2>/dev/null || true)"
+[ -z "$out" ] && [ ! -s "$CURLCALLS" ] && ! grep -q -- "--event call" "$HOOKCALLS" \
+    && ok "a binding that lost its credential calls nothing, token or not" \
+    || bad "no-credential fell back" "$out $(cat "$CURLCALLS" "$HOOKCALLS")"
+: > "$HOOKCALLS"; : > "$CURLCALLS"
+out="$(STUB_STATE=missing PATH="$WORK/statebin:$PATH" BUS_HOST_SESSION=conv-9 \
+    BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_parent BUS_SESSION=legacy-other \
+    sh "$ROOT/bus-call.sh" whoami 2>/dev/null || true)"
+grep -q "^curl" "$CURLCALLS" && ok "a conversation with no binding keeps the legacy path" \
+    || bad "missing binding lost legacy" "$(cat "$CURLCALLS" "$HOOKCALLS")"
+# The Stop drain, end to end through the real bus-call.sh: both reads go
+# through the binding's window and none through the exported session.
+cp "$ROOT/bus-call.sh" "$WORK/bin/bus-call.sh"
+: > "$HOOKCALLS"; : > "$CURLCALLS"
+out="$(cd "$REPO_DIR" && printf '{"session_id":"conv-9"}' | env -u BUS_HOST_SESSION STUB_STATE=authenticated \
+    PATH="$WORK/statebin:$PATH" TMPDIR="$WORK" BUS_URL=http://127.0.0.1:1/mcp BUS_TOKEN=acs_parent \
+    BUS_SESSION=legacy-other sh "$WORK/bin/stop-drain.sh" 2>/dev/null || true)"
+grep -q -- "--event call --tool read_messages" "$HOOKCALLS" && grep -q -- "--event call --tool whoami" "$HOOKCALLS" \
+    && [ ! -s "$CURLCALLS" ] \
+    && ok "the Stop drain reads the binding's inbox, not the exported session's" \
+    || bad "stop drain routing" "$(cat "$HOOKCALLS" "$CURLCALLS")"
+# Put the recorder back for whatever runs after this section.
+cat > "$WORK/bin/bus-call.sh" <<'FAKE'
+#!/bin/sh
+printf '%s\t%s\n' "$1" "${2:-{\}}" >> "$CAPTURE"
+FAKE
+chmod +x "$WORK/bin/bus-call.sh"
+
 # --- every tool the hooks call exists in the served schema ------------------
 # Cheap coupling check: the tool names the scripts use must appear in the
 # server's tool router. Catches a rename before a user's session breaks.

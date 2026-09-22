@@ -5945,6 +5945,19 @@ async fn run_hook(
     payload: &str,
     extra_args: &[&str],
 ) -> String {
+    run_hook_env(script, config_dir, project_dir, payload, extra_args, &[]).await
+}
+
+/// `run_hook` with extra environment, for the cases where what the
+/// operator exported must not win over the window's binding.
+async fn run_hook_env(
+    script: &str,
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    payload: &str,
+    extra_args: &[&str],
+    env: &[(&str, &str)],
+) -> String {
     // The hook talks HTTP to the harness, which runs on this runtime: waiting
     // for the child on this thread deadlocks both. Off to a blocking thread,
     // with a bound so a wedged hook fails the test instead of hanging CI.
@@ -5955,10 +5968,14 @@ async fn run_hook(
         payload.to_owned(),
     );
     let extra: Vec<String> = extra_args.iter().map(|a| (*a).to_owned()).collect();
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
-            run_hook_blocking(&script, &config_dir, &project_dir, &payload, &extra)
+            run_hook_blocking(&script, &config_dir, &project_dir, &payload, &extra, &env)
         }),
     )
     .await
@@ -5972,6 +5989,7 @@ fn run_hook_blocking(
     project_dir: &std::path::Path,
     payload: &str,
     extra_args: &[String],
+    env: &[(String, String)],
 ) -> String {
     use std::io::Write;
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5995,6 +6013,7 @@ fn run_hook_blocking(
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .env("TMPDIR", config_dir)
         .env("BUS_CONFIG_DIR", config_dir)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -12582,5 +12601,131 @@ async fn audit_binding_writers_share_the_config_lock() {
     );
 
     let _ = proxy.cancel().await;
+    h.shutdown().await;
+}
+
+/// The Stop drain of a bound window reads that window's inbox whatever the
+/// environment exports: with a parent BUS_TOKEN and a conflicting
+/// BUS_SESSION, with the conflicting session alone, and after a same-team
+/// profile switch. A conversation with no binding keeps the legacy path,
+/// which is what proves the environment really pointed elsewhere (#152).
+#[tokio::test]
+async fn audit_stop_drain_reads_the_bound_window_whatever_the_environment_says() {
+    let h = require_db!("t_stop_drain_binding");
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let bobby_token = seed_agent(&h.pool, "acme", "bobby").await;
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let dir = proxy_config_dir(
+        &h.base,
+        &[
+            ("acme", "acme", "bob", &bob_token),
+            ("acme-bobby", "acme", "bobby", &bobby_token),
+        ],
+    );
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let window = spawn_proxy(&dir, &repo, &["--host-session", "audit-hook-window"], &[]).await;
+    let label = call(&window, "session_status", json!({})).await["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The other window really exists: bob's legacy label has announced itself.
+    let legacy = connect_with_session(&h.base, &bob_token, "legacy-other").await;
+    call(&legacy, "heartbeat", json!({"status": "active"})).await;
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let ask = |to: String, body: &'static str| {
+        let alice = &alice;
+        async move {
+            call(
+                alice,
+                "post_message",
+                json!({"to": to, "body": body, "metadata": {"question": true}}),
+            )
+            .await
+        }
+    };
+    ask(
+        "bob/legacy-other".to_owned(),
+        "ONLY THE OTHER WINDOW SHOULD SEE THIS QUESTION",
+    )
+    .await;
+
+    let mcp_url = format!("{}/mcp", h.base);
+    let conflicting = [
+        ("BUS_URL", mcp_url.as_str()),
+        ("BUS_TOKEN", bob_token.as_str()),
+        ("BUS_SESSION", "legacy-other"),
+    ];
+    let bound = r#"{"session_id":"audit-hook-window"}"#;
+
+    // Bound window, parent token and conflicting session exported: nothing
+    // to block on, because the other window's question is not this one's.
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, bound, &[], &conflicting).await;
+    assert_eq!(
+        out.trim(),
+        "",
+        "the bound drain injected the other window's question: {out}"
+    );
+    // The same without a token: the binding, not BUS_SESSION, still decides.
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, bound, &[], &conflicting[2..]).await;
+    assert_eq!(out.trim(), "", "{out}");
+    // Positive control: with no binding at all (no session_id in the
+    // payload) the legacy path reads exactly what the environment says.
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, "{}", &[], &conflicting).await;
+    assert!(
+        out.contains("ONLY THE OTHER WINDOW"),
+        "the legacy path did not see the other window's question: {out}"
+    );
+
+    // A question for the bound window is raised, with the token exported
+    // and without it.
+    ask(
+        format!("bob/{label}"),
+        "FOR THE BOUND WINDOW, WITH A TOKEN EXPORTED",
+    )
+    .await;
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, bound, &[], &conflicting).await;
+    assert!(
+        out.contains("\"decision\": \"block\"") || out.contains("\"decision\":\"block\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("WITH A TOKEN EXPORTED") && !out.contains("ONLY THE OTHER WINDOW"),
+        "{out}"
+    );
+    ask(format!("bob/{label}"), "FOR THE BOUND WINDOW, NO TOKEN").await;
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, bound, &[], &conflicting[2..]).await;
+    assert!(
+        out.contains("NO TOKEN") && !out.contains("ONLY THE OTHER WINDOW"),
+        "{out}"
+    );
+
+    // Same-team profile switch: the window is now bobby's, and the drain
+    // follows the binding to bobby's inbox, with bob's token still exported.
+    let switched = call(
+        &window,
+        "configure_session",
+        json!({"profile": "acme-bobby"}),
+    )
+    .await;
+    assert_eq!(switched["status"]["agent"], "bobby", "{switched}");
+    ask(format!("bobby/{label}"), "FOR BOBBY AFTER THE SWITCH").await;
+    ask(
+        format!("bob/{label}"),
+        "FOR BOB, WHO NO LONGER HAS THIS WINDOW",
+    )
+    .await;
+    let out = run_hook_env("stop-drain.sh", &dir, &repo, bound, &[], &conflicting).await;
+    assert!(out.contains("FOR BOBBY AFTER THE SWITCH"), "{out}");
+    assert!(
+        !out.contains("NO LONGER HAS THIS WINDOW") && !out.contains("ONLY THE OTHER WINDOW"),
+        "{out}"
+    );
+
+    let _ = window.cancel().await;
+    for c in [legacy, alice] {
+        let _ = c.cancel().await;
+    }
     h.shutdown().await;
 }
