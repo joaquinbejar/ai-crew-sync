@@ -13331,6 +13331,34 @@ async fn existing_quotas_are_kept_unless_updated_explicitly() {
         (1_000, 16 * mib, 5)
     );
 
+    // A change the broker cannot reserve leaves the team as it was: the
+    // fixture's store is 512 MiB, and 480 MiB for the inbox on top of
+    // 64 MiB for bodies does not fit. The fixture's account has no budget
+    // of its own, so the refusal comes from the broker when the inbox is
+    // updated, after the body stream was; the command restores the body
+    // stream and says so. Both keep their limits.
+    let too_much = StreamQuotas {
+        inbox_max_bytes: 480 * mib,
+        ..other
+    };
+    let err = team_stream(&h.pool, "acme", &nats_url(), None, false, too_much, true)
+        .await
+        .expect_err("the store cannot reserve that much")
+        .to_string();
+    assert!(err.contains("nothing was changed"), "{err}");
+    assert!(err.contains("Restored"), "{err}");
+    assert!(err.contains("could not update"), "{err}");
+    assert!(err.contains("already reserved"), "{err}");
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 5),
+        "the body stream was not changed on its own"
+    );
+    assert_eq!(
+        limits(jetstream::inbox_stream_name(team)).await,
+        (1_000, 4 * mib, 2)
+    );
+
     // An explicit update to larger limits applies, and everything stored
     // is still there.
     team_stream(&h.pool, "acme", &nats_url(), None, false, other, true)
@@ -13358,8 +13386,11 @@ async fn existing_quotas_are_kept_unless_updated_explicitly() {
     let batch = call(&dani, "fetch_conversation_inbox", json!({})).await;
     assert_eq!(batch["from_broker"], 2, "the references survived: {batch}");
 
+    // The fixture broker is shared by every test in the run: give the
+    // reservation back.
     for c in [owner, dani_agent, dani] {
         let _ = c.cancel().await;
     }
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
     h.shutdown().await;
 }

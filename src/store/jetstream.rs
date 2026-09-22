@@ -302,6 +302,71 @@ impl Provisioned {
     pub fn differs_from(&self, max_messages: i64, max_bytes: i64) -> bool {
         self.max_messages != max_messages || self.max_bytes != max_bytes
     }
+
+    /// Whether the stream holds more than its ceiling allows; after an
+    /// update this means a publisher got in between the check and the
+    /// change.
+    pub fn over_ceiling(&self) -> bool {
+        (self.messages as i64) > self.max_messages || (self.bytes as i64) > self.max_bytes
+    }
+}
+
+/// A vetted quota change: the limits to restore on rollback, the limits
+/// asked for, and what the stream holds.
+#[derive(Clone, Debug)]
+pub struct QuotaChange {
+    pub name: String,
+    pub kind: StreamKind,
+    pub current_max_messages: i64,
+    pub current_max_bytes: i64,
+    pub wanted_max_messages: i64,
+    pub wanted_max_bytes: i64,
+    pub messages: u64,
+    pub bytes: u64,
+}
+
+impl QuotaChange {
+    /// Bytes the broker must reserve on top of what this stream already
+    /// reserves; zero for a decrease.
+    pub fn additional_bytes(&self) -> i64 {
+        (self.wanted_max_bytes - self.current_max_bytes).max(0)
+    }
+}
+
+/// The broker's storage account, in bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct StorageAccount {
+    pub used: u64,
+    pub reserved: u64,
+    pub budget: Option<i64>,
+}
+
+impl StorageAccount {
+    /// Whether `additional` more reserved bytes fit the budget.
+    pub fn fits(&self, additional: i64) -> bool {
+        match self.budget {
+            Some(budget) => (self.reserved as i64).saturating_add(additional) <= budget,
+            None => true,
+        }
+    }
+
+    /// One sentence with the numbers, for a refusal.
+    pub fn describe(&self) -> String {
+        let budget = match self.budget {
+            Some(m) => format!("the account's storage budget is {} ({})", m, format_size(m)),
+            None => "the account has no storage limit of its own, so the ceiling is the \
+                     server's max_file_store"
+                .to_owned(),
+        };
+        format!(
+            "{budget}; {} ({}) is already reserved by existing streams' max_bytes while only \
+             {} ({}) is actually used",
+            self.reserved,
+            format_size(self.reserved as i64),
+            self.used,
+            format_size(self.used as i64)
+        )
+    }
 }
 
 /// A connected adapter for one team.
@@ -435,7 +500,11 @@ impl JetStreamBackend {
         let existed = context.get_stream(&name).await.is_ok();
         let mut stream = match context.get_or_create_stream(wanted).await {
             Ok(stream) => stream,
-            Err(e) => return Err(provisioning_error(&context, &name, requested_bytes, e).await),
+            Err(e) => {
+                return Err(
+                    provisioning_error(&context, &name, "create", requested_bytes, e).await,
+                );
+            }
         };
         let info = stream
             .info()
@@ -451,16 +520,17 @@ impl JetStreamBackend {
         })
     }
 
-    /// Change an existing stream's quotas to what `config` asks for. The
-    /// explicit counterpart of the retry that keeps them: refused when the
+    /// What changing a stream's quotas would do, without doing it: the
+    /// limits it has now (what a rollback restores), what it holds, and the
+    /// extra bytes the broker would have to reserve. Refused when the
     /// stream already holds more than the new ceiling would allow, since a
     /// ceiling below the current contents would make the next write fail
     /// (bodies) or start dropping (references) at once.
-    pub async fn update_quotas(
+    pub async fn check_update(
         config: &Config,
         team_id: Uuid,
         kind: StreamKind,
-    ) -> BusResult<Provisioned> {
+    ) -> BusResult<QuotaChange> {
         config.validate_quotas()?;
         let client = connect_client(config).await?;
         let context = jetstream::new(client);
@@ -472,33 +542,79 @@ impl JetStreamBackend {
                  creation and changed here"
             ))
         })?;
-        let state = current
+        let info = current
             .info()
             .await
-            .map_err(|e| BusError::invalid(format!("could not read '{name}': {e}")))?
-            .state
-            .clone();
-        if (state.messages as i64) > wanted.max_messages {
+            .map_err(|e| BusError::invalid(format!("could not read '{name}': {e}")))?;
+        if (info.state.messages as i64) > wanted.max_messages {
             return Err(BusError::invalid(format!(
                 "stream '{name}' holds {} messages, more than the requested ceiling of {}; \
                  nothing was changed. Prune first (`team prune`) or ask for a higher count",
-                state.messages, wanted.max_messages
+                info.state.messages, wanted.max_messages
             )));
         }
-        if (state.bytes as i64) > wanted.max_bytes {
+        if (info.state.bytes as i64) > wanted.max_bytes {
             return Err(BusError::invalid(format!(
                 "stream '{name}' holds {} ({}), more than the requested ceiling of {} ({}); \
                  nothing was changed. Prune first (`team prune`) or ask for a higher quota",
-                state.bytes,
-                format_size(state.bytes as i64),
+                info.state.bytes,
+                format_size(info.state.bytes as i64),
                 wanted.max_bytes,
                 format_size(wanted.max_bytes)
             )));
         }
-        let requested_bytes = wanted.max_bytes;
+        Ok(QuotaChange {
+            name,
+            kind,
+            current_max_messages: info.config.max_messages,
+            current_max_bytes: info.config.max_bytes,
+            wanted_max_messages: wanted.max_messages,
+            wanted_max_bytes: wanted.max_bytes,
+            messages: info.state.messages,
+            bytes: info.state.bytes,
+        })
+    }
+
+    /// Change an existing stream's quotas to what `config` asks for: the
+    /// explicit counterpart of the retry that keeps them. Runs
+    /// [`Self::check_update`] first. The check is a snapshot: a publisher can
+    /// add to the stream between it and the update, so the outcome carries
+    /// the contents read back afterwards and the caller says so when they
+    /// exceed the new ceiling. Neither stream loses data to that race: the
+    /// body stream discards **new** writes when full, and an inbox reference
+    /// the broker drops is rebuilt from Postgres, which is its authority.
+    pub async fn update_quotas(
+        config: &Config,
+        team_id: Uuid,
+        kind: StreamKind,
+    ) -> BusResult<Provisioned> {
+        let change = Self::check_update(config, team_id, kind).await?;
+        Self::apply_update(config, team_id, kind, &change).await
+    }
+
+    /// Apply a change that [`Self::check_update`] already vetted.
+    pub async fn apply_update(
+        config: &Config,
+        team_id: Uuid,
+        kind: StreamKind,
+        change: &QuotaChange,
+    ) -> BusResult<Provisioned> {
+        let client = connect_client(config).await?;
+        let context = jetstream::new(client);
+        let wanted = Self::stream_config(config, team_id, kind);
+        let name = wanted.name.clone();
         let info = match context.update_stream(wanted).await {
             Ok(info) => info,
-            Err(e) => return Err(provisioning_error(&context, &name, requested_bytes, e).await),
+            Err(e) => {
+                return Err(provisioning_error(
+                    &context,
+                    &name,
+                    "update",
+                    change.additional_bytes(),
+                    e,
+                )
+                .await);
+            }
         };
         Ok(Provisioned {
             name,
@@ -507,6 +623,24 @@ impl JetStreamBackend {
             max_bytes: info.config.max_bytes,
             messages: info.state.messages,
             bytes: info.state.bytes,
+        })
+    }
+
+    /// The broker's storage account as it stands: bytes used, bytes
+    /// reserved by every stream's `max_bytes`, and the store's budget
+    /// (`None` when the account is unlimited). Lets a caller refuse a
+    /// change that could not be reserved before touching anything.
+    pub async fn storage_account(config: &Config) -> BusResult<StorageAccount> {
+        let client = connect_client(config).await?;
+        let context = jetstream::new(client);
+        let account = context
+            .query_account()
+            .await
+            .map_err(|e| BusError::invalid(format!("could not read the broker's account: {e}")))?;
+        Ok(StorageAccount {
+            used: account.storage,
+            reserved: account.reserved_storage,
+            budget: account.limits.max_storage.filter(|m| *m > 0),
         })
     }
 
@@ -731,12 +865,17 @@ impl JetStreamBackend {
 /// Turn a create or update failure into something an operator can act on.
 /// The one that bites in practice is 10047, "insufficient storage
 /// resources": the broker reserves every stream's `max_bytes` against its
-/// `max_file_store` when the stream is created, so a store can be almost
-/// empty and still refuse a new stream. Say so, with the numbers.
+/// `max_file_store` when the stream is created or enlarged, so a store can
+/// be almost empty and still refuse. Say so, with the numbers when the
+/// account answers and with an honest "unavailable" when it does not.
+/// `additional_bytes` is what the operation asked the broker to reserve on
+/// top of what it already had: the whole quota for a new stream, the
+/// difference for an update.
 async fn provisioning_error(
     context: &jetstream::Context,
     name: &str,
-    requested_bytes: i64,
+    operation: &str,
+    additional_bytes: i64,
     error: jetstream::context::CreateStreamError,
 ) -> BusError {
     let exhausted = matches!(
@@ -745,30 +884,27 @@ async fn provisioning_error(
             if e.error_code() == jetstream::ErrorCode::STORAGE_RESOURCES_EXCEEDED
     );
     if !exhausted {
-        return BusError::invalid(format!("could not provision '{name}': {error}"));
+        return BusError::invalid(format!("could not {operation} '{name}': {error}"));
     }
-    let account = context.query_account().await.ok();
-    let (used, reserved, max) = account
-        .as_ref()
-        .map(|a| (a.storage, a.reserved_storage, a.limits.max_storage))
-        .unwrap_or((0, 0, None));
-    let budget = max
-        .filter(|m| *m > 0)
-        .map(|m| format!("{} ({})", m, format_size(m)))
-        .unwrap_or_else(|| "unlimited according to the account".to_owned());
+    let account = match context.query_account().await {
+        Ok(a) => StorageAccount {
+            used: a.storage,
+            reserved: a.reserved_storage,
+            budget: a.limits.max_storage.filter(|m| *m > 0),
+        }
+        .describe(),
+        Err(e) => format!(
+            "the broker's account statistics are unavailable ({e}), so the reserved and used \
+             figures cannot be shown; `nats account info` on the broker has them"
+        ),
+    };
     BusError::invalid(format!(
-        "could not provision '{name}': the broker cannot reserve {} ({}) more. Its file \
-         store budget (max_file_store) is {budget}, of which {} ({}) is already reserved by \
-         existing streams' max_bytes while only {} ({}) is actually used. Reservation, not \
-         disk, is what ran out: ask for a smaller quota (--max-bytes / --inbox-max-bytes), \
-         lower another stream's quota (`team stream --update-quotas`) or remove one, or \
-         raise the broker's max_file_store.",
-        requested_bytes,
-        format_size(requested_bytes),
-        reserved,
-        format_size(reserved as i64),
-        used,
-        format_size(used as i64)
+        "could not {operation} '{name}': the broker cannot reserve {} ({}) more. Reservation, \
+         not disk, is what ran out: {account}. Ask for a smaller quota (--max-bytes / \
+         --inbox-max-bytes), lower another stream's quota (`team stream --update-quotas`) or \
+         remove one, or raise the broker's max_file_store.",
+        additional_bytes,
+        format_size(additional_bytes)
     ))
 }
 

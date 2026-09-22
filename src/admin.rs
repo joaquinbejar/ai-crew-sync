@@ -111,7 +111,9 @@ pub async fn team_stream(
     quotas: StreamQuotas,
     update: bool,
 ) -> anyhow::Result<()> {
-    use crate::store::jetstream::{JetStreamBackend, StreamKind, format_size};
+    use crate::store::jetstream::{
+        JetStreamBackend, Provisioned, QuotaChange, StreamKind, format_size,
+    };
     let id = team_id(pool, team).await?;
     let mut config = crate::store::jetstream::Config::new(nats_url.to_owned())
         .with_limits(quotas.max_messages, quotas.max_bytes)
@@ -157,33 +159,117 @@ pub async fn team_stream(
     // truth is in Postgres.
     let bodies = JetStreamBackend::provision(&config, id).await?;
     let inbox = JetStreamBackend::provision_inbox(&config, id).await?;
-    let mut kept = Vec::new();
-    for (mut outcome, kind, want_messages, want_bytes, what) in [
+    let plan = [
         (
             bodies,
             StreamKind::Bodies,
             quotas.max_messages,
             quotas.max_bytes,
-            "bodies",
         ),
         (
             inbox,
             StreamKind::Inbox,
             quotas.inbox_max_messages,
             quotas.inbox_max_bytes,
-            "inbox references",
         ),
-    ] {
-        let differs = outcome.differs_from(want_messages, want_bytes);
-        if update && differs {
-            outcome = JetStreamBackend::update_quotas(&config, id, kind).await?;
+    ];
+    let mut outcomes: Vec<(Provisioned, &str)> = Vec::with_capacity(2);
+    let mut kept = Vec::new();
+    if update {
+        // Every change is vetted before any is applied, and the sum of what
+        // they would newly reserve is checked against the account's budget
+        // when it has one (a server-level max_file_store is not visible
+        // here; the broker refuses at apply time and the rollback below
+        // covers it): one command must not leave a team with one stream
+        // changed and the other refused.
+        let mut changes = Vec::new();
+        for (outcome, kind, want_messages, want_bytes) in &plan {
+            if outcome.differs_from(*want_messages, *want_bytes) {
+                changes.push((
+                    *kind,
+                    JetStreamBackend::check_update(&config, id, *kind).await?,
+                ));
+            }
         }
-        let verb = if outcome.created {
-            "created"
-        } else if update && differs {
-            "updated"
+        let additional: i64 = changes.iter().map(|(_, c)| c.additional_bytes()).sum();
+        if additional > 0 {
+            let account = JetStreamBackend::storage_account(&config).await?;
+            if !account.fits(additional) {
+                anyhow::bail!(
+                    "the requested quotas need {} ({}) more reserved than the streams have now, \
+                     and {}. Nothing was changed. Ask for smaller quotas, lower another \
+                     stream's, remove one, or raise the broker's max_file_store.",
+                    additional,
+                    format_size(additional),
+                    account.describe()
+                );
+            }
+        }
+        let mut applied: Vec<(StreamKind, &QuotaChange)> = Vec::new();
+        for (kind, change) in &changes {
+            match JetStreamBackend::apply_update(&config, id, *kind, change).await {
+                Ok(outcome) => {
+                    applied.push((*kind, change));
+                    outcomes.push((outcome, "updated"));
+                }
+                Err(e) => {
+                    // Put back what was already changed, so the team never
+                    // ends up half way between two quota sets.
+                    let mut restored = Vec::new();
+                    for (done_kind, done) in &applied {
+                        let previous = match done_kind {
+                            StreamKind::Bodies => config
+                                .clone()
+                                .with_limits(done.current_max_messages, done.current_max_bytes),
+                            StreamKind::Inbox => config.clone().with_inbox_limits(
+                                done.current_max_messages,
+                                done.current_max_bytes,
+                            ),
+                        };
+                        match JetStreamBackend::update_quotas(&previous, id, *done_kind).await {
+                            Ok(_) => restored.push(done.name.clone()),
+                            Err(back) => anyhow::bail!(
+                                "updating '{}' failed ({e}) and restoring '{}' to its previous \
+                                 limits failed too ({back}); the team's quotas are now mixed. \
+                                 Re-run with --update-quotas once the cause is fixed.",
+                                change.name,
+                                done.name
+                            ),
+                        }
+                    }
+                    if restored.is_empty() {
+                        anyhow::bail!("{e}\nNothing was changed.");
+                    }
+                    anyhow::bail!(
+                        "{e}\nRestored '{}' to its previous limits; nothing was changed.",
+                        restored.join("', '")
+                    );
+                }
+            }
+        }
+    }
+    for (outcome, _, want_messages, want_bytes) in plan {
+        if outcomes.iter().any(|(o, _)| o.name == outcome.name) {
+            continue;
+        }
+        if outcome.differs_from(want_messages, want_bytes) && !outcome.created {
+            kept.push(format!(
+                "'{}' keeps {} messages / {} (you asked for {} / {})",
+                outcome.name,
+                outcome.max_messages,
+                format_size(outcome.max_bytes),
+                want_messages,
+                format_size(want_bytes)
+            ));
+        }
+        let verb = if outcome.created { "created" } else { "exists" };
+        outcomes.push((outcome, verb));
+    }
+    for (outcome, verb) in &outcomes {
+        let what = if outcome.name.starts_with("ACS_I_") {
+            "inbox references"
         } else {
-            "exists"
+            "bodies"
         };
         println!(
             "team '{team}': '{}' ({what}) {verb}: up to {} messages / {} ({} bytes), holding {} \
@@ -195,15 +281,13 @@ pub async fn team_stream(
             outcome.messages,
             format_size(outcome.bytes as i64)
         );
-        if differs && !update && !outcome.created {
-            kept.push(format!(
-                "'{}' keeps {} messages / {} (you asked for {} / {})",
-                outcome.name,
-                outcome.max_messages,
-                format_size(outcome.max_bytes),
-                want_messages,
-                format_size(want_bytes)
-            ));
+        if *verb == "updated" && outcome.over_ceiling() {
+            println!(
+                "  note: '{}' grew past the new ceiling while it was being changed (a publisher \
+                 got in between). Nothing was lost: the body stream refuses new writes until \
+                 pruned, and a dropped inbox reference is rebuilt from Postgres.",
+                outcome.name
+            );
         }
     }
     if !kept.is_empty() {
