@@ -1,0 +1,13 @@
+{
+  "//": "Direct HTTP, for a script, a CI job or an MCP client that cannot start a command. Needs no binary. Each teammate uses their OWN token; never share tokens between people. X-Crew-Session labels this working context — set BUS_SESSION to the repository name in the shell that launches your agent, and your presence, task claims and locks stay separate from your other repositories. The ':-' fallback matters: an unset variable with no default is sent as the literal ${BUS_SESSION} text. The label partitions; it does not PROVE which window is calling, so it cannot open a seat in a private conversation. For that, use the proxy (.mcp.json).",
+  "mcpServers": {
+    "ai-crew-sync": {
+      "type": "http",
+      "url": "https://bus.your-company.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${TEAM_BUS_TOKEN}",
+        "X-Crew-Session": "${BUS_SESSION:-}"
+      }
+    }
+  }
+}

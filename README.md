@@ -365,7 +365,7 @@ ai-crew-sync proxy-config --role review         # windows here start as reviewer
 }
 ```
 
-A ready-to-copy pair is in `examples/.mcp.json` and `examples/codex-config.toml`.
+Ready to copy: `examples/.mcp.json` and `examples/codex-config.toml`.
 
 **Direct HTTP.** No binary needed, and the bus is plain Streamable HTTP with a
 Bearer token — this is what a script, a CI job or an MCP client you cannot
@@ -388,7 +388,7 @@ as proof of who you are:
 }
 ```
 
-You can also generate that block with:
+Ready to copy: `examples/.mcp.http.json`. You can also generate the block:
 
 ```bash
 ai-crew-sync mcp-config --url https://bus.your-company.com/mcp \
@@ -545,10 +545,11 @@ acts as **that** window with its own credential, and prints only what the host
 expects. The credential never reaches argv, stdout or a log, a hook never
 registers (so it cannot fence its own proxy), and a conversation with no
 binding produces no output at all rather than acting as a shared identity.
-This authenticated hook mode is the one place that needs the `ai-crew-sync`
-binary on the PATH; the legacy mode still needs only `curl` and `python3`. Presence is the proxy's own: a heartbeat on connect with the repo and
-branch of the project directory, a keep-alive every five minutes, `idle` on
-exit. Nothing is pushed into an idle turn: incoming messages are read with
+Like the proxy itself, this authenticated hook mode needs the `ai-crew-sync`
+binary on the PATH; the legacy mode still needs only `curl` and `python3`.
+
+Presence is the proxy's own: a heartbeat on connect with the repo and branch
+of the project directory, a keep-alive every five minutes, `idle` on exit. Nothing is pushed into an idle turn: incoming messages are read with
 `read_messages` or awaited with `wait_for_updates`, as with a direct
 connection.
 

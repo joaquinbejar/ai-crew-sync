@@ -9081,7 +9081,7 @@ async fn a_broker_that_is_gone_does_not_take_the_thread_with_it() {
     call(
         &owner,
         "send_conversation_message",
-        json!({"conversation_id": local["id"], "body": "sigue aquí", "request_id": request_id()}),
+        json!({"conversation_id": local["id"], "body": "still here", "request_id": request_id()}),
     )
     .await;
 
@@ -9158,7 +9158,7 @@ async fn a_broker_that_is_gone_does_not_take_the_thread_with_it() {
     )
     .await;
     assert_eq!(
-        still["messages"][0]["body"], "sigue aquí",
+        still["messages"][0]["body"], "still here",
         "a thread on Postgres is untouched by the broker's trouble"
     );
 

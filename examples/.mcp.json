@@ -1,4 +1,5 @@
 {
+  "//": "RECOMMENDED. Drop this in the repo root as .mcp.json (project scope) or merge into ~/.claude.json. The client starts the binary instead of opening an HTTP connection: one process per conversation, each registering its own authenticated session, so two windows in the same repository can never be mistaken for each other. No credential lives in this file — the proxy resolves one from your local profiles (`ai-crew-sync context profile add`), and `ai-crew-sync context show` says which profile applies where you are. Generate this block with `ai-crew-sync proxy-config`. For a client you cannot give a command to, see .mcp.http.json.",
   "mcpServers": {
     "ai-crew-sync": {
       "command": "ai-crew-sync",
