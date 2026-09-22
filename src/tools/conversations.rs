@@ -395,7 +395,11 @@ impl Bus {
                        READING IS NOT ACKNOWLEDGING: no receipt is touched here and no \
                        cursor moves on anyone's behalf. Each message carries your own \
                        receipt so you can see what you have already acknowledged. Page with \
-                       `next_after_seq`."
+                       `next_after_seq`. Every message has an `unavailable` field: `null` \
+                       means `body` is the real text; a reason there means `body` is an \
+                       empty placeholder because the backend holding it cannot serve it \
+                       right now, NOT an empty message. Never quote or summarise an empty \
+                       body without checking `unavailable` first."
     )]
     async fn read_conversation(
         &self,
@@ -419,7 +423,10 @@ impl Bus {
 
     #[tool(
         description = "One message by id, with your own receipt. Access is rechecked now, \
-                       so a membership that has ended does not keep reading."
+                       so a membership that has ended does not keep reading. `unavailable` \
+                       is always present: `null` means `body` is the real text, a reason \
+                       means `body` is an empty placeholder for a body the backend cannot \
+                       serve right now, not an empty message."
     )]
     async fn get_conversation_message(
         &self,

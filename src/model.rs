@@ -599,6 +599,10 @@ pub struct ConversationMessage {
     pub from: String,
     /// `agent/session` of the sender, for an exact reply.
     pub from_address: String,
+    /// The text the sender wrote, or an EMPTY STRING when `unavailable` is
+    /// set. Check `unavailable` before quoting or summarising: an empty
+    /// body with a reason there is a body this process cannot serve right
+    /// now, not an empty message from your teammate.
     pub body: String,
     pub reply_to: Option<String>,
     pub metadata: serde_json::Value,
@@ -611,10 +615,12 @@ pub struct ConversationMessage {
     /// the body is not here. A thread on the default Postgres backend is
     /// always `stored`.
     pub publication: String,
-    /// Why the body is missing, when it is. The message keeps its place in
-    /// the sequence, its sender and its receipts either way: a gap you can
-    /// see and read about is not the same as a gap.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    /// Always present. `null` when `body` is the real text; otherwise why
+    /// the body is not here (its backend cannot be reached, or no longer
+    /// holds it), and `body` is an empty placeholder. The message keeps its
+    /// place in the sequence, its sender and its receipts either way: a gap
+    /// you can see and read about is not the same as a gap.
+    #[serde(default)]
     pub unavailable: Option<String>,
 }
 

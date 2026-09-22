@@ -1665,15 +1665,19 @@ async fn resolve_body(
             // does not exist. Losing the broker costs the bodies it holds,
             // for as long as it is down, and nothing else: not the thread,
             // not the other messages, not the page.
+            // The reason a model reads carries one classification and no
+            // broker internals; the internals go to the log, where an
+            // operator looks for them.
             let backend = match backends.for_message(&row.backend, team_id).await {
                 Ok(backend) => backend,
                 Err(why) => {
-                    return Ok(BodyState::Unreachable(BusError::conflict(format!(
-                        "the backend holding this body cannot be reached right now \
-                         ({why}). The message is not lost: its place in the thread, its \
-                         recipients and its receipts are here, and the body comes back \
-                         when the backend does."
-                    ))));
+                    tracing::warn!(error = %why, %message_id, "the body's backend cannot be opened");
+                    return Ok(BodyState::Unreachable(BusError::conflict(
+                        "the backend holding this body cannot be reached right now. The \
+                         message is not lost: its place in the thread, its recipients and \
+                         its receipts are here, and the body comes back when the backend \
+                         does.",
+                    )));
                 }
             };
             let fetched = match backend
@@ -1682,11 +1686,12 @@ async fn resolve_body(
             {
                 Ok(fetched) => fetched,
                 Err(why) => {
-                    return Ok(BodyState::Unreachable(BusError::conflict(format!(
-                        "this body could not be read from its backend right now ({why}). \
-                         It is not lost: its place in the thread, its recipients and its \
-                         receipts are here."
-                    ))));
+                    tracing::warn!(error = %why, %message_id, "the body could not be read from its backend");
+                    return Ok(BodyState::Unreachable(BusError::conflict(
+                        "this body could not be read from its backend right now. It is not \
+                         lost: its place in the thread, its recipients and its receipts are \
+                         here, and the body comes back when the backend does.",
+                    )));
                 }
             };
             match fetched {

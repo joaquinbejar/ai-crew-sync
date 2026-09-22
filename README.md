@@ -1062,7 +1062,11 @@ which. Every message carries a `publication`:
 | `tombstoned` | The backend no longer holds the body (retention, or an operator). The message keeps its sequence, its recipients and its receipts; `unavailable` says why. |
 
 A body the current backend cannot serve does not fail the page: the message
-keeps its place and says what happened to it. Thread order is the sequence,
+keeps its place and says what happened to it. Every message carries
+`unavailable`, `null` when `body` is the real text and a one-sentence reason
+when it is not; then `body` is an empty placeholder, never an empty message,
+and the reason names no broker internals (those go to the server log).
+Thread order is the sequence,
 never the order the broker happened to confirm in, and a reader's cursor
 cannot walk past a message still in flight.
 

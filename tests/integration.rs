@@ -13257,6 +13257,126 @@ async fn the_sweep_keeps_a_body_its_backend_cannot_confirm() {
     );
     assert_eq!(local_body(second).await, "and me");
 
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// An unreadable body cannot be mistaken for an empty message: the schema
+/// says so (`unavailable` is always present, `null` when the body is real),
+/// the tool descriptions say so, and the reason carries one classification
+/// and none of the broker's internals (#171).
+#[tokio::test]
+async fn an_unreadable_body_is_labelled_for_the_model() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+    use ai_crew_sync::store::routing::Backends;
+
+    let h = require_db_broker!("t_unavailable_label");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+
+    // What a model reads before its first call already says it.
+    let tools = dani.list_all_tools().await.unwrap();
+    for name in ["read_conversation", "get_conversation_message"] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("`unavailable`"),
+            "{name}: {description}"
+        );
+        assert!(description.contains("placeholder"), "{name}: {description}");
+    }
+
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    let cid = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "labelled", "private": true, "invite": ["dani/review"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    let mid = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "real text", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+    outbox::release_published_bodies(
+        &h.pool,
+        &Backends::with_jetstream(h.pool.clone(), config.clone()),
+        Some(cid.parse().unwrap()),
+        0,
+    )
+    .await
+    .unwrap();
+
+    // Healthy: the field is there and says null, so its absence is never
+    // something a model has to infer.
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let message = &page["messages"][0];
+    assert_eq!(message["body"], "real text", "{page}");
+    assert!(
+        message.get("unavailable").is_some_and(|v| v.is_null()),
+        "unavailable must be present and null on a healthy read: {page}"
+    );
+    let one = call(
+        &dani,
+        "get_conversation_message",
+        json!({"message_id": mid}),
+    )
+    .await;
+    assert!(one.get("unavailable").is_some_and(|v| v.is_null()), "{one}");
+
+    // The broker loses the stream: the body is a placeholder with a reason
+    // that has exactly one class and none of the broker's codes.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+    for read in [
+        call(&dani, "read_conversation", json!({"conversation_id": cid})).await["messages"][0]
+            .clone(),
+        call(
+            &dani,
+            "get_conversation_message",
+            json!({"message_id": mid}),
+        )
+        .await,
+    ] {
+        assert_eq!(read["body"], "", "{read}");
+        assert_eq!(read["seq"], 1, "{read}");
+        assert_eq!(read["from"], "joaquin", "{read}");
+        assert_eq!(read["publication"], "stored", "{read}");
+        let reason = read["unavailable"].as_str().expect("a reason");
+        assert_eq!(reason.matches("conflict:").count(), 1, "{reason}");
+        assert!(!reason.contains("invalid input"), "{reason}");
+        assert!(!reason.contains("jetstream error"), "{reason}");
+        assert!(!reason.contains("code"), "{reason}");
+        assert!(reason.contains("not lost"), "{reason}");
+    }
+    let receipts = call(&owner, "get_message_receipts", json!({"message_id": mid})).await;
+    assert_eq!(receipts["total"], 1, "{receipts}");
+
     // The fixture broker is shared: give the re-created stream back.
     JetStreamBackend::deprovision(&config, team).await.unwrap();
     for c in [owner, dani] {
