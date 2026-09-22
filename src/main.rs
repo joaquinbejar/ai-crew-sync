@@ -491,7 +491,7 @@ enum ContextCmd {
         /// Id of the host conversation, from the hook payload's session_id.
         #[arg(long)]
         binding: String,
-        /// session_start | heartbeat | stop | session_end | status
+        /// session_start | heartbeat | stop | session_end | status | call
         #[arg(long)]
         event: String,
         /// Working directory the presence line describes; the current
@@ -501,6 +501,12 @@ enum ContextCmd {
         /// Hours of team activity to summarise on session_start.
         #[arg(long, env = "BUS_DIGEST_HOURS", default_value_t = 8)]
         digest_hours: i64,
+        /// With `--event call`: the MCP tool to call as the bound window.
+        #[arg(long)]
+        tool: Option<String>,
+        /// With `--event call`: the tool's arguments, a JSON object.
+        #[arg(long, default_value = "{}")]
+        args: String,
     },
 }
 
@@ -1292,6 +1298,8 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
             event,
             cwd,
             digest_hours,
+            tool,
+            args,
         } => {
             let event: hook::Event = event.parse()?;
             let cwd = match cwd {
@@ -1299,7 +1307,19 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                 None => std::env::current_dir()?,
             };
             let hours = digest_hours.clamp(1, 336);
-            match hook::run(&context::config_dir()?, &binding, event, &cwd, hours).await {
+            let call = match event {
+                hook::Event::Call => {
+                    let tool = tool.context("--event call needs --tool <name>")?;
+                    let parsed: serde_json::Value = serde_json::from_str(&args)
+                        .with_context(|| format!("--args is not valid JSON: {args}"))?;
+                    if !parsed.is_object() {
+                        anyhow::bail!("--args must be a JSON object");
+                    }
+                    Some((tool, parsed))
+                }
+                _ => None,
+            };
+            match hook::run(&context::config_dir()?, &binding, event, &cwd, hours, call).await {
                 Ok(Some(out)) => println!("{out}"),
                 Ok(None) => {}
                 // A hook must never break the host's session: report the

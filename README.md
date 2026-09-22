@@ -360,7 +360,12 @@ The hooks run in one of two modes, and pick per conversation:
   `ai-crew-sync context hook`, which reads that window's private binding and
   acts as that session. The credential never passes through a script, an
   argument or an environment variable. This needs the binary on the PATH,
-  which the plugin already requires.
+  which the plugin already requires. A bound window stays bound whatever the
+  environment says: an exported `BUS_TOKEN`/`BUS_SESSION` does not redirect
+  its Stop drain to another session's inbox. The binary serves hooks only the
+  four tools their scripts use (`whoami`, `read_messages`, `team_digest`,
+  `heartbeat`), so a hook can never issue, rotate or revoke a credential.
+  Only a conversation with no binding at all takes the legacy path below.
 - **Legacy** — no proxy and no binding, but `BUS_URL`/`BUS_TOKEN` are
   exported. The hooks fall back to plain `curl` + `python3` and the
   `X-Crew-Session` label, exactly as before. Nothing else is assumed to exist.
