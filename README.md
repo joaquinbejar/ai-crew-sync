@@ -996,9 +996,17 @@ A broker test that skips itself proves nothing and reads like a pass.
 Two independent steps, in this order, and neither implies the other:
 
 ```bash
-# 1. The stream. An operator action with the PROVISIONING credential —
+# 1. The streams. An operator action with the PROVISIONING credential —
 #    the server's own credential deliberately cannot create streams.
-ai-crew-sync team stream --team acme --nats-url nats://broker:4222
+#    Quotas are reserved against the broker's max_file_store at creation,
+#    used or not (defaults: bodies 2 GiB / 100,000 messages, inbox
+#    references 256 MiB / 100,000). Size them for the broker you have.
+ai-crew-sync team stream --team acme --nats-url nats://broker:4222 \
+    --max-bytes 512MiB --inbox-max-bytes 32MiB
+# A re-run keeps an existing stream's limits and says so; changing them is
+# explicit, and refused below what the stream already holds:
+ai-crew-sync team stream --team acme --nats-url nats://broker:4222 \
+    --max-bytes 1GiB --update-quotas
 
 # 2. The route. From now on, this team's NEW conversations store their
 #    bodies on the broker.

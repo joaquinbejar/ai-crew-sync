@@ -72,16 +72,52 @@ pub async fn team_backend(pool: &PgPool, team: &str, backend: &str) -> anyhow::R
 
 /// Create or remove a team's stream. An operator action with its own
 /// credential; the server process deliberately cannot do it.
+/// The ceilings `team stream` asks for, per stream. Reserved against the
+/// broker's `max_file_store` when a stream is created, whether or not the
+/// bytes are ever used.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamQuotas {
+    pub max_bytes: i64,
+    pub max_messages: i64,
+    pub inbox_max_bytes: i64,
+    pub inbox_max_messages: i64,
+}
+
+impl Default for StreamQuotas {
+    fn default() -> Self {
+        use crate::store::jetstream::*;
+        Self {
+            max_bytes: DEFAULT_MAX_BYTES,
+            max_messages: DEFAULT_MAX_MESSAGES,
+            inbox_max_bytes: DEFAULT_INBOX_MAX_BYTES,
+            inbox_max_messages: DEFAULT_INBOX_MAX_MESSAGES,
+        }
+    }
+}
+
+/// Create a team's streams, report their effective limits, or change them.
+///
+/// A stream that already exists keeps its limits on a routine call: the
+/// command says which limits it has and that `--update-quotas` is the way
+/// to change them. With `update` the requested quotas are applied to both
+/// streams, refused where a stream already holds more than the new
+/// ceiling. Bodies and references are never touched by either path.
 pub async fn team_stream(
     pool: &PgPool,
     team: &str,
     nats_url: &str,
     credentials: Option<String>,
     remove: bool,
+    quotas: StreamQuotas,
+    update: bool,
 ) -> anyhow::Result<()> {
+    use crate::store::jetstream::{JetStreamBackend, StreamKind, format_size};
     let id = team_id(pool, team).await?;
-    let mut config = crate::store::jetstream::Config::new(nats_url.to_owned());
+    let mut config = crate::store::jetstream::Config::new(nats_url.to_owned())
+        .with_limits(quotas.max_messages, quotas.max_bytes)
+        .with_inbox_limits(quotas.inbox_max_messages, quotas.inbox_max_bytes);
     config.credentials = credentials;
+    config.validate_quotas()?;
     if remove {
         let (routed,): (String,) =
             sqlx::query_as("SELECT default_backend FROM teams WHERE id = $1")
@@ -116,12 +152,71 @@ pub async fn team_stream(
         println!("team '{team}': stream removed, with every body it held");
         return Ok(());
     }
-    let name = crate::store::jetstream::JetStreamBackend::provision(&config, id).await?;
     // Two streams, because bodies and references cannot share a retention
     // policy: history must not be dropped, and references are a cache whose
     // truth is in Postgres.
-    let inbox = crate::store::jetstream::JetStreamBackend::provision_inbox(&config, id).await?;
-    println!("team '{team}': streams '{name}' (bodies) and '{inbox}' (inbox references) ready");
+    let bodies = JetStreamBackend::provision(&config, id).await?;
+    let inbox = JetStreamBackend::provision_inbox(&config, id).await?;
+    let mut kept = Vec::new();
+    for (mut outcome, kind, want_messages, want_bytes, what) in [
+        (
+            bodies,
+            StreamKind::Bodies,
+            quotas.max_messages,
+            quotas.max_bytes,
+            "bodies",
+        ),
+        (
+            inbox,
+            StreamKind::Inbox,
+            quotas.inbox_max_messages,
+            quotas.inbox_max_bytes,
+            "inbox references",
+        ),
+    ] {
+        let differs = outcome.differs_from(want_messages, want_bytes);
+        if update && differs {
+            outcome = JetStreamBackend::update_quotas(&config, id, kind).await?;
+        }
+        let verb = if outcome.created {
+            "created"
+        } else if update && differs {
+            "updated"
+        } else {
+            "exists"
+        };
+        println!(
+            "team '{team}': '{}' ({what}) {verb}: up to {} messages / {} ({} bytes), holding {} \
+             messages / {}",
+            outcome.name,
+            outcome.max_messages,
+            format_size(outcome.max_bytes),
+            outcome.max_bytes,
+            outcome.messages,
+            format_size(outcome.bytes as i64)
+        );
+        if differs && !update && !outcome.created {
+            kept.push(format!(
+                "'{}' keeps {} messages / {} (you asked for {} / {})",
+                outcome.name,
+                outcome.max_messages,
+                format_size(outcome.max_bytes),
+                want_messages,
+                format_size(want_bytes)
+            ));
+        }
+    }
+    if !kept.is_empty() {
+        println!(
+            "Existing limits were kept: {}. Pass --update-quotas to apply the requested ones; \
+             a ceiling below what a stream already holds is refused.",
+            kept.join("; ")
+        );
+    }
+    println!(
+        "Reservation note: every stream's max_bytes counts against the broker's max_file_store \
+         from creation, used or not."
+    );
     println!(
         "This routes nobody. `team capability --team {team} --backend jetstream` is what \
          sends new conversations there."

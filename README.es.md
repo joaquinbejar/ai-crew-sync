@@ -1006,9 +1006,19 @@ de broker que se salta a sí mismo no prueba nada y parece un pase.
 Dos pasos independientes, en este orden, y ninguno implica al otro:
 
 ```bash
-# 1. El stream. Acción de operador con la credencial de APROVISIONAMIENTO:
+# 1. Los streams. Acción de operador con la credencial de APROVISIONAMIENTO:
 #    la del servidor no puede crear streams, a propósito.
-ai-crew-sync team stream --team acme --nats-url nats://broker:4222
+#    Las cuotas se reservan contra el max_file_store del broker al crearlos,
+#    se usen o no (por defecto: cuerpos 2 GiB / 100.000 mensajes,
+#    referencias de inbox 256 MiB / 100.000). Dimensiónalas para el broker
+#    que tienes.
+ai-crew-sync team stream --team acme --nats-url nats://broker:4222 \
+    --max-bytes 512MiB --inbox-max-bytes 32MiB
+# Repetirlo conserva los límites de un stream que ya existe y lo dice;
+# cambiarlos es explícito, y se rechaza por debajo de lo que el stream ya
+# guarda:
+ai-crew-sync team stream --team acme --nats-url nats://broker:4222 \
+    --max-bytes 1GiB --update-quotas
 
 # 2. La ruta. Desde ahora, las conversaciones NUEVAS de este equipo guardan
 #    sus cuerpos en el broker.

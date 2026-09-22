@@ -252,6 +252,24 @@ enum TeamCmd {
         /// team still routes new conversations there.
         #[arg(long)]
         remove: bool,
+        /// Body stream quota, reserved against the broker's max_file_store
+        /// at creation (bytes, or KiB/MiB/GiB). Default 2 GiB.
+        #[arg(long, default_value = "2GiB")]
+        max_bytes: String,
+        /// Body stream message ceiling. Default 100000.
+        #[arg(long, default_value_t = ai_crew_sync::store::jetstream::DEFAULT_MAX_MESSAGES)]
+        max_messages: i64,
+        /// Inbox stream quota (references, a few hundred bytes each).
+        /// Default 256 MiB.
+        #[arg(long, default_value = "256MiB")]
+        inbox_max_bytes: String,
+        /// Inbox stream message ceiling. Default 100000.
+        #[arg(long, default_value_t = ai_crew_sync::store::jetstream::DEFAULT_INBOX_MAX_MESSAGES)]
+        inbox_max_messages: i64,
+        /// Apply the quotas to streams that already exist. Without it an
+        /// existing stream keeps its limits and the command says so.
+        #[arg(long)]
+        update_quotas: bool,
     },
     /// Report what a team is storing (counts and bytes; never content).
     Usage {
@@ -834,7 +852,31 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
                 nats_url,
                 nats_credentials,
                 remove,
-            } => admin::team_stream(&pool, &team, &nats_url, nats_credentials, remove).await?,
+                max_bytes,
+                max_messages,
+                inbox_max_bytes,
+                inbox_max_messages,
+                update_quotas,
+            } => {
+                let quotas = admin::StreamQuotas {
+                    max_bytes: ai_crew_sync::store::jetstream::parse_size(&max_bytes)
+                        .map_err(|e| anyhow::anyhow!("--max-bytes: {e}"))?,
+                    max_messages,
+                    inbox_max_bytes: ai_crew_sync::store::jetstream::parse_size(&inbox_max_bytes)
+                        .map_err(|e| anyhow::anyhow!("--inbox-max-bytes: {e}"))?,
+                    inbox_max_messages,
+                };
+                admin::team_stream(
+                    &pool,
+                    &team,
+                    &nats_url,
+                    nats_credentials,
+                    remove,
+                    quotas,
+                    update_quotas,
+                )
+                .await?
+            }
             TeamCmd::Usage { team } => admin::team_usage(&pool, &team).await?,
             TeamCmd::Prune {
                 team,

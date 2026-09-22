@@ -90,9 +90,36 @@ Two streams per team, with deliberately different policies:
 | `ACS_T_<team>` | Message bodies | Limits (count, bytes) | **New** | Full means refuse new writes. Dropping history to make room is not a trade an operator agreed to. |
 | `ACS_I_<team>` | Inbox references | Limits + `max_age` 7 days | Old | A reference is a cache. Postgres can rebuild it; dropping the oldest is correct. |
 
-Defaults: 100,000 messages and 2 GiB per body stream. Both are
-`Config` fields, because the right number depends on the disk the broker
-actually has.
+Defaults: 100,000 messages and 2 GiB for the body stream, 100,000
+references and 256 MiB for the inbox stream. Both are `team stream` flags
+(`--max-bytes`, `--max-messages`, `--inbox-max-bytes`,
+`--inbox-max-messages`; sizes as bytes or `KiB`/`MiB`/`GiB`), because the
+right number depends on the disk the broker actually has. A body quota
+below 2 MiB (one maximum-size message) is refused before the broker is
+asked.
+
+**Reservations, not bytes used.** The broker reserves every stream's
+`max_bytes` against its `max_file_store` the moment the stream is created.
+Two teams on the defaults reserve 2 × (2 GiB + 256 MiB) whether they hold a
+message or not, and a third team is refused on an 8 GiB store even with a
+few megabytes actually stored. The arithmetic to keep in mind:
+
+```
+Σ max_bytes of every stream on the broker  ≤  max_file_store
+```
+
+When it does not fit, `team stream` says so with the numbers (requested,
+reserved, actually used, the store's budget) instead of the broker's bare
+"insufficient storage resources available" (error 10047), and the ways out
+are the ones it lists: a smaller quota, a lower quota on another stream,
+removing a stream, or a bigger `max_file_store`.
+
+**Changing a quota is explicit.** A routine `team stream` on a team whose
+streams exist keeps their limits, whatever it was asked, and reports what
+it kept; `--update-quotas` applies the requested limits and is refused
+where a stream already holds more messages or bytes than the new ceiling
+(prune first with `team prune`). Bodies and references are never touched by
+either path.
 
 **Sizing.** Bodies are capped at 1 MiB but real ones are a few KiB. For a
 team of ten agents at a sustained thousand conversation messages a day and
@@ -117,9 +144,11 @@ version of this.
 ## Activation
 
 ```bash
-# 1. Streams, with the provisioning credential.
+# 1. Streams, with the provisioning credential and quotas sized for the
+#    broker (see Reservations above).
 ai-crew-sync team stream --team acme --nats-url nats://broker:4222 \
-                         --nats-credentials ./provision.creds
+                         --nats-credentials ./provision.creds \
+                         --max-bytes 512MiB --inbox-max-bytes 32MiB
 
 # 2. The server, with the runtime credential.
 ai-crew-sync serve --nats-url nats://broker:4222 \
