@@ -1136,9 +1136,10 @@ impl Proxy {
                 // reply the caller gets is the fetch, never this one: the
                 // confirmation is the proxy's business.
                 let settled = settled_ids(confirmation.structured_content.as_ref(), &to_confirm);
+                let sent: std::collections::HashSet<&String> = to_confirm.iter().collect();
                 let mut left = 0usize;
                 for entry in held.iter_mut() {
-                    if to_confirm.contains(&entry.delivery_id) {
+                    if sent.contains(&entry.delivery_id) {
                         if settled.contains(&entry.delivery_id) {
                             entry.confirmed = true;
                         } else {

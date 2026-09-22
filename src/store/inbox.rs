@@ -679,22 +679,24 @@ async fn reconcile_receipt_events(
     Ok(out)
 }
 
-/// The caller says it holds these references durably. Only now is
-/// `delivered_at` written, and only after that is the broker acknowledged.
-///
-/// Idempotent in both directions: confirming twice changes nothing, and a
-/// reference redelivered because an acknowledgement was lost is recognised
-/// and acknowledged rather than delivered again.
 /// What a confirmation did: the ids committed now, and the ids of this
-/// caller's deliveries that were already confirmed. A retry after a lost
-/// response sees the second list and stops retrying; an id that is not
-/// the caller's, or was handed out at another epoch, appears in neither.
+/// caller's deliveries that were already confirmed, at whatever epoch of
+/// this window they were confirmed (a process resumed since then owes
+/// nothing for them either, which is the point of telling it). An id that
+/// is not the caller's appears in neither list, and neither does one this
+/// call could not confirm because it was handed out at another epoch.
 #[derive(Debug)]
 pub struct Confirmed {
     pub confirmed: Vec<Uuid>,
     pub already_confirmed: Vec<Uuid>,
 }
 
+/// The caller says it holds these references durably. Only now is
+/// `delivered_at` written, and only after that is the broker acknowledged.
+///
+/// Idempotent in both directions: confirming twice changes nothing, and a
+/// reference redelivered because an acknowledgement was lost is recognised
+/// and acknowledged rather than delivered again.
 pub async fn confirm(
     pool: &PgPool,
     backends: &crate::store::routing::Backends,
