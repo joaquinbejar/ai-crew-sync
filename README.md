@@ -499,10 +499,15 @@ that one session, and:
 - **refuses a contradicting header.** A request whose `X-Crew-Session` names a
   different window is rejected, so a proven session can never be widened into
   somebody else's;
-- **fences what it replaces.** Registering the same label again is a *resume*:
-  new secret, `epoch` bumped, identity and history unchanged. Send the epoch
-  as `X-Crew-Epoch` and a process that was resumed away is told so
-  (`409`) instead of writing as the window that replaced it.
+- **is not handed to whoever holds the agent token.** Registering a label
+  that is live is *refused* (`409`): the only way back into a window is its
+  own credential, through `resume_session`, which issues a new secret, bumps
+  `epoch` and leaves identity and history unchanged. A label whose credential
+  has expired or been revoked can be registered again, as a new window under
+  the old name;
+- **fences what it replaces.** Send the epoch as `X-Crew-Epoch` and a process
+  that was resumed away is told so (`409`) instead of writing as the window
+  that replaced it.
 
 `renew_session` extends the credential you already hold without touching its
 secret or epoch. `revoke_session` closes it, or another window of your own
@@ -553,9 +558,13 @@ The proxy does this for you: it registers the session on connect, forwards
 every call with the credential and the epoch, renews the credential half-way
 through its lifetime whether the window is busy or idle (`BUS_SESSION_TTL_SECS`
 and `BUS_SESSION_RENEW_LEAD_SECS` tune the lifetime it asks for and the lead),
-and clears the secret from its private state when the window closes. A
-renewal the bus refuses is reported by `session_status` as a rejected
-credential, never papered over with another identity. A bus too old to issue
+and, when the window closes, stamps its binding as closed. The credential
+itself **stays** in that 0600 file: it is the only way to resume the same
+window after a restart of the conversation, since the bus refuses to hand a
+live session to the agent token. A closed binding is unusable by hooks, and
+the credential keeps only the lifetime the bus gave it; `revoke_session`
+ends it early. A renewal the bus refuses is reported by `session_status` as
+a rejected credential, never papered over with another identity. A bus too old to issue
 credentials simply keeps the label-only connection.
 
 **Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
