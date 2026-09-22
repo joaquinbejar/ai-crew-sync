@@ -51,10 +51,19 @@ pub const MSG_ID_HEADER: &str = "Nats-Msg-Id";
 /// broker in the adapter test, not assumed.
 pub const MAX_BROKER_MESSAGE_BYTES: i64 = 2 * 1024 * 1024;
 
-/// Bodies a team's stream retains before the oldest are dropped. Bounded on
+/// Bodies a team's stream retains before new writes are refused. Bounded on
 /// purpose: a stream with no ceiling is an outage waiting for a quiet week.
+/// Every stream's `max_bytes` is **reserved** against the broker's
+/// `max_file_store` the moment it is created, used or not, so these are
+/// the numbers an operator sizes the broker by (`team stream` takes
+/// smaller ones).
 pub const DEFAULT_MAX_MESSAGES: i64 = 100_000;
 pub const DEFAULT_MAX_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+/// The inbox stream holds references (a few hundred bytes each, gone after
+/// seven days or on acknowledgement), so its reservation is a fraction of
+/// the body stream's.
+pub const DEFAULT_INBOX_MAX_MESSAGES: i64 = 100_000;
+pub const DEFAULT_INBOX_MAX_BYTES: i64 = 256 * 1024 * 1024;
 
 /// Stream name for one team. Stable, opaque and derived from the team id, so
 /// renaming a team never moves its data and a slug never reaches the broker.
@@ -140,11 +149,15 @@ pub struct Config {
     /// Runtime credential: publish and fetch only. Provisioning uses a
     /// different one, which the server process does not hold.
     pub credentials: Option<String>,
-    /// Per-team stream ceilings. Quotas are an operator decision — the
-    /// right number depends on the disk the broker actually has — so they
-    /// are configuration with a documented default, not a constant.
+    /// Per-team stream ceilings for the body stream. Quotas are an operator
+    /// decision — the right number depends on the disk the broker actually
+    /// has — so they are configuration with a documented default, not a
+    /// constant.
     pub max_messages: i64,
     pub max_bytes: i64,
+    /// The inbox stream's own ceilings, independent of the body stream's.
+    pub inbox_max_messages: i64,
+    pub inbox_max_bytes: i64,
 }
 
 impl Config {
@@ -156,14 +169,203 @@ impl Config {
             credentials: None,
             max_messages: DEFAULT_MAX_MESSAGES,
             max_bytes: DEFAULT_MAX_BYTES,
+            inbox_max_messages: DEFAULT_INBOX_MAX_MESSAGES,
+            inbox_max_bytes: DEFAULT_INBOX_MAX_BYTES,
         }
     }
 
-    /// Smaller ceilings, for a fixture whose broker has a small store.
+    /// Smaller ceilings for both streams, for a fixture whose broker has a
+    /// small store.
     pub fn with_limits(mut self, max_messages: i64, max_bytes: i64) -> Self {
         self.max_messages = max_messages;
         self.max_bytes = max_bytes;
+        self.inbox_max_messages = max_messages;
+        self.inbox_max_bytes = max_bytes;
         self
+    }
+
+    /// Ceilings for the inbox stream alone.
+    pub fn with_inbox_limits(mut self, max_messages: i64, max_bytes: i64) -> Self {
+        self.inbox_max_messages = max_messages;
+        self.inbox_max_bytes = max_bytes;
+        self
+    }
+
+    /// Refuse quotas that could never work before the broker is asked: a
+    /// body stream must hold at least one maximum-size message, and a
+    /// count of zero would refuse every write.
+    pub fn validate_quotas(&self) -> BusResult<()> {
+        if self.max_bytes < MAX_BROKER_MESSAGE_BYTES {
+            return Err(BusError::invalid(format!(
+                "--max-bytes must be at least {} ({}), the largest message the body stream \
+                 accepts; {} would refuse every body",
+                MAX_BROKER_MESSAGE_BYTES,
+                format_size(MAX_BROKER_MESSAGE_BYTES),
+                format_size(self.max_bytes)
+            )));
+        }
+        if self.inbox_max_bytes < MIN_INBOX_BYTES {
+            return Err(BusError::invalid(format!(
+                "--inbox-max-bytes must be at least {} ({}); references are small but a \
+                 team sends many",
+                MIN_INBOX_BYTES,
+                format_size(MIN_INBOX_BYTES)
+            )));
+        }
+        if self.max_messages < 1 || self.inbox_max_messages < 1 {
+            return Err(BusError::invalid(
+                "--max-messages and --inbox-max-messages must be at least 1",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The smallest inbox reservation `team stream` accepts.
+pub const MIN_INBOX_BYTES: i64 = 1024 * 1024;
+
+/// Parse an operator-typed size: plain bytes, or a number with `K`, `M`, `G`
+/// (or `KiB`, `MiB`, `GiB`, `KB`, `MB`, `GB`), case-insensitive, all
+/// binary multiples. `1GiB`, `512 MiB`, `1048576` all work.
+pub fn parse_size(raw: &str) -> Result<i64, String> {
+    let text = raw.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, unit) = text.split_at(split);
+    if digits.is_empty() {
+        return Err(format!(
+            "'{raw}' is not a size; write bytes, or a number with KiB, MiB or GiB"
+        ));
+    }
+    let number: i64 = digits
+        .parse()
+        .map_err(|_| format!("'{raw}' is too large a number"))?;
+    let multiplier: i64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        other => {
+            return Err(format!(
+                "'{raw}': unknown unit '{other}'; use bytes, KiB, MiB or GiB"
+            ));
+        }
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("'{raw}' is too large a size"))
+}
+
+/// A size for a human, in the unit that reads best.
+pub fn format_size(bytes: i64) -> String {
+    const GIB: i64 = 1024 * 1024 * 1024;
+    const MIB: i64 = 1024 * 1024;
+    const KIB: i64 = 1024;
+    if bytes >= GIB && bytes % GIB == 0 {
+        format!("{} GiB", bytes / GIB)
+    } else if bytes >= MIB && bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB && bytes % KIB == 0 {
+        format!("{} KiB", bytes / KIB)
+    } else if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Which of a team's two streams an operation addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamKind {
+    Bodies,
+    Inbox,
+}
+
+/// What provisioning found or made: the stream, whether this call created
+/// it, the limits it has **now** (an existing stream keeps its own; see
+/// [`JetStreamBackend::update_quotas`]) and what it currently holds.
+#[derive(Clone, Debug)]
+pub struct Provisioned {
+    pub name: String,
+    pub created: bool,
+    pub max_messages: i64,
+    pub max_bytes: i64,
+    pub messages: u64,
+    pub bytes: u64,
+}
+
+impl Provisioned {
+    /// Whether the stream's limits differ from what the caller asked for.
+    pub fn differs_from(&self, max_messages: i64, max_bytes: i64) -> bool {
+        self.max_messages != max_messages || self.max_bytes != max_bytes
+    }
+
+    /// Whether the stream holds more than its ceiling allows; after an
+    /// update this means a publisher got in between the check and the
+    /// change.
+    pub fn over_ceiling(&self) -> bool {
+        (self.messages as i64) > self.max_messages || (self.bytes as i64) > self.max_bytes
+    }
+}
+
+/// A vetted quota change: the limits to restore on rollback, the limits
+/// asked for, and what the stream holds.
+#[derive(Clone, Debug)]
+pub struct QuotaChange {
+    pub name: String,
+    pub kind: StreamKind,
+    pub current_max_messages: i64,
+    pub current_max_bytes: i64,
+    pub wanted_max_messages: i64,
+    pub wanted_max_bytes: i64,
+    pub messages: u64,
+    pub bytes: u64,
+}
+
+impl QuotaChange {
+    /// Bytes the broker must reserve on top of what this stream already
+    /// reserves; zero for a decrease.
+    pub fn additional_bytes(&self) -> i64 {
+        (self.wanted_max_bytes - self.current_max_bytes).max(0)
+    }
+}
+
+/// The broker's storage account, in bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct StorageAccount {
+    pub used: u64,
+    pub reserved: u64,
+    pub budget: Option<i64>,
+}
+
+impl StorageAccount {
+    /// Whether `additional` more reserved bytes fit the budget.
+    pub fn fits(&self, additional: i64) -> bool {
+        match self.budget {
+            Some(budget) => (self.reserved as i64).saturating_add(additional) <= budget,
+            None => true,
+        }
+    }
+
+    /// One sentence with the numbers, for a refusal.
+    pub fn describe(&self) -> String {
+        let budget = match self.budget {
+            Some(m) => format!("the account's storage budget is {} ({})", m, format_size(m)),
+            None => "the account has no storage limit of its own, so the ceiling is the \
+                     server's max_file_store"
+                .to_owned(),
+        };
+        format!(
+            "{budget}; {} ({}) is already reserved by existing streams' max_bytes while only \
+             {} ({}) is actually used",
+            self.reserved,
+            format_size(self.reserved as i64),
+            self.used,
+            format_size(self.used as i64)
+        )
     }
 }
 
@@ -201,63 +403,245 @@ impl JetStreamBackend {
         })
     }
 
-    /// Create or update a team's stream. Operator action: run with the
-    /// provisioning credential, not the one the server runs with.
-    pub async fn provision(config: &Config, team_id: Uuid) -> BusResult<String> {
-        let client = connect_client(config).await?;
-        let context = jetstream::new(client);
-        let name = stream_name(team_id);
-        context
-            .get_or_create_stream(jetstream::stream::Config {
-                name: name.clone(),
-                subjects: vec![subject_filter(team_id)],
-                // File-backed, bounded, and refusing new writes when full
-                // rather than silently dropping the oldest history.
-                storage: jetstream::stream::StorageType::File,
-                retention: jetstream::stream::RetentionPolicy::Limits,
-                discard: jetstream::stream::DiscardPolicy::New,
-                max_messages: config.max_messages,
-                max_bytes: config.max_bytes,
-                max_message_size: MAX_BROKER_MESSAGE_BYTES as i32,
-                // History reads go straight to the stream rather than
-                // through a consumer: a body fetched by locator is a point
-                // read, not a subscription, and a consumer per read would
-                // be a consumer per read.
-                allow_direct: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| BusError::invalid(format!("could not provision '{name}': {e}")))?;
-        Ok(name)
+    /// The body stream's configuration, as `provision` creates it and
+    /// `update_quotas` rewrites it: one place, so the two never drift.
+    fn bodies_config(
+        team_id: Uuid,
+        max_messages: i64,
+        max_bytes: i64,
+    ) -> jetstream::stream::Config {
+        jetstream::stream::Config {
+            name: stream_name(team_id),
+            subjects: vec![subject_filter(team_id)],
+            // File-backed, bounded, and refusing new writes when full
+            // rather than silently dropping the oldest history.
+            storage: jetstream::stream::StorageType::File,
+            retention: jetstream::stream::RetentionPolicy::Limits,
+            discard: jetstream::stream::DiscardPolicy::New,
+            max_messages,
+            max_bytes,
+            max_message_size: MAX_BROKER_MESSAGE_BYTES as i32,
+            // History reads go straight to the stream rather than through
+            // a consumer: a body fetched by locator is a point read, not a
+            // subscription, and a consumer per read would be a consumer per
+            // read.
+            allow_direct: true,
+            ..Default::default()
+        }
     }
 
-    /// Create or update a team's inbox stream. Same operator action and
-    /// same credential as `provision`; separate so a deployment can see
-    /// what each stream costs.
-    pub async fn provision_inbox(config: &Config, team_id: Uuid) -> BusResult<String> {
+    /// The inbox stream's configuration; see `bodies_config`.
+    fn inbox_config(team_id: Uuid, max_messages: i64, max_bytes: i64) -> jetstream::stream::Config {
+        jetstream::stream::Config {
+            name: inbox_stream_name(team_id),
+            subjects: vec![inbox_filter(team_id)],
+            storage: jetstream::stream::StorageType::File,
+            // A reference is work: it is removed when its recipient
+            // acknowledges it. With one exact subject per recipient and one
+            // consumer on it, two recipients can never compete for each
+            // other's references.
+            retention: jetstream::stream::RetentionPolicy::WorkQueue,
+            discard: jetstream::stream::DiscardPolicy::Old,
+            max_age: std::time::Duration::from_secs(INBOX_MAX_AGE_SECS),
+            max_messages,
+            max_bytes,
+            allow_direct: true,
+            ..Default::default()
+        }
+    }
+
+    fn stream_config(
+        config: &Config,
+        team_id: Uuid,
+        kind: StreamKind,
+    ) -> jetstream::stream::Config {
+        match kind {
+            StreamKind::Bodies => {
+                Self::bodies_config(team_id, config.max_messages, config.max_bytes)
+            }
+            StreamKind::Inbox => {
+                Self::inbox_config(team_id, config.inbox_max_messages, config.inbox_max_bytes)
+            }
+        }
+    }
+
+    /// Create a team's body stream, or find it. Operator action: run with
+    /// the provisioning credential, not the one the server runs with.
+    ///
+    /// An existing stream **keeps its limits**, whatever `config` asks for:
+    /// a routine retry must never shrink or grow a quota on the quiet.
+    /// [`Provisioned::created`] and [`Provisioned::differs_from`] tell the
+    /// caller what happened, and [`Self::update_quotas`] is the explicit
+    /// way to change them.
+    pub async fn provision(config: &Config, team_id: Uuid) -> BusResult<Provisioned> {
+        Self::provision_kind(config, team_id, StreamKind::Bodies).await
+    }
+
+    /// Create or find a team's inbox stream. Same operator action and same
+    /// credential as `provision`; separate so a deployment can see what
+    /// each stream costs.
+    pub async fn provision_inbox(config: &Config, team_id: Uuid) -> BusResult<Provisioned> {
+        Self::provision_kind(config, team_id, StreamKind::Inbox).await
+    }
+
+    async fn provision_kind(
+        config: &Config,
+        team_id: Uuid,
+        kind: StreamKind,
+    ) -> BusResult<Provisioned> {
+        config.validate_quotas()?;
         let client = connect_client(config).await?;
         let context = jetstream::new(client);
-        let name = inbox_stream_name(team_id);
-        context
-            .get_or_create_stream(jetstream::stream::Config {
-                name: name.clone(),
-                subjects: vec![inbox_filter(team_id)],
-                storage: jetstream::stream::StorageType::File,
-                // A reference is work: it is removed when its recipient
-                // acknowledges it. With one exact subject per recipient and
-                // one consumer on it, two recipients can never compete for
-                // each other's references.
-                retention: jetstream::stream::RetentionPolicy::WorkQueue,
-                discard: jetstream::stream::DiscardPolicy::Old,
-                max_age: std::time::Duration::from_secs(INBOX_MAX_AGE_SECS),
-                max_messages: config.max_messages,
-                max_bytes: config.max_bytes,
-                allow_direct: true,
-                ..Default::default()
-            })
+        let wanted = Self::stream_config(config, team_id, kind);
+        let name = wanted.name.clone();
+        let requested_bytes = wanted.max_bytes;
+        // Existing: found, limits untouched. Missing: created with the
+        // requested limits. `get_or_create_stream` is exactly that.
+        let existed = context.get_stream(&name).await.is_ok();
+        let mut stream = match context.get_or_create_stream(wanted).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                return Err(
+                    provisioning_error(&context, &name, "create", requested_bytes, e).await,
+                );
+            }
+        };
+        let info = stream
+            .info()
             .await
-            .map_err(|e| BusError::invalid(format!("could not provision '{name}': {e}")))?;
-        Ok(name)
+            .map_err(|e| BusError::invalid(format!("could not read '{name}' back: {e}")))?;
+        Ok(Provisioned {
+            name,
+            created: !existed,
+            max_messages: info.config.max_messages,
+            max_bytes: info.config.max_bytes,
+            messages: info.state.messages,
+            bytes: info.state.bytes,
+        })
+    }
+
+    /// What changing a stream's quotas would do, without doing it: the
+    /// limits it has now (what a rollback restores), what it holds, and the
+    /// extra bytes the broker would have to reserve. Refused when the
+    /// stream already holds more than the new ceiling would allow, since a
+    /// ceiling below the current contents would make the next write fail
+    /// (bodies) or start dropping (references) at once.
+    pub async fn check_update(
+        config: &Config,
+        team_id: Uuid,
+        kind: StreamKind,
+    ) -> BusResult<QuotaChange> {
+        config.validate_quotas()?;
+        let client = connect_client(config).await?;
+        let context = jetstream::new(client);
+        let wanted = Self::stream_config(config, team_id, kind);
+        let name = wanted.name.clone();
+        let mut current = context.get_stream(&name).await.map_err(|e| {
+            BusError::invalid(format!(
+                "stream '{name}' does not exist ({e}); provision it first, quotas are set at \
+                 creation and changed here"
+            ))
+        })?;
+        let info = current
+            .info()
+            .await
+            .map_err(|e| BusError::invalid(format!("could not read '{name}': {e}")))?;
+        if (info.state.messages as i64) > wanted.max_messages {
+            return Err(BusError::invalid(format!(
+                "stream '{name}' holds {} messages, more than the requested ceiling of {}; \
+                 nothing was changed. Prune first (`team prune`) or ask for a higher count",
+                info.state.messages, wanted.max_messages
+            )));
+        }
+        if (info.state.bytes as i64) > wanted.max_bytes {
+            return Err(BusError::invalid(format!(
+                "stream '{name}' holds {} ({}), more than the requested ceiling of {} ({}); \
+                 nothing was changed. Prune first (`team prune`) or ask for a higher quota",
+                info.state.bytes,
+                format_size(info.state.bytes as i64),
+                wanted.max_bytes,
+                format_size(wanted.max_bytes)
+            )));
+        }
+        Ok(QuotaChange {
+            name,
+            kind,
+            current_max_messages: info.config.max_messages,
+            current_max_bytes: info.config.max_bytes,
+            wanted_max_messages: wanted.max_messages,
+            wanted_max_bytes: wanted.max_bytes,
+            messages: info.state.messages,
+            bytes: info.state.bytes,
+        })
+    }
+
+    /// Change an existing stream's quotas to what `config` asks for: the
+    /// explicit counterpart of the retry that keeps them. Runs
+    /// [`Self::check_update`] first. The check is a snapshot: a publisher can
+    /// add to the stream between it and the update, so the outcome carries
+    /// the contents read back afterwards and the caller says so when they
+    /// exceed the new ceiling. Neither stream loses data to that race: the
+    /// body stream discards **new** writes when full, and an inbox reference
+    /// the broker drops is rebuilt from Postgres, which is its authority.
+    pub async fn update_quotas(
+        config: &Config,
+        team_id: Uuid,
+        kind: StreamKind,
+    ) -> BusResult<Provisioned> {
+        let change = Self::check_update(config, team_id, kind).await?;
+        Self::apply_update(config, team_id, kind, &change).await
+    }
+
+    /// Apply a change that [`Self::check_update`] already vetted.
+    pub async fn apply_update(
+        config: &Config,
+        team_id: Uuid,
+        kind: StreamKind,
+        change: &QuotaChange,
+    ) -> BusResult<Provisioned> {
+        let client = connect_client(config).await?;
+        let context = jetstream::new(client);
+        let wanted = Self::stream_config(config, team_id, kind);
+        let name = wanted.name.clone();
+        let info = match context.update_stream(wanted).await {
+            Ok(info) => info,
+            Err(e) => {
+                return Err(provisioning_error(
+                    &context,
+                    &name,
+                    "update",
+                    change.additional_bytes(),
+                    e,
+                )
+                .await);
+            }
+        };
+        Ok(Provisioned {
+            name,
+            created: false,
+            max_messages: info.config.max_messages,
+            max_bytes: info.config.max_bytes,
+            messages: info.state.messages,
+            bytes: info.state.bytes,
+        })
+    }
+
+    /// The broker's storage account as it stands: bytes used, bytes
+    /// reserved by every stream's `max_bytes`, and the store's budget
+    /// (`None` when the account is unlimited). Lets a caller refuse a
+    /// change that could not be reserved before touching anything.
+    pub async fn storage_account(config: &Config) -> BusResult<StorageAccount> {
+        let client = connect_client(config).await?;
+        let context = jetstream::new(client);
+        let account = context
+            .query_account()
+            .await
+            .map_err(|e| BusError::invalid(format!("could not read the broker's account: {e}")))?;
+        Ok(StorageAccount {
+            used: account.storage,
+            reserved: account.reserved_storage,
+            budget: account.limits.max_storage.filter(|m| *m > 0),
+        })
     }
 
     /// Publish one reference to a recipient's own subject.
@@ -478,6 +862,52 @@ impl JetStreamBackend {
     }
 }
 
+/// Turn a create or update failure into something an operator can act on.
+/// The one that bites in practice is 10047, "insufficient storage
+/// resources": the broker reserves every stream's `max_bytes` against its
+/// `max_file_store` when the stream is created or enlarged, so a store can
+/// be almost empty and still refuse. Say so, with the numbers when the
+/// account answers and with an honest "unavailable" when it does not.
+/// `additional_bytes` is what the operation asked the broker to reserve on
+/// top of what it already had: the whole quota for a new stream, the
+/// difference for an update.
+async fn provisioning_error(
+    context: &jetstream::Context,
+    name: &str,
+    operation: &str,
+    additional_bytes: i64,
+    error: jetstream::context::CreateStreamError,
+) -> BusError {
+    let exhausted = matches!(
+        error.kind(),
+        jetstream::context::CreateStreamErrorKind::JetStream(e)
+            if e.error_code() == jetstream::ErrorCode::STORAGE_RESOURCES_EXCEEDED
+    );
+    if !exhausted {
+        return BusError::invalid(format!("could not {operation} '{name}': {error}"));
+    }
+    let account = match context.query_account().await {
+        Ok(a) => StorageAccount {
+            used: a.storage,
+            reserved: a.reserved_storage,
+            budget: a.limits.max_storage.filter(|m| *m > 0),
+        }
+        .describe(),
+        Err(e) => format!(
+            "the broker's account statistics are unavailable ({e}), so the reserved and used \
+             figures cannot be shown; `nats account info` on the broker has them"
+        ),
+    };
+    BusError::invalid(format!(
+        "could not {operation} '{name}': the broker cannot reserve {} ({}) more. Reservation, \
+         not disk, is what ran out: {account}. Ask for a smaller quota (--max-bytes / \
+         --inbox-max-bytes), lower another stream's quota (`team stream --update-quotas`) or \
+         remove one, or raise the broker's max_file_store.",
+        additional_bytes,
+        format_size(additional_bytes)
+    ))
+}
+
 async fn connect_client(config: &Config) -> BusResult<async_nats::Client> {
     let options = match &config.credentials {
         Some(path) => {
@@ -663,6 +1093,49 @@ fn classify(error: &str) -> Published {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_parse_in_binary_units_and_refuse_nonsense() {
+        assert_eq!(parse_size("1048576").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("64MiB").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_size("64 mib").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_size("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("512kb").unwrap(), 512 * 1024);
+        assert!(parse_size("").unwrap_err().contains("not a size"));
+        assert!(parse_size("MiB").unwrap_err().contains("not a size"));
+        assert!(
+            parse_size("12 parsecs")
+                .unwrap_err()
+                .contains("unknown unit")
+        );
+        assert!(
+            parse_size("99999999999999999999")
+                .unwrap_err()
+                .contains("too large")
+        );
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2 GiB");
+        assert_eq!(format_size(256 * 1024 * 1024), "256 MiB");
+        assert_eq!(format_size(1536 * 1024), "1536 KiB");
+        assert_eq!(format_size(5_289_810), "5.0 MiB");
+    }
+
+    #[test]
+    fn quotas_are_validated_before_the_broker_is_asked() {
+        let ok = Config::new("nats://x").with_limits(10, 4 * 1024 * 1024);
+        assert!(ok.validate_quotas().is_ok());
+        let tiny = Config::new("nats://x").with_limits(10, MAX_BROKER_MESSAGE_BYTES - 1);
+        let err = tiny.validate_quotas().unwrap_err().to_string();
+        assert!(err.contains("--max-bytes must be at least"), "{err}");
+        let inbox = Config::new("nats://x").with_inbox_limits(10, MIN_INBOX_BYTES - 1);
+        let err = inbox.validate_quotas().unwrap_err().to_string();
+        assert!(err.contains("--inbox-max-bytes"), "{err}");
+        let none = Config::new("nats://x").with_limits(0, 4 * 1024 * 1024);
+        let err = none.validate_quotas().unwrap_err().to_string();
+        assert!(err.contains("at least 1"), "{err}");
+        let defaults = Config::new("nats://x");
+        assert_eq!(defaults.inbox_max_bytes, DEFAULT_INBOX_MAX_BYTES);
+        assert!(defaults.inbox_max_bytes < defaults.max_bytes);
+    }
 
     #[test]
     fn names_are_opaque_and_stable() {

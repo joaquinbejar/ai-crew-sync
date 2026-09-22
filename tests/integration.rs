@@ -7637,7 +7637,8 @@ async fn the_jetstream_adapter_holds_its_contract_against_a_real_broker() {
     assert!(err.contains("Provision it first"), "{err}");
 
     let stream = JetStreamBackend::provision(&config, team).await.unwrap();
-    assert_eq!(stream, jetstream::stream_name(team));
+    assert_eq!(stream.name, jetstream::stream_name(team));
+    assert!(stream.created);
     JetStreamBackend::provision(&config, other_team)
         .await
         .unwrap();
@@ -13089,5 +13090,307 @@ async fn audit_receipt_event_redelivery_after_resume_on_the_postgres_path() {
     for c in [alice_agent, alice1, alice2, bob_agent, bob] {
         let _ = c.cancel().await;
     }
+    h.shutdown().await;
+}
+
+/// Small teams fit on a small broker: three teams provisioned with explicit
+/// quotas on the fixture's 512 MiB store, each stream carrying exactly the
+/// limits asked for, and a quota the store cannot reserve refused with the
+/// arithmetic spelled out rather than "insufficient storage resources"
+/// (#169).
+#[tokio::test]
+async fn small_quotas_let_several_teams_share_a_bounded_broker() {
+    use ai_crew_sync::admin::{StreamQuotas, team_stream};
+    use ai_crew_sync::store::jetstream::{self, Config, JetStreamBackend};
+    let h = require_db_broker!("t_stream_quotas");
+    let mib = 1024 * 1024;
+    let small = StreamQuotas {
+        max_bytes: 32 * mib,
+        max_messages: 5_000,
+        inbox_max_bytes: 4 * mib,
+        inbox_max_messages: 2_000,
+    };
+    let context = async_nats::jetstream::new(
+        async_nats::connect(nats_url())
+            .await
+            .expect("the fixture broker"),
+    );
+    let mut ids = Vec::new();
+    for slug in ["small-a", "small-b", "small-c"] {
+        seed_agent(&h.pool, slug, "x").await;
+        team_stream(&h.pool, slug, &nats_url(), None, false, small, false)
+            .await
+            .expect("a small team provisions");
+        let id = team_id(&h.pool, slug).await;
+        ids.push(id);
+        let mut bodies = context
+            .get_stream(jetstream::stream_name(id))
+            .await
+            .unwrap();
+        let info = bodies.info().await.unwrap();
+        assert_eq!(info.config.max_bytes, 32 * mib, "{slug} bodies");
+        assert_eq!(info.config.max_messages, 5_000, "{slug} bodies");
+        let mut inbox = context
+            .get_stream(jetstream::inbox_stream_name(id))
+            .await
+            .unwrap();
+        let info = inbox.info().await.unwrap();
+        assert_eq!(info.config.max_bytes, 4 * mib, "{slug} inbox");
+        assert_eq!(info.config.max_messages, 2_000, "{slug} inbox");
+    }
+
+    // The fixture's store is 512 MiB; 3 × 36 MiB are reserved. Asking for
+    // 480 MiB more is refused by the broker, and the error says why in
+    // terms an operator can act on.
+    seed_agent(&h.pool, "greedy", "x").await;
+    let greedy = StreamQuotas {
+        max_bytes: 480 * mib,
+        ..small
+    };
+    let err = team_stream(&h.pool, "greedy", &nats_url(), None, false, greedy, false)
+        .await
+        .expect_err("the store cannot reserve that much")
+        .to_string();
+    assert!(err.contains("cannot reserve"), "{err}");
+    assert!(err.contains("max_file_store"), "{err}");
+    assert!(err.contains("already reserved"), "{err}");
+    assert!(err.contains("actually used"), "{err}");
+    assert!(err.contains("--max-bytes"), "{err}");
+
+    // Nonsense is refused before the broker is asked.
+    let tiny = StreamQuotas {
+        max_bytes: 1024,
+        ..small
+    };
+    let err = team_stream(&h.pool, "greedy", &nats_url(), None, false, tiny, false)
+        .await
+        .expect_err("a body stream must hold one body")
+        .to_string();
+    assert!(err.contains("--max-bytes must be at least"), "{err}");
+
+    for id in ids {
+        let config = Config::new(nats_url());
+        JetStreamBackend::deprovision(&config, id).await.unwrap();
+    }
+    h.shutdown().await;
+}
+
+/// A routine `team stream` on a team that already has its streams keeps
+/// their limits whatever it is asked for, and says so. Changing them is
+/// explicit, refused below what a stream holds, and never touches bodies
+/// or references (#169).
+#[tokio::test]
+async fn existing_quotas_are_kept_unless_updated_explicitly() {
+    use ai_crew_sync::admin::{StreamQuotas, team_stream};
+    use ai_crew_sync::store::jetstream::{self, Config, JetStreamBackend, StreamKind};
+    use ai_crew_sync::store::{inbox, outbox};
+    let h = require_db_broker!("t_stream_quota_update");
+    let mib = 1024 * 1024;
+    let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let first = StreamQuotas {
+        max_bytes: 16 * mib,
+        max_messages: 1_000,
+        inbox_max_bytes: 4 * mib,
+        inbox_max_messages: 1_000,
+    };
+    team_stream(&h.pool, "acme", &nats_url(), None, false, first, false)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * mib);
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    // Two bodies on the stream and one reference in the inbox.
+    let owner = connect_with_session(&h.base, &owner_token, "impl").await;
+    let dani_agent = connect(&h.base, &dani_token).await;
+    let cred = call(
+        &dani_agent,
+        "register_session",
+        json!({"session": "review"}),
+    )
+    .await;
+    let dani = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let cid = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "quotas", "private": true, "invite": ["dani/review"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+    for body in ["one", "two"] {
+        call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+        )
+        .await;
+        assert_eq!(
+            outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+            Some(outbox::Settled::Stored)
+        );
+    }
+    assert_eq!(
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap(),
+        2
+    );
+    let context = async_nats::jetstream::new(async_nats::connect(nats_url()).await.unwrap());
+    let limits = |name: String| {
+        let context = context.clone();
+        async move {
+            let mut stream = context.get_stream(name).await.unwrap();
+            let info = stream.info().await.unwrap();
+            (
+                info.config.max_messages,
+                info.config.max_bytes,
+                info.state.messages,
+            )
+        }
+    };
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 2),
+        "the bodies are on the stream"
+    );
+
+    // A retry with other numbers changes nothing.
+    let other = StreamQuotas {
+        max_bytes: 64 * mib,
+        max_messages: 9_000,
+        inbox_max_bytes: 8 * mib,
+        inbox_max_messages: 9_000,
+    };
+    team_stream(&h.pool, "acme", &nats_url(), None, false, other, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 2),
+        "kept"
+    );
+    assert_eq!(
+        limits(jetstream::inbox_stream_name(team)).await,
+        (1_000, 4 * mib, 2),
+        "kept"
+    );
+
+    // An explicit update below what the stream holds is refused, with the
+    // count, and nothing changes.
+    let too_small = StreamQuotas {
+        max_messages: 1,
+        ..first
+    };
+    let err = team_stream(&h.pool, "acme", &nats_url(), None, false, too_small, true)
+        .await
+        .expect_err("two bodies do not fit a ceiling of one")
+        .to_string();
+    assert!(err.contains("holds 2 messages"), "{err}");
+    assert!(err.contains("nothing was changed"), "{err}");
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 2)
+    );
+    // Three large bodies push the stream past 2 MiB, the smallest quota
+    // the command accepts; a byte ceiling below the contents is refused
+    // just like a count.
+    for _ in 0..3 {
+        call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": cid, "body": "x".repeat(800 * 1024), "request_id": request_id()}),
+        )
+        .await;
+        assert_eq!(
+            outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+            Some(outbox::Settled::Stored)
+        );
+    }
+    let err = JetStreamBackend::update_quotas(
+        &Config::new(nats_url()).with_limits(10, 2 * mib),
+        team,
+        StreamKind::Bodies,
+    )
+    .await
+    .expect_err("a byte ceiling below the contents is refused too")
+    .to_string();
+    assert!(err.contains("more than the requested ceiling"), "{err}");
+    assert!(err.contains("MiB"), "{err}");
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 5)
+    );
+
+    // A change the broker cannot reserve leaves the team as it was: the
+    // fixture's store is 512 MiB, and 480 MiB for the inbox on top of
+    // 64 MiB for bodies does not fit. The fixture's account has no budget
+    // of its own, so the refusal comes from the broker when the inbox is
+    // updated, after the body stream was; the command restores the body
+    // stream and says so. Both keep their limits.
+    let too_much = StreamQuotas {
+        inbox_max_bytes: 480 * mib,
+        ..other
+    };
+    let err = team_stream(&h.pool, "acme", &nats_url(), None, false, too_much, true)
+        .await
+        .expect_err("the store cannot reserve that much")
+        .to_string();
+    assert!(err.contains("nothing was changed"), "{err}");
+    assert!(err.contains("Restored"), "{err}");
+    assert!(err.contains("could not update"), "{err}");
+    assert!(err.contains("already reserved"), "{err}");
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (1_000, 16 * mib, 5),
+        "the body stream was not changed on its own"
+    );
+    assert_eq!(
+        limits(jetstream::inbox_stream_name(team)).await,
+        (1_000, 4 * mib, 2)
+    );
+
+    // An explicit update to larger limits applies, and everything stored
+    // is still there.
+    team_stream(&h.pool, "acme", &nats_url(), None, false, other, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        limits(jetstream::stream_name(team)).await,
+        (9_000, 64 * mib, 5),
+        "updated"
+    );
+    assert_eq!(
+        limits(jetstream::inbox_stream_name(team)).await,
+        (9_000, 8 * mib, 2),
+        "updated"
+    );
+    let page = call(&dani, "read_conversation", json!({"conversation_id": cid})).await;
+    let bodies: Vec<&str> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["body"].as_str())
+        .collect();
+    assert_eq!(bodies.len(), 5, "{page}");
+    assert_eq!(&bodies[..2], ["one", "two"], "{page}");
+    let batch = call(&dani, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(batch["from_broker"], 2, "the references survived: {batch}");
+
+    // The fixture broker is shared by every test in the run: give the
+    // reservation back.
+    for c in [owner, dani_agent, dani] {
+        let _ = c.cancel().await;
+    }
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
     h.shutdown().await;
 }
