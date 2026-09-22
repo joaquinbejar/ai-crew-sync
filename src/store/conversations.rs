@@ -1008,19 +1008,36 @@ pub async fn join(pool: &PgPool, auth: &AuthCtx, id: Uuid) -> BusResult<Conversa
     // acknowledge as it — without the audit trail that the documented
     // recovery path carries.
     crate::store::sessions::require_window(pool, auth).await?;
-    // A project thread's invitation is only worth accepting while the
-    // project is still granted; accepting it afterwards would seat someone
-    // the grant no longer covers.
-    let before = access(pool, auth, id).await?;
-    if before.visibility == "project" && !before.by_project {
-        return Err(BusError::Forbidden(
-            "your access to this project has been revoked, so this invitation cannot be \
-             accepted. Ask someone with access to grant it again first."
-                .to_owned(),
-        ));
-    }
     let mut tx = pool.begin().await?;
     crate::store::sessions::guard(&mut tx, auth).await?;
+    // A project thread's invitation is only worth accepting while the
+    // project is still granted, decided inside this transaction with the
+    // grant row share-locked: a revocation that commits first is seen, and
+    // one that is in flight waits for this accept to land or be refused,
+    // so no seat is taken behind a revocation.
+    let project_gate: Option<(bool,)> = sqlx::query_as(
+        "SELECT c.visibility <> 'project'
+                OR EXISTS (SELECT 1 FROM project_agent_access a
+                            WHERE a.project_id = c.project_id AND a.agent_id = $2
+                            FOR SHARE)
+           FROM conversations c WHERE c.id = $1 AND c.team_id = $3",
+    )
+    .bind(id)
+    .bind(auth.agent_id)
+    .bind(auth.team_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match project_gate {
+        Some((true,)) => {}
+        Some((false,)) => {
+            return Err(BusError::Forbidden(
+                "your access to this project has been revoked, so this invitation cannot be \
+                 accepted. Ask someone with access to grant it again first."
+                    .to_owned(),
+            ));
+        }
+        None => return Err(BusError::not_found("no such conversation")),
+    }
     let updated: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE conversation_memberships
             SET state = 'active', accepted_at = now(), session_id = $4
