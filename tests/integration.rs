@@ -10955,3 +10955,129 @@ async fn a_lapsed_lease_reads_as_open_everywhere() {
     }
     h.shutdown().await;
 }
+
+/// Revoking an agent token takes its session credentials with it. Auth
+/// already refused them, but their rows still read as live: recovery
+/// counted a window that could not answer and the label stayed reserved
+/// for a credential that no longer worked, until it expired a day later
+/// (#137). A genuinely live window under another token still protects.
+#[tokio::test]
+async fn a_revoked_token_takes_its_sessions_with_it() {
+    use ai_crew_sync::auth::{generate_token, hash_token, token_prefix};
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_revoked_parent");
+    let token_a = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    // A second credential for the same agent: the replacement.
+    let (agent_id,): (Uuid,) = sqlx::query_as("SELECT id FROM agents WHERE name = 'joaquin'")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let token_b = generate_token();
+    sqlx::query("INSERT INTO api_tokens (agent_id, token_hash, prefix) VALUES ($1, $2, $3)")
+        .bind(agent_id)
+        .bind(hash_token(&token_b))
+        .bind(token_prefix(&token_b))
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (token_a_id,): (Uuid,) = sqlx::query_as("SELECT id FROM api_tokens WHERE token_hash = $1")
+        .bind(hash_token(&token_a))
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+
+    let a = connect(&h.base, &token_a).await;
+    let cred = call(
+        &a,
+        "register_session",
+        json!({"session": "only-window", "ttl_seconds": 3600}),
+    )
+    .await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let convo = call(
+        &window,
+        "create_conversation",
+        json!({"title": "mine alone", "private": true}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(
+        &window,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "before the rotation", "request_id": request_id()}),
+    )
+    .await;
+
+    // While the window lives, the replacement token recovers nothing.
+    let b = connect(&h.base, &token_b).await;
+    let err = call_expect_error(
+        &b,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("still live"), "{err}");
+
+    // The operator revokes the first token (the CLI and the admin API share
+    // this call).
+    store::revoke_token(&h.pool, Actor::Cli, None, token_a_id)
+        .await
+        .unwrap();
+    let (detail,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT detail FROM admin_audit WHERE action = 'token.revoke' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        detail["sessions_revoked"],
+        json!(["only-window"]),
+        "{detail}"
+    );
+
+    // The window's credential is dead, as before.
+    let status = mcp_status(&h.base, cred["session_token"].as_str().unwrap()).await;
+    assert_eq!(status, 401, "the child credential is refused");
+
+    // And now the rows agree with authentication: recovery works, the
+    // label is free, the old secret stays dead.
+    let recovered = call(
+        &b,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert_eq!(
+        recovered["messages"][0]["body"], "before the rotation",
+        "{recovered}"
+    );
+    let again = call(
+        &b,
+        "register_session",
+        json!({"session": "only-window", "ttl_seconds": 3600}),
+    )
+    .await;
+    assert!(again["session_token"].is_string(), "{again}");
+    assert_eq!(
+        mcp_status(&h.base, cred["session_token"].as_str().unwrap()).await,
+        401,
+        "re-registering the label does not revive the old secret"
+    );
+
+    // A window that is genuinely live, under the replacement token, still
+    // blocks recovery: the rule protects windows that can answer.
+    let err = call_expect_error(
+        &b,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("still live"), "{err}");
+
+    for c in [a, window, b] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

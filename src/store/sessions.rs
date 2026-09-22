@@ -104,6 +104,12 @@ pub async fn register(
             last_used_at = NULL
         WHERE agent_sessions.revoked_at IS NOT NULL
            OR agent_sessions.expires_at <= now()
+           -- A window whose parent token was revoked cannot answer with its
+           -- credential any more, whatever its own row says: the label is
+           -- free. Revocation also marks the row, so this is the seam belt.
+           OR EXISTS (SELECT 1 FROM api_tokens t
+                       WHERE t.id = agent_sessions.parent_token
+                         AND t.revoked_at IS NOT NULL)
         RETURNING id, epoch, expires_at
         "#,
     )
