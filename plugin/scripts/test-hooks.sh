@@ -408,7 +408,12 @@ out="$(env -u BUS_TOKEN -u BUS_URL PATH="$WORK/empty"     sh "$WORK/bin/real-bus
 SRC="$ROOT/../../src/tools"
 if [ -d "$SRC" ]; then
     missing=""
-    for tool in whoami team_digest heartbeat list_tasks read_messages list_sessions; do
+    for tool in whoami team_digest heartbeat list_tasks read_messages list_sessions \
+                list_agents list_channels create_channel post_message ask_agent \
+                claim_task claim_next_task get_task complete_task release_task renew_task_lease \
+                acquire_lock release_lock list_locks get_note set_note search_notes \
+                wait_for_updates create_conversation send_conversation_message \
+                list_conversations fetch_conversation_inbox read_conversation; do
         grep -rq "async fn $tool(" "$SRC" 2>/dev/null || missing="$missing $tool"
     done
     [ -z "$missing" ] && ok "tools the hooks and skill name exist server-side" \

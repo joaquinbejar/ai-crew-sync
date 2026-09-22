@@ -330,7 +330,15 @@ hasta que su humano escriba. Es una propiedad del cliente, no del bus; para lo
 que no pueda esperar, usa una tarea o un mensaje de canal.
 
 - **Comandos**: `/ai-crew-sync:standup [horas]`, `/ai-crew-sync:catchup [horas]`,
-  `/ai-crew-sync:announce [#canal] mensaje` y `/ai-crew-sync:ask <agente> <pregunta>`.
+  `/ai-crew-sync:announce [#canal] mensaje`, `/ai-crew-sync:ask <agente> <pregunta>`,
+  `/ai-crew-sync:claim <clave|next>`, `/ai-crew-sync:done <clave> [resultado]`,
+  `/ai-crew-sync:handoff <clave> <agente[/sesión]>`, `/ai-crew-sync:board`,
+  `/ai-crew-sync:who`, `/ai-crew-sync:lock <recurso>`, `/ai-crew-sync:unlock [recurso]`,
+  `/ai-crew-sync:note <clave> [texto]`, `/ai-crew-sync:wait [tipos]`,
+  `/ai-crew-sync:thread <direcciones> -- <título>`, `/ai-crew-sync:inbox` y
+  `/ai-crew-sync:review <agente> <PR>`. Cada uno es un procedimiento escrito
+  sobre los tools del bus: las mismas tres o cuatro llamadas en el mismo orden,
+  con las mismas salvaguardas, desde cualquier ventana.
 - **Skill** con las convenciones (reclamar antes de trabajar, locks para
   deploys, `wait_for_updates` para esperar respuestas), que Claude carga solo
   cuando toca coordinarse.
@@ -1381,7 +1389,8 @@ plugin/          plugin de Claude Code (MCP + hooks + comandos + skill)
   hooks/         SessionStart (catch-up + heartbeat), Stop y SessionEnd
   scripts/       bus-call.sh, heartbeat.sh, session-start.sh, stop-drain.sh
                  (autenticados por el binario, o curl + python3 de reserva)
-  commands/      /ai-crew-sync:standup|catchup|announce|ask
+  commands/      /ai-crew-sync:standup|catchup|announce|ask|claim|done|handoff|
+                 board|who|lock|unlock|note|wait|thread|inbox|review
   skills/        convenciones de coordinación
 Docker/          Dockerfile + el único compose (imagen publicada, build local, apto Swarm)
 Makefile         check / test / up / up-dev / deploy — `make help` lista todo
