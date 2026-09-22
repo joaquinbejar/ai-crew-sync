@@ -356,6 +356,23 @@ async fn record_broker_reference(
     let Some((_, conversation_id, seq, from, from_session, created_at)) = row else {
         return Ok(None);
     };
+    // The same gate as the Postgres hand-out: a project thread hands nothing
+    // to a seat whose grant is gone, whichever backend holds the reference.
+    // Not acknowledged, like a reference for a removed member: the grant
+    // may come back, and the Postgres side still owes the message then.
+    let (open,): (bool,) = sqlx::query_as(
+        "SELECT c.visibility <> 'project' OR EXISTS (
+                    SELECT 1 FROM project_agent_access a
+                     WHERE a.project_id = c.project_id AND a.agent_id = $2)
+           FROM conversations c WHERE c.id = $1",
+    )
+    .bind(conversation_id)
+    .bind(auth.agent_id)
+    .fetch_one(pool)
+    .await?;
+    if !open {
+        return Ok(None);
+    }
 
     let membership: Option<(Uuid,)> = sqlx::query_as(
         "SELECT r.membership_id FROM message_recipients r
@@ -448,9 +465,15 @@ async fn reconcile_from_postgres(
                FROM message_receipts r
                JOIN conversation_memberships cm ON cm.id = r.membership_id
                JOIN conversation_messages m ON m.id = r.message_id
+               JOIN conversations c ON c.id = m.conversation_id
                JOIN agents ag ON ag.id = m.sender_agent
               WHERE cm.agent_id = $1 AND cm.session = $2 AND cm.state = 'active'
                 AND r.delivered_at IS NULL
+                -- A project thread hands nothing to a seat whose grant is
+                -- gone, whatever the receipt said when it was written.
+                AND (c.visibility <> 'project' OR EXISTS (
+                        SELECT 1 FROM project_agent_access a
+                         WHERE a.project_id = c.project_id AND a.agent_id = cm.agent_id))
                 AND m.deleted_at IS NULL
                 AND m.publication_state = 'stored'
                 AND NOT EXISTS (
@@ -470,10 +493,17 @@ async fn reconcile_from_postgres(
 
     let mut out = Vec::with_capacity(rows.len());
     for (membership_id, message_id, conversation_id, seq, from, from_session, created_at) in rows {
-        let (delivery_id,): (Uuid,) = sqlx::query_as(
+        // The grant is re-checked by the insert itself: selected above and
+        // revoked before this statement, the seat is handed nothing.
+        let delivery: Option<(Uuid,)> = sqlx::query_as(
             "INSERT INTO inbox_deliveries
                 (team_id, recipient_key, session_id, epoch, message_id, membership_id)
-             VALUES ($1, $2, $3, $4, $5, $6)
+             SELECT $1, $2, $3, $4, $5, $6
+               FROM conversations c
+              WHERE c.id = $7
+                AND (c.visibility <> 'project' OR EXISTS (
+                        SELECT 1 FROM project_agent_access a
+                         WHERE a.project_id = c.project_id AND a.agent_id = $8))
              ON CONFLICT (recipient_key, message_id, event_dedup) WHERE confirmed_at IS NULL
              DO UPDATE SET handed_at = now()
              RETURNING id",
@@ -484,8 +514,13 @@ async fn reconcile_from_postgres(
         .bind(auth.session_epoch)
         .bind(message_id)
         .bind(membership_id)
-        .fetch_one(pool)
+        .bind(conversation_id)
+        .bind(auth.agent_id)
+        .fetch_optional(pool)
         .await?;
+        let Some((delivery_id,)) = delivery else {
+            continue;
+        };
         out.push(InboxReference {
             delivery_id: delivery_id.to_string(),
             message_id: message_id.to_string(),
@@ -528,9 +563,15 @@ async fn reconcile_receipt_events(
                     m.sender_session, m.created_at
                FROM inbox_events e
                JOIN conversation_messages m ON m.id = e.message_id
+               JOIN conversations c ON c.id = m.conversation_id
                JOIN agents ag ON ag.id = m.sender_agent
               WHERE e.recipient_key = $1 AND e.kind = 'receipt' AND e.state = 'published'
                 AND m.deleted_at IS NULL
+                -- A receipt is news about a thread; a sender whose grant is
+                -- gone is told nothing more about it.
+                AND (c.visibility <> 'project' OR EXISTS (
+                        SELECT 1 FROM project_agent_access a
+                         WHERE a.project_id = c.project_id AND a.agent_id = $3))
                 AND NOT EXISTS (
                     SELECT 1 FROM inbox_deliveries d
                      WHERE d.recipient_key = $1 AND d.message_id = e.message_id
@@ -542,15 +583,22 @@ async fn reconcile_receipt_events(
     )
     .bind(key)
     .bind(limit)
+    .bind(auth.agent_id)
     .fetch_all(pool)
     .await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for (message_id, dedup, conversation_id, seq, from, from_session, created_at) in rows {
-        let (delivery_id,): (Uuid,) = sqlx::query_as(
+        // As for messages: the grant is part of the insert.
+        let delivery: Option<(Uuid,)> = sqlx::query_as(
             "INSERT INTO inbox_deliveries
                 (team_id, recipient_key, session_id, epoch, message_id, event_dedup)
-             VALUES ($1, $2, $3, $4, $5, $6)
+             SELECT $1, $2, $3, $4, $5, $6
+               FROM conversations c
+              WHERE c.id = $7
+                AND (c.visibility <> 'project' OR EXISTS (
+                        SELECT 1 FROM project_agent_access a
+                         WHERE a.project_id = c.project_id AND a.agent_id = $8))
              ON CONFLICT (recipient_key, message_id, event_dedup) WHERE confirmed_at IS NULL
              DO UPDATE SET handed_at = now()
              RETURNING id",
@@ -561,8 +609,13 @@ async fn reconcile_receipt_events(
         .bind(auth.session_epoch)
         .bind(message_id)
         .bind(&dedup)
-        .fetch_one(pool)
+        .bind(conversation_id)
+        .bind(auth.agent_id)
+        .fetch_optional(pool)
         .await?;
+        let Some((delivery_id,)) = delivery else {
+            continue;
+        };
         out.push(InboxReference {
             delivery_id: delivery_id.to_string(),
             message_id: message_id.to_string(),
@@ -696,8 +749,12 @@ pub async fn state(
         "SELECT count(*) FROM message_receipts r
            JOIN conversation_memberships cm ON cm.id = r.membership_id
            JOIN conversation_messages m ON m.id = r.message_id
+           JOIN conversations c ON c.id = m.conversation_id
           WHERE cm.agent_id = $1 AND cm.session = $2 AND cm.state = 'active'
-            AND r.delivered_at IS NULL AND m.deleted_at IS NULL",
+            AND r.delivered_at IS NULL AND m.deleted_at IS NULL
+            AND (c.visibility <> 'project' OR EXISTS (
+                    SELECT 1 FROM project_agent_access a
+                     WHERE a.project_id = c.project_id AND a.agent_id = cm.agent_id))",
     )
     .bind(auth.agent_id)
     .bind(&auth.session)

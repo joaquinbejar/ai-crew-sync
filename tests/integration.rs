@@ -11262,3 +11262,315 @@ async fn a_revocation_does_not_deadlock_with_a_first_heartbeat() {
     let _ = agent.cancel().await;
     h.shutdown().await;
 }
+
+/// Revoking a project grant takes effect at once, threads being read
+/// included: an active seat in a project thread is not a second door. The
+/// revoked agent reads nothing new, gets no new receipt or inbox reference,
+/// cannot accept a pending invitation, and a project reader without a seat
+/// is shut out the same way. Private threads keep their membership rules.
+#[tokio::test]
+async fn audit_project_revocation_closes_an_active_members_access() {
+    let h = require_db!("t_project_revocation");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let carol_token = seed_agent(&h.pool, "acme", "carol").await;
+    let dave_token = seed_agent(&h.pool, "acme", "dave").await;
+    enable_conversations(&h.pool, "acme").await;
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    // Bob is a registered window, so the inbox path is exercised too.
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let bob_cred = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob = connect(&h.base, bob_cred["session_token"].as_str().unwrap()).await;
+    let carol = connect_with_session(&h.base, &carol_token, "peek").await;
+    let dave = connect_with_session(&h.base, &dave_token, "late").await;
+
+    call(&alice, "create_project", json!({"project": "audit"})).await;
+    for who in ["bob", "carol", "dave"] {
+        call(
+            &alice,
+            "grant_project_access",
+            json!({"project": "audit", "agent": who}),
+        )
+        .await;
+    }
+    let convo = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "audit thread", "project": "audit", "invite": ["bob/reader", "dave/late"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&bob, "join_conversation", json!({"conversation_id": cid})).await;
+    let before = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "while Bob still had access", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let seen = call(
+        &bob,
+        "get_conversation_message",
+        json!({"message_id": before}),
+    )
+    .await;
+    assert_eq!(seen["body"], "while Bob still had access", "{seen}");
+    let seen = call(
+        &carol,
+        "get_conversation_message",
+        json!({"message_id": before}),
+    )
+    .await;
+    assert_eq!(
+        seen["body"], "while Bob still had access",
+        "a project reader: {seen}"
+    );
+
+    // The revocations.
+    for who in ["bob", "carol", "dave"] {
+        call(
+            &alice,
+            "grant_project_access",
+            json!({"project": "audit", "agent": who, "grant": false}),
+        )
+        .await;
+    }
+    let after = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "after Bob lost access", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The active member reads nothing, new or old, and cannot write.
+    for (who, client) in [("bob", &bob), ("carol", &carol)] {
+        let err =
+            call_expect_error(client, "read_conversation", json!({"conversation_id": cid})).await;
+        assert!(!err.contains("database error"), "{who}: {err}");
+        for m in [&before, &after] {
+            let err =
+                call_expect_error(client, "get_conversation_message", json!({"message_id": m}))
+                    .await;
+            assert!(!err.contains("database error"), "{who}: {err}");
+        }
+    }
+    let err = call_expect_error(
+        &bob,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "still here?", "request_id": request_id()}),
+    )
+    .await;
+    assert!(!err.contains("database error"), "{err}");
+    let err = call_expect_error(
+        &bob,
+        "ack_message",
+        json!({"conversation_id": cid, "message_id": after, "resolved": false}),
+    )
+    .await;
+    assert!(!err.contains("database error"), "{err}");
+
+    // No new obligation: the message sent after the revocation has no
+    // receipt for Bob, and his inbox hands him nothing from this thread.
+    let receipts = call(&alice, "get_message_receipts", json!({"message_id": after})).await;
+    assert!(
+        !receipts["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["address"].as_str().unwrap_or("").starts_with("bob")),
+        "no receipt for the revoked seat: {receipts}"
+    );
+    let inbox = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    assert!(
+        inbox["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["conversation_id"] != cid.as_str()),
+        "nothing from the project thread is handed out: {inbox}"
+    );
+
+    // Nor is the seat told anything about the thread: no unread activity
+    // to wake on, nothing counted as undelivered.
+    let woke = call(
+        &bob,
+        "wait_for_conversation_updates",
+        json!({"timeout_seconds": 1}),
+    )
+    .await;
+    assert!(
+        woke["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["conversation_id"] != cid.as_str()),
+        "a revoked seat is not woken: {woke}"
+    );
+    let status = call(&bob, "conversation_inbox_status", json!({})).await;
+    assert_eq!(status["undelivered"], 0, "{status}");
+
+    // A pending invitation cannot be accepted after the revocation.
+    let err = call_expect_error(&dave, "join_conversation", json!({"conversation_id": cid})).await;
+    assert!(err.contains("revoked"), "{err}");
+
+    // Granting it back reopens the seat: the membership was never removed.
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob"}),
+    )
+    .await;
+    let seen = call(
+        &bob,
+        "get_conversation_message",
+        json!({"message_id": after}),
+    )
+    .await;
+    assert_eq!(seen["body"], "after Bob lost access", "{seen}");
+
+    // A private thread is untouched by project grants.
+    let private = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "private", "private": true, "invite": ["bob/reader"]}),
+    )
+    .await;
+    let pid = private["id"].as_str().unwrap().to_owned();
+    call(&bob, "join_conversation", json!({"conversation_id": pid})).await;
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob", "grant": false}),
+    )
+    .await;
+    let pm = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": pid, "body": "private still works", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let seen = call(&bob, "get_conversation_message", json!({"message_id": pm})).await;
+    assert_eq!(seen["body"], "private still works", "{seen}");
+
+    for c in [alice, bob_agent, bob, carol, dave] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The same promise on the broker path: a reference published to JetStream
+/// before the revocation is not handed to the revoked seat, so the
+/// guarantee does not depend on which backend holds the thread.
+#[tokio::test]
+async fn audit_project_revocation_holds_on_the_broker_path() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::{inbox, outbox};
+    let h = require_db_broker!("t_project_revocation_js");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    JetStreamBackend::provision_inbox(&config, team)
+        .await
+        .unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+    // The test server runs no publication worker: the outbox and the inbox
+    // references are drained by hand, exactly as the other broker tests do.
+    let publish = || async {
+        assert_eq!(
+            outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+            Some(outbox::Settled::Stored)
+        );
+        inbox::publish_pending(&h.pool, &backend, team, 100)
+            .await
+            .unwrap()
+    };
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let bob_cred = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob = connect(&h.base, bob_cred["session_token"].as_str().unwrap()).await;
+
+    call(&alice, "create_project", json!({"project": "audit"})).await;
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob"}),
+    )
+    .await;
+    let convo = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "audit thread", "project": "audit", "invite": ["bob/reader"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&bob, "join_conversation", json!({"conversation_id": cid})).await;
+
+    // A first message proves the broker path is live for this seat.
+    call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "first", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(publish().await, 1, "one reference for Bob");
+    let batch = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(batch["from_broker"], 1, "{batch}");
+    assert_eq!(batch["references"][0]["conversation_id"], cid, "{batch}");
+    let ids: Vec<&str> = batch["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["delivery_id"].as_str())
+        .collect();
+    call(&bob, "confirm_inbox_delivery", json!({"delivery_ids": ids})).await;
+
+    // A second message reaches the broker while Bob still has the grant;
+    // then the grant goes.
+    call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "second", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(publish().await, 1, "the second reference is on the broker");
+    call(
+        &alice,
+        "grant_project_access",
+        json!({"project": "audit", "agent": "bob", "grant": false}),
+    )
+    .await;
+    for _ in 0..3 {
+        let batch = call(&bob, "fetch_conversation_inbox", json!({})).await;
+        assert!(
+            batch["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["conversation_id"] != cid.as_str()),
+            "the broker handed a project reference to a revoked seat: {batch}"
+        );
+    }
+    let status = call(&bob, "conversation_inbox_status", json!({})).await;
+    assert_eq!(status["undelivered"], 0, "{status}");
+
+    for c in [alice, bob_agent, bob] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
