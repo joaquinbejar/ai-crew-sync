@@ -10955,3 +10955,310 @@ async fn a_lapsed_lease_reads_as_open_everywhere() {
     }
     h.shutdown().await;
 }
+
+/// Revoking an agent token takes its session credentials with it. Auth
+/// already refused them, but their rows still read as live: recovery
+/// counted a window that could not answer and the label stayed reserved
+/// for a credential that no longer worked, until it expired a day later
+/// (#137). A genuinely live window under another token still protects.
+#[tokio::test]
+async fn a_revoked_token_takes_its_sessions_with_it() {
+    use ai_crew_sync::auth::{generate_token, hash_token, token_prefix};
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_revoked_parent");
+    let token_a = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    // A second credential for the same agent: the replacement.
+    let (agent_id,): (Uuid,) = sqlx::query_as("SELECT id FROM agents WHERE name = 'joaquin'")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let token_b = generate_token();
+    sqlx::query("INSERT INTO api_tokens (agent_id, token_hash, prefix) VALUES ($1, $2, $3)")
+        .bind(agent_id)
+        .bind(hash_token(&token_b))
+        .bind(token_prefix(&token_b))
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (token_a_id,): (Uuid,) = sqlx::query_as("SELECT id FROM api_tokens WHERE token_hash = $1")
+        .bind(hash_token(&token_a))
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+
+    let a = connect(&h.base, &token_a).await;
+    let cred = call(
+        &a,
+        "register_session",
+        json!({"session": "only-window", "ttl_seconds": 3600}),
+    )
+    .await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let convo = call(
+        &window,
+        "create_conversation",
+        json!({"title": "mine alone", "private": true}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(
+        &window,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "before the rotation", "request_id": request_id()}),
+    )
+    .await;
+
+    // While the window lives, the replacement token recovers nothing.
+    let b = connect(&h.base, &token_b).await;
+    let err = call_expect_error(
+        &b,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("still live"), "{err}");
+
+    // The operator revokes the first token (the CLI and the admin API share
+    // this call).
+    store::revoke_token(&h.pool, Actor::Cli, None, token_a_id)
+        .await
+        .unwrap();
+    let (detail,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT detail FROM admin_audit WHERE action = 'token.revoke' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        detail["sessions_revoked"],
+        json!(["only-window"]),
+        "{detail}"
+    );
+
+    // The window's credential is dead, as before.
+    let status = mcp_status(&h.base, cred["session_token"].as_str().unwrap()).await;
+    assert_eq!(status, 401, "the child credential is refused");
+
+    // And now the rows agree with authentication: recovery works, the
+    // label is free, the old secret stays dead.
+    let recovered = call(
+        &b,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert_eq!(
+        recovered["messages"][0]["body"], "before the rotation",
+        "{recovered}"
+    );
+    let again = call(
+        &b,
+        "register_session",
+        json!({"session": "only-window", "ttl_seconds": 3600}),
+    )
+    .await;
+    assert!(again["session_token"].is_string(), "{again}");
+    assert_eq!(
+        mcp_status(&h.base, cred["session_token"].as_str().unwrap()).await,
+        401,
+        "re-registering the label does not revive the old secret"
+    );
+
+    // A window that is genuinely live, under the replacement token, still
+    // blocks recovery: the rule protects windows that can answer.
+    let err = call_expect_error(
+        &b,
+        "recover_conversation_history",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    assert!(err.contains("still live"), "{err}");
+
+    // The races, replayed deterministically at the store: a request that
+    // authenticated with token A before the revocation and runs after it.
+    use ai_crew_sync::auth::AuthCtx;
+    use ai_crew_sync::store::sessions;
+    let team = team_id(&h.pool, "acme").await;
+    let stale_agent = AuthCtx {
+        agent_id,
+        agent_name: "joaquin".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: String::new(),
+        session_id: None,
+        session_epoch: None,
+        token_id: Some(token_a_id),
+    };
+    let err = match sessions::register(&h.pool, &stale_agent, token_a_id, "late-window", None).await
+    {
+        Ok(_) => panic!("a registration under a revoked token must not land"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("revoked while it was in flight"),
+        "{err}"
+    );
+    let (late,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM agent_sessions WHERE agent_id = $1 AND label = 'late-window'",
+    )
+    .bind(agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(late, 0, "no row was written");
+
+    // And a request that authenticated with the old window's credential,
+    // running after B re-registered the label: it must not rotate B's row.
+    let (row_id, epoch_now): (Uuid, i64) = sqlx::query_as(
+        "SELECT id, epoch FROM agent_sessions WHERE agent_id = $1 AND label = 'only-window'",
+    )
+    .bind(agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let stale_window = AuthCtx {
+        agent_id,
+        agent_name: "joaquin".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: "only-window".into(),
+        session_id: Some(row_id),
+        session_epoch: Some(epoch_now - 1),
+        token_id: None,
+    };
+    let err = match sessions::resume(&h.pool, &stale_window, None).await {
+        Ok(_) => panic!("a stale connection must not rotate the new window's credential"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("re-registered"), "{err}");
+    let err = match sessions::renew(&h.pool, &stale_window, None).await {
+        Ok(_) => panic!("a stale connection must not extend the new window's credential"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("revoked"), "{err}");
+    assert_eq!(
+        mcp_status(&h.base, again["session_token"].as_str().unwrap()).await,
+        200,
+        "B's window still works"
+    );
+
+    // Revocation over the admin API, with a team-scoped credential, sweeps
+    // the sessions the same way; another team's credential cannot reach it.
+    let token_c = generate_token();
+    let (token_c_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO api_tokens (agent_id, token_hash, prefix) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(agent_id)
+    .bind(hash_token(&token_c))
+    .bind(token_prefix(&token_c))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let c = connect(&h.base, &token_c).await;
+    let other = call(&c, "register_session", json!({"session": "other-window"})).await;
+    let other_token = other["session_token"].as_str().unwrap().to_owned();
+    seed_agent(&h.pool, "rivals", "eve").await;
+    let rivals = team_id(&h.pool, "rivals").await;
+    let foreign = store::grant_admin(&h.pool, Actor::Cli, Some(rivals), None)
+        .await
+        .unwrap();
+    let (status, _) = Admin::new(&h.base, &foreign.token)
+        .delete(&format!("/teams/acme/tokens/{token_c_id}"))
+        .await;
+    assert_eq!(status, 403, "another team's credential is refused");
+    let ours = store::grant_admin(&h.pool, Actor::Cli, Some(team), None)
+        .await
+        .unwrap();
+    let (status, _) = Admin::new(&h.base, &ours.token)
+        .delete(&format!("/teams/acme/tokens/{token_c_id}"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(mcp_status(&h.base, &other_token).await, 401);
+    let (swept,): (bool,) = sqlx::query_as(
+        "SELECT revoked_at IS NOT NULL FROM agent_sessions WHERE agent_id = $1 AND label = 'other-window'",
+    )
+    .bind(agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(swept, "the session row is revoked with its parent");
+
+    for cl in [a, window, b, c] {
+        let _ = cl.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The agent lock the lifecycle paths serialise on must not conflict with
+/// the key share a foreign key takes. A first heartbeat holds `FOR SHARE`
+/// on its session (the epoch guard) and then inserts presence, which needs
+/// `FOR KEY SHARE` on the agent; a revocation holding `FOR UPDATE` on the
+/// agent and waiting on that session row closed the cycle, and Postgres
+/// rolled the revocation back with 40P01. `FOR NO KEY UPDATE` serialises
+/// the lifecycle paths without blocking the key share.
+#[tokio::test]
+async fn a_revocation_does_not_deadlock_with_a_first_heartbeat() {
+    use ai_crew_sync::auth::hash_token;
+    use ai_crew_sync::store::admin::{self as store, Actor};
+
+    let h = require_db!("t_revoke_vs_heartbeat");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let (agent_id, token_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT a.id, t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id
+          WHERE t.token_hash = $1",
+    )
+    .bind(hash_token(&token))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let agent = connect(&h.base, &token).await;
+    let cred = call(&agent, "register_session", json!({"session": "first"})).await;
+    let session_id: Uuid = cred["session_id"].as_str().unwrap().parse().unwrap();
+
+    // The heartbeat's transaction, paused right after the guard.
+    let mut heartbeat = h.pool.begin().await.unwrap();
+    sqlx::query("SELECT epoch FROM agent_sessions WHERE id = $1 FOR SHARE")
+        .bind(session_id)
+        .fetch_one(&mut *heartbeat)
+        .await
+        .unwrap();
+
+    // The revocation takes the agent lock and waits on that session row.
+    let revoke = tokio::spawn({
+        let pool = h.pool.clone();
+        async move { store::revoke_token(&pool, Actor::Cli, None, token_id).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !revoke.is_finished(),
+        "the revocation waits for the guarded transaction"
+    );
+
+    // The heartbeat inserts presence, which needs a key share on the agent.
+    sqlx::query(
+        "INSERT INTO agent_presence (agent_id, session, status, updated_at, expires_at)
+         VALUES ($1, 'first', 'active', now(), now() + interval '15 minutes')",
+    )
+    .bind(agent_id)
+    .execute(&mut *heartbeat)
+    .await
+    .expect("the first heartbeat lands while a revocation waits");
+    heartbeat.commit().await.unwrap();
+
+    revoke
+        .await
+        .unwrap()
+        .expect("the revocation completes once the heartbeat commits");
+    let (revoked,): (bool,) =
+        sqlx::query_as("SELECT revoked_at IS NOT NULL FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(revoked, "and it swept the session");
+
+    let _ = agent.cancel().await;
+    h.shutdown().await;
+}

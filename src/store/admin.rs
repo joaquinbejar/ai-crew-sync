@@ -661,6 +661,26 @@ pub async fn revoke_token(
     id: Uuid,
 ) -> BusResult<()> {
     let mut tx = pool.begin().await?;
+    // The agent row first: registration, resume and recovery serialise on
+    // it, so a window registering under this token right now either lands
+    // before the revocation and is swept below, or waits and finds the
+    // token gone. Without the lock a session could slip in between.
+    //
+    // NO KEY UPDATE, not UPDATE: a first heartbeat holds the session row
+    // (the epoch guard) and then inserts presence, whose foreign key takes
+    // a key share on this agent. FOR UPDATE blocks that share while this
+    // transaction waits on the session row, and Postgres breaks the cycle
+    // by rolling the revocation back. NO KEY UPDATE serialises the
+    // lifecycle paths with each other and lets the key share through.
+    sqlx::query(
+        "SELECT a.id FROM agents a JOIN api_tokens t ON t.agent_id = a.id
+          WHERE t.id = $1 AND ($2::uuid IS NULL OR a.team_id = $2)
+          FOR NO KEY UPDATE OF a",
+    )
+    .bind(id)
+    .bind(team_id)
+    .execute(&mut *tx)
+    .await?;
     let revoked: Option<(Uuid, String, String)> = sqlx::query_as(
         "UPDATE api_tokens t SET revoked_at = now()
          FROM agents a
@@ -674,13 +694,30 @@ pub async fn revoke_token(
     .await?;
     match revoked {
         Some((owner_team, agent, prefix)) => {
+            // A session credential is a child of this token: authentication
+            // already refuses it once the parent is gone, and the row must
+            // say the same, or recovery keeps counting a window that cannot
+            // answer and its label stays reserved for a credential that no
+            // longer works.
+            let sessions: Vec<(String,)> = sqlx::query_as(
+                "UPDATE agent_sessions SET revoked_at = now()
+                  WHERE parent_token = $1 AND revoked_at IS NULL
+                  RETURNING label",
+            )
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
             audit(
                 &mut tx,
                 actor,
                 "token.revoke",
                 Some(owner_team),
                 Some(id),
-                serde_json::json!({ "agent": agent, "prefix": prefix }),
+                serde_json::json!({
+                    "agent": agent,
+                    "prefix": prefix,
+                    "sessions_revoked": sessions.iter().map(|s| &s.0).collect::<Vec<_>>(),
+                }),
             )
             .await?;
         }

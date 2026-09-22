@@ -2418,13 +2418,18 @@ pub async fn recover_history(
     // writes a new row, conflicts with no held lock, and can slip in between
     // this check and the read below. Registration takes the same lock, so
     // the two serialise on something that is always there.
-    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR UPDATE")
+    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR NO KEY UPDATE")
         .bind(auth.agent_id)
         .fetch_one(&mut *tx)
         .await?;
+    // Live means able to answer: a session whose parent token was revoked
+    // is refused at authentication, so it cannot read the thread on the
+    // agent's behalf and does not block the agent from recovering it.
     let live: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM agent_sessions
-          WHERE agent_id = $1 AND revoked_at IS NULL AND expires_at > now()",
+        "SELECT s.id FROM agent_sessions s
+          WHERE s.agent_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now()
+            AND NOT EXISTS (SELECT 1 FROM api_tokens t
+                             WHERE t.id = s.parent_token AND t.revoked_at IS NOT NULL)",
     )
     .bind(auth.agent_id)
     .fetch_all(&mut *tx)
