@@ -55,6 +55,14 @@ enum Command {
     /// Talk to a running bus from the console, as an agent. Everything the MCP
     /// tools can do: send/read messages, claim tasks, notes, presence.
     Client(client::ClientArgs),
+    /// Print the team's procedures as prose any MCP host can follow. No
+    /// name lists them; a name prints one, with `{{input}}` where the
+    /// caller's arguments go. The plugin's slash commands are generated from
+    /// the same files.
+    Recipes {
+        /// Recipe name, e.g. `catchup`. Omit to list them.
+        name: Option<String>,
+    },
     /// Print the client configuration for the per-conversation stdio proxy
     /// (`mcp proxy`). Carries no credential: the proxy resolves one from the
     /// local profiles.
@@ -665,6 +673,10 @@ async fn main() -> anyhow::Result<()> {
     // Commands that talk to the bus over HTTP (or to nothing at all) do not
     // need a database connection.
     match cli.command {
+        Command::Recipes { name } => {
+            ai_crew_sync::recipes::print(name.as_deref())?;
+            return Ok(());
+        }
         Command::McpConfig {
             url,
             token,
@@ -738,6 +750,7 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
     match command {
         // `main` routes these before opening a pool; they cannot arrive here.
         Command::McpConfig { .. }
+        | Command::Recipes { .. }
         | Command::ProxyConfig { .. }
         | Command::Client(_)
         | Command::Context(_)

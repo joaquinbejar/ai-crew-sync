@@ -1,11 +1,7 @@
----
-description: Who is on the bus right now, on what, and how to address each window
-argument-hint: "[agent]"
----
-
+<!-- slash: description="Who is on the bus right now, on what, and how to address each window" hint="[agent]" -->
 Show me who is around on the crew bus.
 
-Input: $ARGUMENTS
+Input: {{input}}
 
 Steps:
 1. Call `list_agents` with `online_only` false.

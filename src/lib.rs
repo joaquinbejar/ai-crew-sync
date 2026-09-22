@@ -29,6 +29,7 @@ pub mod hook;
 pub mod model;
 pub mod proxy;
 pub mod ratelimit;
+pub mod recipes;
 pub mod serve;
 pub mod spool;
 pub mod store;

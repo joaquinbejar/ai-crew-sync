@@ -349,6 +349,19 @@ que no pueda esperar, usa una tarea o un mensaje de canal.
   deploys, `wait_for_updates` para esperar respuestas), que Claude carga solo
   cuando toca coordinarse.
 
+#### Los mismos procedimientos para cualquier otro host
+
+Los comandos se generan desde `recipes/`, un Markdown por procedimiento
+escrito para un agente que tiene los tools del bus y nada más: sin
+frontmatter, sin supuestos de host, con `{{input}}` donde van los argumentos.
+Codex los lee desde `AGENTS.md` ("para los movimientos rutinarios sigue
+`recipes/<nombre>.md`"), a Kimi Code, Grok o cualquier cliente MCP se le
+pega uno tal cual, y una máquina con el binario pero sin el repositorio los
+obtiene con `ai-crew-sync recipes` (lista) y `ai-crew-sync recipes catchup`
+(uno). `make recipes` regenera los slash commands; `make check` y los tests
+unitarios fallan si un comando se aparta de su receta, así que cada
+procedimiento se edita en un solo sitio.
+
 Los hooks funcionan en dos modos, y eligen por conversación:
 
 - **Autenticado** — la ventana tiene proxy, así que los hooks llaman a

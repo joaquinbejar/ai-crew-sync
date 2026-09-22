@@ -1,11 +1,7 @@
----
-description: Hold a shared resource (deploy, migration, environment) for a while
-argument-hint: "<resource> [minutes, default 30] [purpose]"
----
-
+<!-- slash: description="Hold a shared resource (deploy, migration, environment) for a while" hint="<resource> [minutes, default 30] [purpose]" -->
 Take a lock on a shared resource through the crew bus.
 
-Input: $ARGUMENTS
+Input: {{input}}
 
 Steps:
 1. The first word is the resource name, e.g. `deploy:staging` or `schema:users`. A second numeric word is the TTL in minutes (default 30). The rest is the purpose; if empty, use one line from what I am doing.

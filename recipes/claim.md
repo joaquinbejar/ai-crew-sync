@@ -1,11 +1,7 @@
----
-description: Claim a shared task (or the next unblocked one) with a lease and show the brief
-argument-hint: "<task-key | next> [lease minutes, default 15]"
----
-
+<!-- slash: description="Claim a shared task (or the next unblocked one) with a lease and show the brief" hint="<task-key | next> [lease minutes, default 15]" -->
 Take a task from the crew bus queue so nobody else does the same work.
 
-Input: $ARGUMENTS
+Input: {{input}}
 
 Steps:
 1. The first word is a task key, or `next` for whichever unblocked open task is oldest. A second word, if numeric, is the lease in minutes (default 15; the bus clamps it to its limits). Anything else: ask me, do not guess.
