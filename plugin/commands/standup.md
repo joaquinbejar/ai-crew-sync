@@ -7,7 +7,7 @@ Produce a standup-style summary of team activity using the ai-crew-sync MCP tool
 
 Steps:
 1. Call `team_digest` with `hours` = $ARGUMENTS if a number was given, otherwise 24.
-2. Call `list_agents` with `online_only` = false to see who is around and what they are working on.
+2. Call `list_agents` with `online_only` = false to see who is around and what they are working on, and `list_sessions` when you need the exact window behind a name (a teammate with three repositories open shows three).
 3. Call `list_tasks` (open + in-progress) to see the state of the shared task queue.
 
 Then write a compact standup report grouped as:

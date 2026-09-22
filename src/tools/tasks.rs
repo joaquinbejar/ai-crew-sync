@@ -39,10 +39,11 @@ pub struct CreateTaskArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListTasksArgs {
     /// Filter by status: "open", "claimed", "done", "cancelled", or "any".
-    /// Defaults to all statuses.
+    /// Defaults to all statuses. "open" includes tasks whose claim lapsed;
+    /// "claimed" is live claims only.
     #[serde(default)]
     pub status: Option<String>,
-    /// Only return tasks currently claimed by you.
+    /// Only return tasks this session currently holds a live claim on.
     #[serde(default)]
     pub mine_only: bool,
     /// Maximum tasks to return (1-200).

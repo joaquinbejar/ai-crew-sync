@@ -1,6 +1,6 @@
 ---
 name: ai-crew-sync
-description: Conventions for coordinating with teammates' AI coding agents over the team bus MCP server. Use whenever starting work in a shared repo, picking up or handing off tasks, announcing deploys/migrations, asking a teammate's agent something, or deciding whether work is already claimed by someone else.
+description: Conventions for coordinating with teammates' AI coding agents over the team bus MCP server. Use whenever starting work in a shared repo, picking up or handing off tasks, announcing deploys/migrations, asking a teammate's agent something, addressing a specific window or a conversation thread, or deciding whether work is already claimed by someone else.
 ---
 
 # Working on a team bus
@@ -11,7 +11,7 @@ This machine is connected to a shared coordination bus (MCP server `ai-crew-sync
 1. `whoami` → confirm identity, unread DMs, and tasks you already claimed. `read_messages` fetches them: it returns only what you have not seen and advances your cursor, so calling it again gives you the next batch rather than the same one.
 2. `list_tasks` → check whether the work you are about to do is already a task, claimed by someone else. If it is claimed and the lease is fresh, do NOT do it; message the owner instead.
 3. If it is not tracked, `create_task` first, then `claim_task` it. Claiming is what prevents duplicate work — never start multi-step shared work without a claim.
-4. When your window connects through `ai-crew-sync mcp proxy`, its identity is already proven: `whoami` shows `session_identity`, and `session_status` shows the address teammates use. You never handle the credential yourself, and you never need `register_session` — the proxy did it.
+4. Your window connects through `ai-crew-sync mcp proxy`, so its identity is already proven: `whoami` shows `session_identity`, and `session_status` (a local tool of the proxy, never forwarded to the bus) shows the address teammates use. You never handle the credential yourself, and you never call `register_session`/`resume_session` — the proxy did it and renews it. `configure_session` is the other local tool: it sets this window's `project`, `role` and default `channel` without a round trip to anyone.
 5. `heartbeat` with `repo`, `branch` and a short `activity` string so teammates can see what you are doing. Add `project` (the repository) and `role` (`implementation`, `design`, `review`, …) so teammates can find this window with `list_sessions` and address it exactly; when you need a specific window yourself, call `list_sessions` with `project`/`role`, pick one `address` from the result and use it in `to` — never send a private instruction to every match, and never to an entry whose `exact` is false (the bare agent name reaches all of that agent's windows). Presence belongs to your *session*, not to you: a teammate with several repositories open shows one entry per repository under their name in `list_agents`, and a session that stops heartbeating ages out on its own without touching the others.
 
 ## While working
@@ -48,6 +48,16 @@ The reason is a hard limit, not a preference: a coding agent only calls tools wh
 - **a session idle for an hour answers nothing until its human types.**
 
 So `create_task` with a repo-prefixed key (`market-data#42`) or a channel message loses nothing when the other window is closed, while `ask_agent` only pays off against a window you have reason to believe is working right now — `list_agents` shows which sessions are live and what they are doing.
+
+## Conversations (only when the team has them on)
+
+A channel cannot answer "who has seen this?", and three direct messages never converge into one thread. When that question matters — a review handoff, a decision several windows must each act on — use a conversation. If `create_conversation` is not in your tool list, the team has not enabled them: use channels and DMs, and do not ask for them mid-task.
+
+- `create_conversation` with `project` (everyone with that project's access can read it) or `private: true` (members only). **The choice is permanent.** Invite exact windows by `agent/session` from `list_sessions`; each one accepts with `join_conversation`, so nobody is conscripted into your receipts.
+- `send_conversation_message` needs a fresh `request_id` UUID. It returns `stored` — the database committed, **not** that anyone read it — plus the exact windows the message was addressed to, snapshotted at that moment. Someone who joins later never enters that message's denominator.
+- `read_conversation` does **not** acknowledge anything and moves no cursor. Recording that you read a message is `ack_message`; `resolved: true` says you acted on it, and it does not complete a task, merge a PR or close an issue.
+- `get_message_receipts` reports five independent facts per recipient: stored, delivered, presented, acknowledged, resolved. **An absent timestamp means not observed, not "no"** — `presented_at` is null wherever the host cannot confirm the message reached the model. Read it as "who is still to answer", never as "who ignored me".
+- Your seat belongs to this window. A sibling window of yours cannot accept an invitation or acknowledge on your behalf; when the work moves to another repository, `transfer_membership` proposes the seat and the target accepts it.
 
 ## Catch-up
 `team_digest` summarises recent messages, task movement and presence; use it at session start or after being away instead of reading every channel. When a channel is named after your session it is the one summarised, and the one `post_message` uses when you give neither `channel` nor `to`; pass `all_channels: true` when you need the whole team.
