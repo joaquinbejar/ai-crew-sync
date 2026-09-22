@@ -803,16 +803,26 @@ pub async fn list_conversations(
     include_archived: bool,
 ) -> BusResult<Vec<ConversationInfo>> {
     require_capability(pool, auth).await?;
+    // The candidates obey the same rules as `access`: a seat taken by a
+    // registered window belongs to that window (the parent token wearing
+    // the label does not sit in it), and a project grant opens project
+    // threads only, never a private thread that happens to name a project.
+    // Listing a seat the caller could not then open failed the whole
+    // listing with "no such conversation".
     let ids: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT DISTINCT c.id
            FROM conversations c
            LEFT JOIN conversation_memberships m
                   ON m.conversation_id = c.id AND m.agent_id = $2 AND m.session = $3
+                 AND (m.session_id IS NULL OR $5::uuid IS NOT NULL)
           WHERE c.team_id = $1
             AND ($4::bool OR c.archived_at IS NULL)
             AND (
-                 m.state IN ('invited', 'active')
-                 OR (c.project_id IS NOT NULL AND EXISTS (
+                 (m.state IN ('invited', 'active')
+                  AND (c.visibility <> 'project' OR EXISTS (
+                        SELECT 1 FROM project_agent_access a
+                         WHERE a.project_id = c.project_id AND a.agent_id = $2)))
+                 OR (c.visibility = 'project' AND c.project_id IS NOT NULL AND EXISTS (
                         SELECT 1 FROM project_agent_access a
                          WHERE a.project_id = c.project_id AND a.agent_id = $2))
             )
@@ -822,11 +832,19 @@ pub async fn list_conversations(
     .bind(auth.agent_id)
     .bind(&auth.session)
     .bind(include_archived)
+    .bind(auth.session_id)
     .fetch_all(pool)
     .await?;
     let mut out = Vec::with_capacity(ids.len());
     for (id,) in ids {
-        out.push(conversation_info(pool, auth, id).await?);
+        // Permissions can change between the candidate query and this
+        // read: a seat removed or a grant revoked meanwhile is simply not
+        // listed, and does not take the rest of the listing with it.
+        match conversation_info(pool, auth, id).await {
+            Ok(info) => out.push(info),
+            Err(BusError::NotFound(_)) | Err(BusError::Forbidden(_)) => continue,
+            Err(e) => return Err(e),
+        }
     }
     Ok(out)
 }

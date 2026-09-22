@@ -11574,3 +11574,144 @@ async fn audit_project_revocation_holds_on_the_broker_path() {
     }
     h.shutdown().await;
 }
+
+/// Listing obeys the same rules as opening: a private seat taken by a
+/// registered window is not listed to the parent token wearing its label,
+/// a project grant lists project threads only, and a thread that becomes
+/// inaccessible between the candidate query and its read is skipped rather
+/// than failing the whole listing (#149).
+#[tokio::test]
+async fn audit_list_skips_an_authenticated_seat_for_parent_label() {
+    let h = require_db!("t_list_candidates");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let alice_agent = connect(&h.base, &alice_token).await;
+    let cred = call(
+        &alice_agent,
+        "register_session",
+        json!({"session": "window"}),
+    )
+    .await;
+    let window = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let bob = connect_with_session(&h.base, &bob_token, "bob-win").await;
+
+    // A private thread the registered window owns, and a project thread
+    // Alice's shared session can list by grant.
+    let private = call(
+        &window,
+        "create_conversation",
+        json!({"title": "window's own", "private": true}),
+    )
+    .await;
+    let private_id = private["id"].as_str().unwrap().to_owned();
+    call(&window, "create_project", json!({"project": "shared"})).await;
+    let project = call(
+        &window,
+        "create_conversation",
+        json!({"title": "project thread", "project": "shared"}),
+    )
+    .await;
+    let project_id = project["id"].as_str().unwrap().to_owned();
+
+    // The parent token wearing the window's label: the private seat is the
+    // window's, the project thread is readable by grant. The listing must
+    // succeed and omit the seat it cannot open.
+    let impostor = connect_with_session(&h.base, &alice_token, "window").await;
+    let listed = call(&impostor, "list_conversations", json!({})).await;
+    let ids: Vec<&str> = listed["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !ids.contains(&private_id.as_str()),
+        "the window's private seat is not the label's: {listed}"
+    );
+    assert!(
+        ids.contains(&project_id.as_str()),
+        "the project thread is listed by grant: {listed}"
+    );
+    let err = call_expect_error(
+        &impostor,
+        "read_conversation",
+        json!({"conversation_id": private_id}),
+    )
+    .await;
+    assert!(!err.contains("database error"), "{err}");
+
+    // A legacy row that combines a project with private visibility is
+    // still private: the grant lists nothing there.
+    let legacy = call(
+        &window,
+        "create_conversation",
+        json!({"title": "legacy private", "private": true}),
+    )
+    .await;
+    let legacy_id: Uuid = legacy["id"].as_str().unwrap().parse().unwrap();
+    let (project_uuid,): (Uuid,) =
+        sqlx::query_as("SELECT project_id FROM conversations WHERE id = $1")
+            .bind(project_id.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE conversations SET project_id = $2 WHERE id = $1")
+        .bind(legacy_id)
+        .bind(project_uuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    call(
+        &window,
+        "grant_project_access",
+        json!({"project": "shared", "agent": "bob"}),
+    )
+    .await;
+    let listed = call(&bob, "list_conversations", json!({})).await;
+    let ids: Vec<&str> = listed["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&project_id.as_str()), "{listed}");
+    assert!(
+        !ids.contains(&legacy_id.to_string().as_str()),
+        "a private thread naming a project stays private: {listed}"
+    );
+
+    // Access lost between candidates and reads does not fail the listing:
+    // Bob's grant is revoked while he holds an invitation to the project
+    // thread, and the listing still returns what he may see.
+    call(
+        &window,
+        "invite_to_conversation",
+        json!({"conversation_id": project_id, "address": "bob/bob-win"}),
+    )
+    .await;
+    call(
+        &window,
+        "grant_project_access",
+        json!({"project": "shared", "agent": "bob", "grant": false}),
+    )
+    .await;
+    let listed = call(&bob, "list_conversations", json!({})).await;
+    assert!(
+        listed["conversations"].is_array(),
+        "the listing answers: {listed}"
+    );
+    assert!(
+        !listed["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == project_id.as_str()),
+        "a project thread is not listed without the project: {listed}"
+    );
+
+    for c in [alice_agent, window, impostor, bob] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
