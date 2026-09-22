@@ -11837,3 +11837,84 @@ async fn audit_only_new_pagination_does_not_skip_unread_messages() {
     }
     h.shutdown().await;
 }
+
+/// revoke_session is fenced like resume and renew: a request admitted with
+/// a credential that was rotated before it ran must not close the window
+/// that replaced it, nor a sibling, while an agent token still closes a
+/// dead window and the label registers again afterwards (#148).
+#[tokio::test]
+async fn audit_a_stale_session_cannot_revoke_its_replacement() {
+    use ai_crew_sync::auth::{AuthCtx, hash_token};
+    use ai_crew_sync::store::sessions;
+
+    let h = require_db!("t_stale_revoke");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let (agent_id, token_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT a.id, t.id FROM api_tokens t JOIN agents a ON a.id = t.agent_id WHERE t.token_hash = $1",
+    )
+    .bind(hash_token(&token))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let team = team_id(&h.pool, "acme").await;
+    let agent = connect(&h.base, &token).await;
+    let first = call(&agent, "register_session", json!({"session": "window"})).await;
+    let sibling = call(&agent, "register_session", json!({"session": "sibling"})).await;
+    let session_id: Uuid = first["session_id"].as_str().unwrap().parse().unwrap();
+    // The context middleware built at epoch 1, kept while the window rotates.
+    let stale = AuthCtx {
+        agent_id,
+        agent_name: "joaquin".into(),
+        team_id: team,
+        team_slug: "acme".into(),
+        session: "window".into(),
+        session_id: Some(session_id),
+        session_epoch: Some(1),
+        token_id: None,
+    };
+    let old = connect(&h.base, first["session_token"].as_str().unwrap()).await;
+    let resumed = call(&old, "resume_session", json!({})).await;
+    assert_eq!(resumed["epoch"], 2, "{resumed}");
+    let current = resumed["session_token"].as_str().unwrap().to_owned();
+
+    // The stale request runs now: refused, and the replacement still works.
+    let err = match sessions::revoke(&h.pool, &stale, None).await {
+        Ok(label) => panic!("a stale request revoked '{label}'"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("stale"), "{err}");
+    assert_eq!(
+        mcp_status(&h.base, &current).await,
+        200,
+        "the replacement is untouched"
+    );
+    let err = match sessions::revoke(&h.pool, &stale, Some("sibling")).await {
+        Ok(label) => panic!("a stale request revoked the sibling '{label}'"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("stale"), "{err}");
+    assert_eq!(
+        mcp_status(&h.base, sibling["session_token"].as_str().unwrap()).await,
+        200,
+        "the sibling is untouched"
+    );
+
+    // The live credential revokes itself; the agent token closes the
+    // sibling; the labels register again afterwards.
+    let live = connect(&h.base, &current).await;
+    call(&live, "revoke_session", json!({})).await;
+    assert_eq!(mcp_status(&h.base, &current).await, 401);
+    call(&agent, "revoke_session", json!({"session": "sibling"})).await;
+    assert_eq!(
+        mcp_status(&h.base, sibling["session_token"].as_str().unwrap()).await,
+        401
+    );
+    let again = call(&agent, "register_session", json!({"session": "window"})).await;
+    assert!(again["session_token"].is_string(), "{again}");
+    let _ = token_id;
+
+    for c in [agent, old, live] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

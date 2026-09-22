@@ -278,6 +278,17 @@ pub async fn revoke(pool: &PgPool, auth: &AuthCtx, label: Option<&str>) -> BusRe
             auth.session.clone()
         }
     };
+    // Same lock order as the rest of the lifecycle (agent row first), and
+    // the caller fenced inside the transaction: a request admitted with a
+    // credential that was rotated before this ran must not close the
+    // window that replaced it, its own or a sibling's. An agent token has
+    // no epoch and passes: closing a dead window is what it is for.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM agents WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(auth.agent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    guard(&mut tx, auth).await?;
     let row: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE agent_sessions SET revoked_at = now()
           WHERE agent_id = $1 AND label = $2 AND revoked_at IS NULL
@@ -285,7 +296,7 @@ pub async fn revoke(pool: &PgPool, auth: &AuthCtx, label: Option<&str>) -> BusRe
     )
     .bind(auth.agent_id)
     .bind(&target)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if row.is_none() {
         // Already revoked, expired-and-swept or never existed: the caller
@@ -295,7 +306,7 @@ pub async fn revoke(pool: &PgPool, auth: &AuthCtx, label: Option<&str>) -> BusRe
             sqlx::query_as("SELECT id FROM agent_sessions WHERE agent_id = $1 AND label = $2")
                 .bind(auth.agent_id)
                 .bind(&target)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *tx)
                 .await?;
         if exists.is_none() {
             return Err(BusError::not_found(format!(
@@ -303,6 +314,7 @@ pub async fn revoke(pool: &PgPool, auth: &AuthCtx, label: Option<&str>) -> BusRe
             )));
         }
     }
+    tx.commit().await?;
     Ok(target)
 }
 
