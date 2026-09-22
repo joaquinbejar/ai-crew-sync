@@ -12447,3 +12447,140 @@ async fn audit_proxy_renews_its_credential_before_expiry() {
     let _ = parent.cancel().await;
     h.shutdown().await;
 }
+
+/// The renewal schedule follows the connected context, not the presence
+/// tick: a credential established after startup (configure_session on a
+/// proxy that started without a profile) is renewed on time, and after a
+/// refusal a context established anew is renewed again.
+#[tokio::test]
+async fn audit_proxy_renewal_follows_a_context_established_later() {
+    let h = require_db!("t_proxy_renewal_late");
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &bob_token)]);
+    // No .acs.toml and no default profile: the proxy starts disconnected.
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let knobs = [
+        ("BUS_SESSION_TTL_SECS", "60"),
+        ("BUS_SESSION_RENEW_LEAD_SECS", "50"),
+    ];
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-late"], &knobs).await;
+    let status = call(&proxy, "session_status", json!({})).await;
+    assert_eq!(status["connected"], false, "{status}");
+    let label = status["session"].as_str().unwrap().to_owned();
+    let row = |label: String| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_as::<_, (i64, chrono::DateTime<chrono::Utc>)>(
+                "SELECT epoch, expires_at FROM agent_sessions WHERE label = $1 AND revoked_at IS NULL",
+            )
+            .bind(label)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let renewed_after = |label: String, since: chrono::DateTime<chrono::Utc>| {
+        let row = &row;
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            loop {
+                let (_, expiry) = row(label.clone()).await;
+                if expiry > since {
+                    return expiry;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no renewal within 40 s of {since}"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    };
+
+    // Configured after startup: the keepalive must pick the credential up
+    // now, not on its next five-minute presence tick.
+    let switched = call(&proxy, "configure_session", json!({"profile": "acme"})).await;
+    assert_eq!(switched["status"]["connected"], true, "{switched}");
+    let (_, first_expiry) = row(label.clone()).await;
+    renewed_after(label.clone(), first_expiry).await;
+
+    // Refused, then established anew: the refusal's backoff belongs to the
+    // old context, and the new credential is scheduled at once.
+    let parent = connect(&h.base, &bob_token).await;
+    call(&parent, "revoke_session", json!({"session": label})).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    loop {
+        let status = call(&proxy, "session_status", json!({})).await;
+        if status["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("rejected the credential"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refusal was never reported: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let again = call(&proxy, "configure_session", json!({"profile": "acme"})).await;
+    assert_eq!(again["status"]["connected"], true, "{again}");
+    assert!(again["status"]["error"].is_null(), "{again}");
+    let (_, second_expiry) = row(label.clone()).await;
+    renewed_after(label.clone(), second_expiry).await;
+
+    let _ = proxy.cancel().await;
+    let _ = parent.cancel().await;
+    h.shutdown().await;
+}
+
+/// Every writer of a binding record takes the configuration lock: a proxy
+/// starting while another holder has it waits to publish its record rather
+/// than replacing it underneath a renewal's ownership check.
+#[tokio::test]
+async fn audit_binding_writers_share_the_config_lock() {
+    let h = require_db!("t_binding_lock");
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &bob_token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+
+    // Hold the directory's lock for three seconds, as a sibling writer would.
+    let lock_path = dir.join(".lock");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let holder = tokio::task::spawn_blocking(move || {
+        held.lock().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        held.unlock().unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The proxy registers its session and then publishes its binding, which
+    // waits for the lock: it cannot answer before the holder lets go.
+    let started = std::time::Instant::now();
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-locked"], &[]).await;
+    let status = call(&proxy, "session_status", json!({})).await;
+    let waited = started.elapsed();
+    assert_eq!(status["connected"], true, "{status}");
+    assert!(
+        waited >= std::time::Duration::from_secs(2),
+        "the proxy published its binding without waiting for the lock ({waited:?})"
+    );
+    holder.await.unwrap();
+    let binding = std::fs::read_to_string(ai_crew_sync::context::binding_path(&dir, "conv-locked"))
+        .expect("the binding was written once the lock was free");
+    assert!(
+        binding.contains(status["session"].as_str().unwrap()),
+        "{binding}"
+    );
+
+    let _ = proxy.cancel().await;
+    h.shutdown().await;
+}

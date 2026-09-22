@@ -247,6 +247,11 @@ pub struct Proxy {
     in_flight: Arc<AtomicUsize>,
     /// Serialises context switches.
     switch: Arc<Mutex<()>>,
+    /// Pinged whenever the connected context changes, so the keepalive
+    /// recomputes its renewal deadline at once instead of on its next
+    /// presence tick: a credential established after startup, or after a
+    /// refusal, must not wait five minutes for its first schedule.
+    wake: Arc<tokio::sync::Notify>,
     opts: Arc<ProxyOptions>,
     project_dir: PathBuf,
 }
@@ -723,6 +728,7 @@ impl Proxy {
             })),
             in_flight: Arc::new(AtomicUsize::new(0)),
             switch: Arc::new(Mutex::new(())),
+            wake: Arc::new(tokio::sync::Notify::new()),
             opts: Arc::new(opts),
             project_dir,
         };
@@ -871,6 +877,9 @@ impl Proxy {
             st.disconnected_reason = None;
             st.generation += 1;
         }
+        // A stored permit, not a broadcast: a keepalive that is not waiting
+        // at this instant still sees the change on its next select.
+        self.wake.notify_one();
         self.heartbeat("active").await;
         self.write_binding().await;
         Ok(previous)
@@ -934,8 +943,17 @@ impl Proxy {
             "proxy_pid": std::process::id(),
             "updated_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         });
+        drop(st);
+        // Under the same lock as every other writer of this record: a
+        // renewal stamping the expiry checks ownership and writes inside
+        // that lock, so this replacement cannot slip in between.
         let path = context::binding_path(&self.opts.state_dir, &key);
-        if let Err(e) = context::write_binding_file(&path, &record.to_string()) {
+        let text = record.to_string();
+        if let Err(e) = under_config_lock(self.opts.state_dir.clone(), move || {
+            context::write_binding_file(&path, &text)
+        })
+        .await
+        {
             tracing::warn!(error = %e, "could not write the session binding");
         }
     }
@@ -1381,6 +1399,8 @@ impl Proxy {
             );
             tokio::select! {
                 _ = ct.cancelled() => return,
+                // A new context: go round and schedule for its credential.
+                _ = self.wake.notified() => {}
                 _ = tokio::time::sleep_until(next_heartbeat) => {
                     self.heartbeat("active").await;
                     next_heartbeat = tokio::time::Instant::now() + KEEPALIVE_EVERY;
@@ -1528,15 +1548,17 @@ impl Proxy {
         // of this directory takes: a successor that replaces the record
         // between the check and the write would otherwise be overwritten
         // with this instance's older credential.
-        let stamped = context::with_config_lock(&self.opts.state_dir, || {
+        let (session_id, epoch, expires_at) =
+            (proof.session_id.clone(), proof.epoch, expires_at.to_owned());
+        let stamped = under_config_lock(self.opts.state_dir.clone(), move || {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 return Ok(false);
             };
             let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
                 return Ok(false);
             };
-            let same = value["session_id"].as_str() == Some(proof.session_id.as_str())
-                && value["epoch"].as_i64() == Some(proof.epoch);
+            let same = value["session_id"].as_str() == Some(session_id.as_str())
+                && value["epoch"].as_i64() == Some(epoch);
             if !same {
                 return Ok(false);
             }
@@ -1549,7 +1571,8 @@ impl Proxy {
             }
             context::write_binding_file(&path, &value.to_string())?;
             Ok(true)
-        });
+        })
+        .await;
         match stamped {
             Ok(true) => {}
             Ok(false) => tracing::debug!(
@@ -1608,32 +1631,54 @@ impl Proxy {
             (key, mine)
         };
         let path = context::binding_path(&self.opts.state_dir, &key);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
-            return;
-        };
-        // Ownership check: a record whose session or epoch has moved on
-        // belongs to the instance that replaced us.
-        if let Some((session_id, epoch)) = mine {
-            let same = value["session_id"].as_str() == Some(session_id.as_str())
-                && value["epoch"].as_i64() == Some(epoch);
-            if !same {
-                tracing::debug!(
-                    binding = %key,
-                    "another instance owns this binding now; leaving it alone"
-                );
-                return;
+        let shown = key.clone();
+        let outcome = under_config_lock(self.opts.state_dir.clone(), move || {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return Ok(false);
+            };
+            let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+                return Ok(false);
+            };
+            // Ownership check: a record whose session or epoch has moved on
+            // belongs to the instance that replaced us.
+            if let Some((session_id, epoch)) = mine {
+                let same = value["session_id"].as_str() == Some(session_id.as_str())
+                    && value["epoch"].as_i64() == Some(epoch);
+                if !same {
+                    return Ok(false);
+                }
+            }
+            if let Some(map) = value.as_object_mut() {
+                map.insert("closed_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+            }
+            context::write_binding_file(&path, &value.to_string())?;
+            Ok(true)
+        })
+        .await;
+        match outcome {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                binding = %shown,
+                "another instance owns this binding now, or it is gone; leaving it alone"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, binding = %shown, "could not mark the binding closed")
             }
         }
-        if let Some(map) = value.as_object_mut() {
-            map.insert("closed_at".into(), json!(chrono::Utc::now().to_rfc3339()));
-        }
-        if let Err(e) = context::write_binding_file(&path, &value.to_string()) {
-            tracing::warn!(error = %e, binding = %key, "could not mark the binding closed");
-        }
     }
+}
+
+/// Run a binding read-modify-write under the configuration lock, on a
+/// blocking thread: the lock is a file lock shared with every other writer
+/// of the directory (other proxies of this conversation included), and a
+/// wait for it must not stall the runtime that serves the host.
+async fn under_config_lock<T: Send + 'static>(
+    dir: PathBuf,
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    tokio::task::spawn_blocking(move || context::with_config_lock(&dir, f))
+        .await
+        .map_err(|e| anyhow::anyhow!("the binding writer task failed: {e}"))?
 }
 
 /// Close a remote connection we may share with an in-flight call. Sole
