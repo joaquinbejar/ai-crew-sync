@@ -12036,6 +12036,146 @@ async fn audit_postgres_redelivery_after_resume_can_be_confirmed() {
     h.shutdown().await;
 }
 
+/// The proxy's inbox fetch always answers with the fetch, never with the
+/// confirmation it sends on the side, and a confirmation replayed after a
+/// lost local record converges: the bus lists what it committed and what it
+/// had already, and the spool settles on both (#150).
+#[tokio::test]
+async fn audit_proxy_inbox_keeps_fetch_schema_after_lost_confirmation() {
+    let h = require_db!("t_proxy_inbox_replay");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &bob_token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let bob = spawn_proxy(&dir, &repo, &["--host-session", "conv-inbox"], &[]).await;
+    let status = call(&bob, "session_status", json!({})).await;
+    let address = status["address"].as_str().unwrap().to_owned();
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let convo = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "spool", "private": true, "invite": [address]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&bob, "join_conversation", json!({"conversation_id": cid})).await;
+    let send = |body: &'static str| {
+        let alice = &alice;
+        let cid = cid.clone();
+        async move {
+            call(
+                alice,
+                "send_conversation_message",
+                json!({"conversation_id": cid, "body": body, "request_id": request_id()}),
+            )
+            .await["message_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let first = send("first").await;
+
+    // Fetched through the proxy: the reply is the fetch, and the proxy
+    // confirms behind the scenes and records it in its spool.
+    let batch = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(batch["references"][0]["message_id"], first, "{batch}");
+    let spool = std::fs::read_dir(dir.join("inbox"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("the proxy wrote a spool");
+    let confirmed_line = |path: &std::path::Path| -> Vec<bool> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["confirmed"]
+                    .as_bool()
+                    .unwrap()
+            })
+            .collect()
+    };
+    assert_eq!(
+        confirmed_line(&spool),
+        vec![true],
+        "confirmed after the first fetch"
+    );
+
+    // The crash window: the bus committed the confirmation, the local
+    // rewrite was lost. Replay the fetch.
+    let text = std::fs::read_to_string(&spool)
+        .unwrap()
+        .replace("\"confirmed\":true", "\"confirmed\":false");
+    std::fs::write(&spool, text).unwrap();
+    assert_eq!(confirmed_line(&spool), vec![false]);
+    let again = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    assert!(
+        again.get("references").is_some(),
+        "the fetch keeps its schema: {again}"
+    );
+    assert!(
+        again.get("confirmed").is_none(),
+        "the confirmation reply never leaks: {again}"
+    );
+    assert_eq!(
+        confirmed_line(&spool),
+        vec![true],
+        "the replay converged on already_confirmed"
+    );
+
+    // A pending old entry mixed with a fresh one: both settle in one call.
+    let second = send("second").await;
+    let text = std::fs::read_to_string(&spool)
+        .unwrap()
+        .replace("\"confirmed\":true", "\"confirmed\":false");
+    std::fs::write(&spool, text).unwrap();
+    let batch = call(&bob, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(batch["references"][0]["message_id"], second, "{batch}");
+    assert_eq!(
+        confirmed_line(&spool),
+        vec![true, true],
+        "old and new both settled"
+    );
+
+    // The bus itself lists what it settled, scoped to the caller.
+    let direct = connect_with_session(&h.base, &alice_token, "lead").await;
+    let ids: Vec<String> = std::fs::read_to_string(&spool)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["delivery_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    let foreign = call(
+        &direct,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": ids}),
+    )
+    .await;
+    assert_eq!(foreign["confirmed"], 0, "{foreign}");
+    assert_eq!(
+        foreign["already_confirmed"],
+        json!([]),
+        "somebody else's settled ids are not the caller's: {foreign}"
+    );
+
+    let _ = bob.cancel().await;
+    for c in [alice, direct] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
 /// An inbox fetch that was admitted holds the session row for the whole
 /// hand-out: a resume waits for it, and once the resume has committed a
 /// fetch still carrying the old epoch is refused inside its own transaction

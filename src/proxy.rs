@@ -407,6 +407,28 @@ fn verdict_of(e: &anyhow::Error) -> Option<Verdict> {
     e.chain().find_map(|c| c.downcast_ref::<Verdict>().copied())
 }
 
+/// The delivery ids a confirmation settled: the ones the bus committed
+/// now plus the ones it says were already confirmed for this caller. A bus
+/// too old to list ids answers with a count alone; then the count settles
+/// everything only when it matches what was sent, as before.
+fn settled_ids(reply: Option<&Value>, sent: &[String]) -> std::collections::HashSet<String> {
+    let mut settled = std::collections::HashSet::new();
+    let Some(reply) = reply else {
+        return settled;
+    };
+    let listed = reply.get("confirmed_ids").is_some() || reply.get("already_confirmed").is_some();
+    if listed {
+        for key in ["confirmed_ids", "already_confirmed"] {
+            if let Some(ids) = reply.get(key).and_then(|v| v.as_array()) {
+                settled.extend(ids.iter().filter_map(|v| v.as_str()).map(str::to_owned));
+            }
+        }
+    } else if reply.get("confirmed").and_then(|v| v.as_i64()) == Some(sent.len() as i64) {
+        settled.extend(sent.iter().cloned());
+    }
+    settled
+}
+
 async fn call_remote(remote: &Remote, name: &str, args: Value) -> anyhow::Result<Value> {
     let arguments: rmcp::model::JsonObject =
         serde_json::from_value(args).context("arguments must be an object")?;
@@ -1106,34 +1128,36 @@ impl Proxy {
         let confirm =
             CallToolRequestParams::new("confirm_inbox_delivery".to_string()).with_arguments(params);
         match self.forward(confirm, host_ct).await {
-            Ok(result) => {
-                // The bus says how many it actually committed. A stale
-                // epoch, or a partial result, answers successfully and
-                // writes nothing; marking the spool confirmed anyway would
-                // throw away the only evidence that they are still owed.
-                let committed = result
-                    .structured_content
-                    .as_ref()
-                    .and_then(|v| v.get("confirmed"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                if committed as usize != to_confirm.len() {
-                    tracing::warn!(
-                        sent = to_confirm.len(),
-                        committed,
-                        "the bus confirmed fewer references than were sent; keeping the rest \
-                         in the spool"
-                    );
-                    return result;
-                }
+            Ok(confirmation) => {
+                // The bus says which ids it committed now and which of ours
+                // it had already: both are settled. An id in neither (a
+                // stale epoch, somebody else's reference) stays in the
+                // spool as the only evidence that it is still owed. The
+                // reply the caller gets is the fetch, never this one: the
+                // confirmation is the proxy's business.
+                let settled = settled_ids(confirmation.structured_content.as_ref(), &to_confirm);
+                let mut left = 0usize;
                 for entry in held.iter_mut() {
                     if to_confirm.contains(&entry.delivery_id) {
-                        entry.confirmed = true;
+                        if settled.contains(&entry.delivery_id) {
+                            entry.confirmed = true;
+                        } else {
+                            left += 1;
+                        }
                     }
+                }
+                if left > 0 {
+                    tracing::warn!(
+                        sent = to_confirm.len(),
+                        left,
+                        "the bus did not settle every reference sent; keeping the rest in \
+                         the spool"
+                    );
                 }
                 if let Err(e) = crate::spool::rewrite(&path, &held) {
                     // The bus has the truth; this only costs a repeated
-                    // confirmation next time, which is a no-op there.
+                    // confirmation next time, which the bus answers with
+                    // `already_confirmed`.
                     tracing::warn!(error = %e, "could not compact the inbox spool");
                 }
             }
