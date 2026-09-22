@@ -601,7 +601,10 @@ and claim it here
 Without that, one token driving two windows made the lease meaningless between
 them: both claimed the same task, both were told they held it, and both did
 the work. An expired lease is still up for grabs by anyone, including another
-of your own sessions.
+of your own sessions, and it reads that way: the task is `open` again,
+`claimed_by` is null, `lease_expired` is true and `lapsed_holder` names who
+let it go. `list_tasks {"status": "open"}` includes it; renewing it is refused,
+claim it again instead.
 
 Direct messages can address a **session** as well as a person:
 

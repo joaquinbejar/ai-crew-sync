@@ -69,10 +69,14 @@ fn render_task_line(t: &Value) {
             None => format!(" ({h})"),
         })
         .unwrap_or_default();
-    let expired = if t["lease_expired"].as_bool() == Some(true) {
-        " [lease expired]"
-    } else {
-        ""
+    // A lapsed lease reads as open; who let it lapse is still worth a glance.
+    let expired = match (
+        t["lease_expired"].as_bool() == Some(true),
+        t["lapsed_holder"].as_str(),
+    ) {
+        (true, Some(who)) => format!(" [lease lapsed: {who}]"),
+        (true, None) => " [lease lapsed]".to_owned(),
+        _ => String::new(),
     };
     println!(
         "{:<24} {:<8}{}{} {}",

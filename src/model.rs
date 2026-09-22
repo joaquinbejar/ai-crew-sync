@@ -288,7 +288,9 @@ pub struct TaskInfo {
     pub key: String,
     pub title: String,
     pub description: Option<String>,
-    /// One of `open`, `claimed`, `done`, `cancelled`.
+    /// One of `open`, `claimed`, `done`, `cancelled`. A claim whose lease
+    /// lapsed reads as `open`: anyone may take it, the former holder
+    /// included (see `lapsed_holder`).
     pub status: String,
     /// Keys of tasks this one depends on.
     pub depends_on: Vec<String>,
@@ -305,10 +307,14 @@ pub struct TaskInfo {
     /// steal the task, so renew the lease if you are still working on it.
     pub lease_expires_at: Option<String>,
     /// Seconds left on the claim, so you can decide whether waiting is
-    /// reasonable without doing the arithmetic. Zero means it has lapsed.
+    /// reasonable without doing the arithmetic.
     pub lease_seconds_remaining: Option<i64>,
-    /// True when the claim has already lapsed.
+    /// True when the last claim lapsed and nobody has claimed the task
+    /// since: it is `open`, and `lapsed_holder` says who let it go.
     pub lease_expired: bool,
+    /// Who held the claim that lapsed, while the task stays unclaimed. Not a
+    /// holder: nobody has to be asked before claiming it.
+    pub lapsed_holder: Option<String>,
     pub result: Option<String>,
     #[schemars(schema_with = "any_json_schema")]
     pub metadata: serde_json::Value,

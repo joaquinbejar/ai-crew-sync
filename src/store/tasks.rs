@@ -35,6 +35,9 @@ struct TaskRow {
     claimed_session: Option<String>,
     claimed_at: Option<chrono::DateTime<chrono::Utc>>,
     lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Decided by the database clock, the same one the writers use, so a
+    /// read never disagrees with the claim that follows it.
+    lease_expired: bool,
     result: Option<String>,
     metadata: serde_json::Value,
     attachments: serde_json::Value,
@@ -45,9 +48,35 @@ struct TaskRow {
 
 impl From<TaskRow> for TaskInfo {
     fn from(r: TaskRow) -> Self {
+        // A lapsed lease is an open task. The writers have always treated it
+        // so (anyone may claim it); a read that still said "claimed by marta"
+        // sent the reader to wait for a holder that no longer exists, or to
+        // trust a list of open tasks that left this one out. Who let it lapse
+        // stays visible, in its own field.
+        if r.lease_expired {
+            return TaskInfo {
+                key: r.key,
+                title: r.title,
+                description: r.description,
+                status: "open".to_owned(),
+                depends_on: r.depends_on,
+                blocked: r.blocked,
+                claimed_by: None,
+                claimed_session: None,
+                claimed_at: None,
+                lease_expires_at: None,
+                lease_expired: true,
+                lease_seconds_remaining: None,
+                lapsed_holder: r.claimed_by,
+                result: r.result,
+                metadata: r.metadata,
+                attachments: serde_json::from_value(r.attachments).unwrap_or_default(),
+                created_by: r.created_by,
+                created_at: ts(r.created_at),
+                updated_at: ts(r.updated_at),
+            };
+        }
         let now = chrono::Utc::now();
-        let lease_expired =
-            r.status == "claimed" && r.lease_expires_at.map(|e| e < now).unwrap_or(false);
         // Seconds, not a timestamp: an error that says "expires in 240s" tells
         // the caller whether waiting is an option; an RFC 3339 instant makes it
         // do the arithmetic first.
@@ -68,8 +97,9 @@ impl From<TaskRow> for TaskInfo {
             claimed_session: r.claimed_session.filter(|s| !s.is_empty()),
             claimed_at: ts_opt(r.claimed_at),
             lease_expires_at: ts_opt(r.lease_expires_at),
-            lease_expired,
+            lease_expired: false,
             lease_seconds_remaining,
+            lapsed_holder: None,
             result: r.result,
             metadata: r.metadata,
             attachments: serde_json::from_value(r.attachments).unwrap_or_default(),
@@ -101,6 +131,7 @@ const TASK_SELECT: &str = r#"
            t.claimed_session,
            t.claimed_at,
            t.lease_expires_at,
+           (t.status = 'claimed' AND t.lease_expires_at <= now()) AS lease_expired,
            t.result,
            t.metadata,
            COALESCE(
@@ -118,6 +149,11 @@ const TASK_SELECT: &str = r#"
     LEFT JOIN agents cb  ON cb.id = t.claimed_by
     LEFT JOIN agents crb ON crb.id = t.created_by
 "#;
+
+/// The status a reader is told, which is the one the writers act on: a
+/// claim whose lease lapsed is open, whatever the row still says.
+const EFFECTIVE_STATUS: &str =
+    "CASE WHEN t.status = 'claimed' AND t.lease_expires_at <= now() THEN 'open' ELSE t.status END";
 
 async fn log_event(
     pool: &PgPool,
@@ -345,15 +381,17 @@ pub async fn list_tasks(
     let rows: Vec<TaskRow> = sqlx::query_as(AssertSqlSafe(format!(
         r#"{TASK_SELECT}
            WHERE t.team_id = $1
-             AND ($2::text IS NULL OR t.status = $2)
-             -- "mine" means this session's, matching whoami, renew and
-             -- release. Matching the agent alone would report a task your
+             AND ($2::text IS NULL OR ({EFFECTIVE_STATUS}) = $2)
+             -- "mine" means this session's live claim, matching whoami, renew
+             -- and release. Matching the agent alone would report a task your
              -- core-manager window is holding as this window's own work,
-             -- which is the duplication the session check exists to stop.
+             -- which is the duplication the session check exists to stop; a
+             -- lapsed lease is nobody's.
              AND (NOT $3::bool
-                  OR (t.claimed_by = $4 AND COALESCE(t.claimed_session, '') = $6))
+                  OR (t.claimed_by = $4 AND COALESCE(t.claimed_session, '') = $6
+                      AND t.lease_expires_at > now()))
            ORDER BY
-             CASE t.status WHEN 'claimed' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
+             CASE ({EFFECTIVE_STATUS}) WHEN 'claimed' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
              t.updated_at DESC
            LIMIT $5"#
     )))
@@ -366,13 +404,13 @@ pub async fn list_tasks(
     .fetch_all(pool)
     .await?;
 
-    let (open, claimed): (i64, i64) = sqlx::query_as(
+    let (open, claimed): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
         r#"
-        SELECT count(*) FILTER (WHERE status = 'open'),
-               count(*) FILTER (WHERE status = 'claimed')
-        FROM tasks WHERE team_id = $1
-        "#,
-    )
+        SELECT count(*) FILTER (WHERE ({EFFECTIVE_STATUS}) = 'open'),
+               count(*) FILTER (WHERE ({EFFECTIVE_STATUS}) = 'claimed')
+        FROM tasks t WHERE t.team_id = $1
+        "#
+    )))
     .bind(auth.team_id)
     .fetch_one(pool)
     .await?;
@@ -518,6 +556,16 @@ async fn no_claim_here(pool: &PgPool, auth: &AuthCtx, key: &str) -> BusError {
             "you do not hold the claim on '{key}': it is {}",
             holder_reason(auth, &current)
         )),
+        Ok(current)
+            if current.lease_expired
+                && current.lapsed_holder.as_deref() == Some(auth.agent_name.as_str()) =>
+        {
+            BusError::conflict(format!(
+                "your lease on '{key}' lapsed, so the task has been open to everyone since. \
+                 If you are still working on it, claim it again (and renew before the lease \
+                 runs out next time)."
+            ))
+        }
         Ok(current) => BusError::conflict(format!(
             "you do not hold an active claim on '{key}' (it is {})",
             current.status
@@ -630,6 +678,10 @@ pub async fn renew_lease(
             updated_at = now()
         WHERE team_id = $2 AND key = $3 AND claimed_by = $4 AND status = 'claimed'
           AND COALESCE(claimed_session, '') = $5
+          -- A lease that lapsed is not renewed, it is claimed again: the task
+          -- has been open to everyone since, and ownership is re-established
+          -- through the same door as everyone else's.
+          AND lease_expires_at > now()
         RETURNING id
         "#,
     )

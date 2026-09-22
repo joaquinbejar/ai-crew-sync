@@ -10801,3 +10801,138 @@ async fn a_moderator_cannot_demote_an_owner_by_reinviting_it() {
         h.shutdown().await;
     }
 }
+
+/// A claim whose lease lapsed is open, and every read says so at once: the
+/// writers always treated it that way (anyone could claim it), while
+/// get_task and list_tasks kept reporting "claimed by marta", the open list
+/// left it out and the claimed list kept it (#135).
+#[tokio::test]
+async fn a_lapsed_lease_reads_as_open_everywhere() {
+    let h = require_db!("t_lapsed_lease");
+    let a = seed_agent(&h.pool, "acme", "marta").await;
+    let b = seed_agent(&h.pool, "acme", "dani").await;
+    let marta = connect(&h.base, &a).await;
+    let dani = connect(&h.base, &b).await;
+
+    call(
+        &marta,
+        "create_task",
+        json!({"key": "lapse", "title": "long job"}),
+    )
+    .await;
+    call(
+        &marta,
+        "create_task",
+        json!({"key": "still-open", "title": "untouched"}),
+    )
+    .await;
+    let claimed = call(
+        &marta,
+        "claim_task",
+        json!({"key": "lapse", "lease_seconds": 60}),
+    )
+    .await;
+    assert_eq!(claimed["claimed"], true, "{claimed}");
+
+    // Live: claimed by marta, with time left, nobody lapsed.
+    let live = call(&dani, "get_task", json!({"key": "lapse"})).await["task"].clone();
+    assert_eq!(live["status"], "claimed", "{live}");
+    assert_eq!(live["claimed_by"], "marta", "{live}");
+    assert_eq!(live["lease_expired"], false, "{live}");
+    assert!(live["lapsed_holder"].is_null(), "{live}");
+    assert!(
+        live["lease_seconds_remaining"].as_i64().unwrap_or(0) > 0,
+        "{live}"
+    );
+    let mine = call(&marta, "list_tasks", json!({"mine_only": true})).await;
+    assert_eq!(mine["tasks"].as_array().map(Vec::len), Some(1), "{mine}");
+    let listed = call(&dani, "list_tasks", json!({})).await;
+    assert_eq!(
+        (listed["open"].as_i64(), listed["claimed"].as_i64()),
+        (Some(1), Some(1)),
+        "{listed}"
+    );
+
+    sqlx::query(
+        "UPDATE tasks SET lease_expires_at = now() - interval '1 minute' WHERE key = 'lapse'",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    // Lapsed: open, unheld, and honest about who let it go.
+    let lapsed = call(&dani, "get_task", json!({"key": "lapse"})).await["task"].clone();
+    assert_eq!(lapsed["status"], "open", "{lapsed}");
+    assert!(lapsed["claimed_by"].is_null(), "{lapsed}");
+    assert!(lapsed["claimed_session"].is_null(), "{lapsed}");
+    assert!(lapsed["claimed_at"].is_null(), "{lapsed}");
+    assert!(lapsed["lease_expires_at"].is_null(), "{lapsed}");
+    assert!(lapsed["lease_seconds_remaining"].is_null(), "{lapsed}");
+    assert_eq!(lapsed["lease_expired"], true, "{lapsed}");
+    assert_eq!(lapsed["lapsed_holder"], "marta", "{lapsed}");
+
+    let keys = |r: &Value| -> Vec<String> {
+        r["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["key"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let open = call(&dani, "list_tasks", json!({"status": "open"})).await;
+    assert!(
+        keys(&open).contains(&"lapse".to_owned()),
+        "the open list has it: {open}"
+    );
+    assert!(
+        open["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["status"] == "open"),
+        "and every row in it says open: {open}"
+    );
+    let claimed = call(&dani, "list_tasks", json!({"status": "claimed"})).await;
+    assert!(
+        !keys(&claimed).contains(&"lapse".to_owned()),
+        "the claimed list does not: {claimed}"
+    );
+    let all = call(&dani, "list_tasks", json!({})).await;
+    let row = all["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["key"] == "lapse")
+        .unwrap();
+    assert_eq!(row["status"], "open", "{all}");
+    assert_eq!(row["lapsed_holder"], "marta", "{all}");
+    assert_eq!(
+        (all["open"].as_i64(), all["claimed"].as_i64()),
+        (Some(2), Some(0)),
+        "counters follow: {all}"
+    );
+    let mine = call(&marta, "list_tasks", json!({"mine_only": true})).await;
+    assert_eq!(
+        mine["tasks"].as_array().map(Vec::len),
+        Some(0),
+        "a lapsed lease is nobody's: {mine}"
+    );
+
+    // Renewing what lapsed is refused with the way back in; claiming works,
+    // for the former holder as for anyone else.
+    let err = call_expect_error(&marta, "renew_task_lease", json!({"key": "lapse"})).await;
+    assert!(err.contains("lapsed"), "{err}");
+    assert!(err.contains("claim it again"), "{err}");
+    let taken = call(&dani, "claim_task", json!({"key": "lapse"})).await;
+    assert_eq!(taken["claimed"], true, "{taken}");
+    let now = taken["task"].clone();
+    assert_eq!(now["status"], "claimed", "{now}");
+    assert_eq!(now["claimed_by"], "dani", "{now}");
+    assert_eq!(now["lease_expired"], false, "{now}");
+    assert!(now["lapsed_holder"].is_null(), "{now}");
+
+    for c in [marta, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

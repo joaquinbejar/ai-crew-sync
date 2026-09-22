@@ -612,7 +612,10 @@ and claim it here
 Sin eso, un token moviendo dos ventanas dejaba el lease sin valor entre ellas:
 las dos reclamaban la misma tarea, a las dos se les decía que la tenían, y las
 dos hacían el trabajo. Un lease caducado sigue siendo robable por cualquiera,
-incluida otra sesión tuya.
+incluida otra sesión tuya, y así se lee: la tarea vuelve a ser `open`,
+`claimed_by` es null, `lease_expired` es true y `lapsed_holder` dice quién lo
+dejó caducar. `list_tasks {"status": "open"}` la incluye; renovarlo se rechaza,
+reclámala de nuevo.
 
 Los DM pueden dirigirse a una **sesión**, no solo a una persona:
 
