@@ -12035,3 +12035,154 @@ async fn audit_postgres_redelivery_after_resume_can_be_confirmed() {
     }
     h.shutdown().await;
 }
+
+/// An inbox fetch that was admitted holds the session row for the whole
+/// hand-out: a resume waits for it, and once the resume has committed a
+/// fetch still carrying the old epoch is refused inside its own transaction
+/// rather than stamping the old epoch over the live window's delivery.
+#[tokio::test]
+async fn audit_an_admitted_fetch_cannot_move_a_delivery_backwards() {
+    use ai_crew_sync::store::{inbox, routing::Backends, sessions};
+    let h = require_db!("t_fetch_epoch_fence");
+    let alice_token = seed_agent(&h.pool, "acme", "alice").await;
+    let bob_token = seed_agent(&h.pool, "acme", "bob").await;
+    enable_conversations(&h.pool, "acme").await;
+    let alice = connect_with_session(&h.base, &alice_token, "lead").await;
+    let bob_agent = connect(&h.base, &bob_token).await;
+    let first = call(&bob_agent, "register_session", json!({"session": "reader"})).await;
+    let bob1 = connect(&h.base, first["session_token"].as_str().unwrap()).await;
+    let convo = call(
+        &alice,
+        "create_conversation",
+        json!({"title": "fence", "private": true, "invite": ["bob/reader"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&bob1, "join_conversation", json!({"conversation_id": cid})).await;
+    let mid = call(
+        &alice,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "hold this", "request_id": request_id()}),
+    )
+    .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bob_epoch1 = ai_crew_sync::auth::AuthCtx {
+        agent_id: sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE name = 'bob'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap(),
+        agent_name: "bob".into(),
+        team_id: team_id(&h.pool, "acme").await,
+        team_slug: "acme".into(),
+        session: "reader".into(),
+        session_id: Some(
+            first["session_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        ),
+        session_epoch: Some(1),
+        token_id: None,
+    };
+
+    // An admitted fetch, paused before its hand-out: the guard it passed
+    // holds the session row, so the resume cannot commit underneath it.
+    let mut admitted = h.pool.begin().await.unwrap();
+    sessions::guard(&mut admitted, &bob_epoch1).await.unwrap();
+    let resume = {
+        let bob1 = connect(&h.base, first["session_token"].as_str().unwrap()).await;
+        tokio::spawn(async move {
+            let out = call(&bob1, "resume_session", json!({})).await;
+            let _ = bob1.cancel().await;
+            out
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert!(
+        !resume.is_finished(),
+        "the resume must wait for the admitted fetch to finish"
+    );
+    admitted.rollback().await.unwrap();
+    let resumed = tokio::time::timeout(std::time::Duration::from_secs(10), resume)
+        .await
+        .expect("the resume proceeds once the fetch is done")
+        .unwrap();
+    assert_eq!(resumed["epoch"], 2, "{resumed}");
+    let bob2 = connect(&h.base, resumed["session_token"].as_str().unwrap()).await;
+
+    // The live window takes the delivery at epoch 2.
+    let batch = call(&bob2, "fetch_conversation_inbox", json!({})).await;
+    let delivery = batch["references"][0]["delivery_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(batch["references"][0]["message_id"], mid, "{batch}");
+
+    // A fetch still carrying epoch 1, admitted at the door and reaching the
+    // store after the resume: refused inside its transaction, and the row
+    // keeps epoch 2 for the window that holds it.
+    let backends = Backends::postgres_only(h.pool.clone());
+    let err = match inbox::fetch(&h.pool, &backends, &bob_epoch1, None).await {
+        Ok(_) => panic!("a stale fetch must not hand anything out"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("stale"), "{err}");
+    let (epoch,): (Option<i64>,) =
+        sqlx::query_as("SELECT epoch FROM inbox_deliveries WHERE id = $1")
+            .bind(delivery.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(epoch, Some(2), "the delivery stays with the live window");
+
+    // The statement itself refuses to go backwards, guard or no guard: a
+    // hand-out at epoch 1 run straight against the store leaves the row at
+    // epoch 2 and hands nothing out.
+    let membership_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM conversation_memberships WHERE conversation_id = $1 AND agent_id = $2",
+    )
+    .bind(cid.parse::<Uuid>().unwrap())
+    .bind(bob_epoch1.agent_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let key = inbox::recipient_key(bob_epoch1.agent_id, "reader");
+    let mut unguarded = h.pool.begin().await.unwrap();
+    let handed = inbox::hand_out_message(
+        &mut unguarded,
+        &bob_epoch1,
+        &key,
+        mid.parse::<Uuid>().unwrap(),
+        membership_id,
+        cid.parse::<Uuid>().unwrap(),
+    )
+    .await
+    .unwrap();
+    unguarded.commit().await.unwrap();
+    assert!(
+        handed.is_none(),
+        "an older epoch must not take the delivery over"
+    );
+    let (epoch,): (Option<i64>,) =
+        sqlx::query_as("SELECT epoch FROM inbox_deliveries WHERE id = $1")
+            .bind(delivery.parse::<Uuid>().unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(epoch, Some(2), "still the live window's");
+    let done = call(
+        &bob2,
+        "confirm_inbox_delivery",
+        json!({"delivery_ids": [delivery]}),
+    )
+    .await;
+    assert_eq!(done["confirmed"], 1, "{done}");
+
+    for c in [alice, bob_agent, bob1, bob2] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

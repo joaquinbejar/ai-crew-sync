@@ -223,13 +223,12 @@ pub async fn fetch(
     // Nor is a replaced connection that window. It would pull references
     // off the consumer as the live window and leave them handed out to a
     // process that is gone, which the live window then cannot see for the
-    // whole in-flight grace period. Checked here, once: the hand-outs
-    // record the epoch, and `confirm` rechecks it inside its own write.
-    {
-        let mut tx = pool.begin().await?;
-        crate::store::sessions::guard(&mut tx, auth).await?;
-        tx.rollback().await?;
-    }
+    // whole in-flight grace period. The guard share-locks the session row
+    // for the whole hand-out below: a resume that committed first is seen
+    // here, and one in flight waits until these rows are written, so an
+    // admitted fetch can never stamp its old epoch over a newer hand-out.
+    let mut tx = pool.begin().await?;
+    crate::store::sessions::guard(&mut tx, auth).await?;
     let limit = limit.unwrap_or(DEFAULT_BATCH).clamp(1, MAX_BATCH);
     let key = caller_key(auth);
     let mut references = Vec::new();
@@ -242,7 +241,7 @@ pub async fn fetch(
             match backend.fetch_references(&key, limit as usize).await {
                 Ok(refs) => {
                     for r in refs {
-                        match record_broker_reference(pool, auth, &key, &r).await? {
+                        match record_broker_reference(&mut tx, auth, &key, &r).await? {
                             Some(reference) => {
                                 from_broker += 1;
                                 references.push(reference);
@@ -279,7 +278,7 @@ pub async fn fetch(
     // recipient must not be told its inbox is empty because a cache lost it.
     if (references.len() as i64) < limit {
         let rest = limit - references.len() as i64;
-        references.extend(reconcile_from_postgres(pool, auth, &key, rest).await?);
+        references.extend(reconcile_from_postgres(&mut tx, auth, &key, rest).await?);
     }
     // Receipt notifications are not in message_receipts — the sender is not
     // a recipient of its own message — so they are rebuilt from the events
@@ -287,8 +286,9 @@ pub async fn fetch(
     // it had not yet collected.
     if (references.len() as i64) < limit {
         let rest = limit - references.len() as i64;
-        references.extend(reconcile_receipt_events(pool, auth, &key, rest).await?);
+        references.extend(reconcile_receipt_events(&mut tx, auth, &key, rest).await?);
     }
+    tx.commit().await?;
     let more = references.len() as i64 >= limit;
     Ok(InboxBatch {
         references,
@@ -301,7 +301,7 @@ pub async fn fetch(
 /// Record that a broker reference was handed over. `None` means it was
 /// already confirmed and needs acknowledging rather than delivering again.
 async fn record_broker_reference(
-    pool: &PgPool,
+    tx: &mut sqlx::PgConnection,
     auth: &AuthCtx,
     key: &str,
     r: &crate::store::jetstream::InboxRef,
@@ -329,7 +329,7 @@ async fn record_broker_reference(
     .bind(key)
     .bind(message_id)
     .bind(&dedup)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if confirmed > 0 {
         return Ok(None);
@@ -349,7 +349,7 @@ async fn record_broker_reference(
               WHERE m.id = $1 AND m.deleted_at IS NULL",
     )
     .bind(message_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     // The broker held a reference to something Postgres no longer has: a
     // deleted message. Acknowledging it is the right answer.
@@ -368,7 +368,7 @@ async fn record_broker_reference(
     )
     .bind(conversation_id)
     .bind(auth.agent_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if !open {
         return Ok(None);
@@ -383,7 +383,7 @@ async fn record_broker_reference(
     .bind(message_id)
     .bind(auth.agent_id)
     .bind(&auth.session)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     // A message reference is for a recipient, and a membership that has
     // ended is not one any more. The reference names a private thread, its
@@ -396,7 +396,7 @@ async fn record_broker_reference(
     // One open hand-out per reference. A redelivery, or two fetches racing,
     // finds the row that is already out and returns its id rather than
     // making a second one under a different delivery id.
-    let (delivery_id,): (Uuid,) = sqlx::query_as(
+    let delivery_id: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO inbox_deliveries
             (team_id, recipient_key, session_id, epoch, message_id, membership_id,
              ack_subject, stream_seq, event_dedup)
@@ -407,6 +407,9 @@ async fn record_broker_reference(
                        session_id = EXCLUDED.session_id,
                        epoch = EXCLUDED.epoch,
                        handed_at = now()
+         -- Never backwards: a row a newer epoch of this window holds is
+         -- not handed to an older one. Belt and braces behind the guard.
+         WHERE COALESCE(EXCLUDED.epoch, 0) >= COALESCE(inbox_deliveries.epoch, 0)
          RETURNING id",
     )
     .bind(auth.team_id)
@@ -418,8 +421,13 @@ async fn record_broker_reference(
     .bind(&r.ack_subject)
     .bind(r.stream_seq as i64)
     .bind(&dedup)
-    .fetch_one(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    // Refused by the epoch rule: the live window already holds this one,
+    // and its own confirmation acknowledges the broker's copy.
+    let Some((delivery_id,)) = delivery_id else {
+        return Ok(None);
+    };
 
     Ok(Some(InboxReference {
         delivery_id: delivery_id.to_string(),
@@ -443,10 +451,61 @@ async fn record_broker_reference(
     }))
 }
 
+/// Hand one message reference to the caller's window: the row for
+/// (recipient, message) is created, or re-handed if it is still
+/// unconfirmed. Two rules are part of the statement itself, so they hold
+/// whatever happened between the caller's admission and this write: the
+/// conversation's project grant is re-checked (a seat whose grant is gone
+/// is handed nothing), and the delivery never moves back to an older epoch
+/// of the window (`None`: a newer epoch holds it). `fetch` runs this under
+/// the session guard, so the second rule is belt and braces there.
+pub async fn hand_out_message(
+    tx: &mut sqlx::PgConnection,
+    auth: &AuthCtx,
+    key: &str,
+    message_id: Uuid,
+    membership_id: Uuid,
+    conversation_id: Uuid,
+) -> BusResult<Option<Uuid>> {
+    let delivery: Option<(Uuid,)> = sqlx::query_as(
+        "INSERT INTO inbox_deliveries
+            (team_id, recipient_key, session_id, epoch, message_id, membership_id)
+         SELECT $1, $2, $3, $4, $5, $6
+           FROM conversations c
+          WHERE c.id = $7
+            AND (c.visibility <> 'project' OR EXISTS (
+                    SELECT 1 FROM project_agent_access a
+                     WHERE a.project_id = c.project_id AND a.agent_id = $8))
+         -- A redelivery is handed to the window fetching now, at its
+         -- epoch: kept at the epoch of the first hand-out, the row could
+         -- never be confirmed once that window resumed, because the
+         -- confirmation is fenced on the epoch the reference carries.
+         ON CONFLICT (recipient_key, message_id, event_dedup) WHERE confirmed_at IS NULL
+         DO UPDATE SET handed_at = now(),
+                       session_id = EXCLUDED.session_id,
+                       epoch = EXCLUDED.epoch
+         -- Never backwards: a row a newer epoch of this window holds is
+         -- not handed to an older one.
+         WHERE COALESCE(EXCLUDED.epoch, 0) >= COALESCE(inbox_deliveries.epoch, 0)
+         RETURNING id",
+    )
+    .bind(auth.team_id)
+    .bind(key)
+    .bind(auth.session_id)
+    .bind(auth.session_epoch)
+    .bind(message_id)
+    .bind(membership_id)
+    .bind(conversation_id)
+    .bind(auth.agent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(delivery.map(|d| d.0))
+}
+
 /// Everything this recipient has not been delivered, straight from the
 /// bus's own records.
 async fn reconcile_from_postgres(
-    pool: &PgPool,
+    tx: &mut sqlx::PgConnection,
     auth: &AuthCtx,
     key: &str,
     limit: i64,
@@ -488,43 +547,14 @@ async fn reconcile_from_postgres(
     .bind(&auth.session)
     .bind(key)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for (membership_id, message_id, conversation_id, seq, from, from_session, created_at) in rows {
-        // The grant is re-checked by the insert itself: selected above and
-        // revoked before this statement, the seat is handed nothing.
-        let delivery: Option<(Uuid,)> = sqlx::query_as(
-            "INSERT INTO inbox_deliveries
-                (team_id, recipient_key, session_id, epoch, message_id, membership_id)
-             SELECT $1, $2, $3, $4, $5, $6
-               FROM conversations c
-              WHERE c.id = $7
-                AND (c.visibility <> 'project' OR EXISTS (
-                        SELECT 1 FROM project_agent_access a
-                         WHERE a.project_id = c.project_id AND a.agent_id = $8))
-             -- A redelivery is handed to the window fetching now, at its
-             -- epoch: kept at the epoch of the first hand-out, the row could
-             -- never be confirmed once that window resumed, because the
-             -- confirmation is fenced on the epoch the reference carries.
-             ON CONFLICT (recipient_key, message_id, event_dedup) WHERE confirmed_at IS NULL
-             DO UPDATE SET handed_at = now(),
-                           session_id = EXCLUDED.session_id,
-                           epoch = EXCLUDED.epoch
-             RETURNING id",
-        )
-        .bind(auth.team_id)
-        .bind(key)
-        .bind(auth.session_id)
-        .bind(auth.session_epoch)
-        .bind(message_id)
-        .bind(membership_id)
-        .bind(conversation_id)
-        .bind(auth.agent_id)
-        .fetch_optional(pool)
-        .await?;
-        let Some((delivery_id,)) = delivery else {
+        let Some(delivery_id) =
+            hand_out_message(tx, auth, key, message_id, membership_id, conversation_id).await?
+        else {
             continue;
         };
         out.push(InboxReference {
@@ -550,7 +580,7 @@ async fn reconcile_from_postgres(
 /// Receipt notifications this window has not confirmed, from the events
 /// themselves.
 async fn reconcile_receipt_events(
-    pool: &PgPool,
+    tx: &mut sqlx::PgConnection,
     auth: &AuthCtx,
     key: &str,
     limit: i64,
@@ -590,7 +620,7 @@ async fn reconcile_receipt_events(
     .bind(key)
     .bind(limit)
     .bind(auth.agent_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     let mut out = Vec::with_capacity(rows.len());
@@ -613,6 +643,7 @@ async fn reconcile_receipt_events(
              DO UPDATE SET handed_at = now(),
                            session_id = EXCLUDED.session_id,
                            epoch = EXCLUDED.epoch
+             WHERE COALESCE(EXCLUDED.epoch, 0) >= COALESCE(inbox_deliveries.epoch, 0)
              RETURNING id",
         )
         .bind(auth.team_id)
@@ -623,7 +654,7 @@ async fn reconcile_receipt_events(
         .bind(&dedup)
         .bind(conversation_id)
         .bind(auth.agent_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some((delivery_id,)) = delivery else {
             continue;
