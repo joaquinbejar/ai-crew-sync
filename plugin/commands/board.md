@@ -8,7 +8,7 @@ Show me the state of the crew bus task queue.
 Input: $ARGUMENTS
 
 Steps:
-1. Call `list_tasks` with `status` = the input if given, otherwise `any`, and `limit` 200.
+1. Call `list_tasks` with `limit` 200 and `status` = the input when it is `open`, `claimed` or `done`; for `blocked`, or no input, use `any` (`blocked` is not a status the bus filters on; it is a flag on each row, so filter `blocked: true` here).
 2. Call `list_locks`.
 
 Then print a compact board:
