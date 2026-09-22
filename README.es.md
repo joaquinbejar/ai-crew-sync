@@ -263,42 +263,62 @@ opción B.
 ### Opción A (Claude Code): plugin
 
 Este repo es también un *marketplace* de plugins de Claude Code. Cada compañero
-ejecuta, dentro de Claude Code:
+instala el binario una vez (Homebrew, `.deb`/`.rpm` o `cargo install`, ver
+**Instalación**), le dice en qué bus está, y después instala el plugin dentro
+de Claude Code:
+
+```bash
+# --url es la URL base del bus; el /mcp se añade solo
+ai-crew-sync context profile add --name acme --default \
+    --url https://bus.tu-empresa.com:8443 --team roundcrew --agent backend
+ai-crew-sync context show            # endpoint, perfil, identidad esperada, prefijo del token
+ai-crew-sync context verify          # le pregunta al bus quién es DE VERDAD ese token
+```
 
 ```
 /plugin marketplace add tu-org/ai-crew-sync
 /plugin install ai-crew-sync@ai-crew-sync
 ```
 
-y exporta en su shell (p. ej. `~/.zshrc`):
+El perfil lee sus credenciales de `~/.config/ai-crew-sync/tokens-roundcrew`,
+que quien administra el equipo rellena sin llegar a imprimir un token
+(`admin token issue --save --repo`, ver **Administración remota**).
 
-```bash
-export BUS_URL=https://bus.tu-empresa.com/mcp
-export BUS_TOKEN=acs_...   # su token personal, de `ai-crew-sync agent add`
-```
+**El plugin necesita `ai-crew-sync` en el PATH.** Su entrada MCP no es una URL
+HTTP con un token dentro: arranca `ai-crew-sync mcp proxy`, un proceso por
+conversación, y ese proceso resuelve una credencial de tus perfiles locales y
+registra la ventana como *sesión autenticada*. Ni la configuración del plugin
+ni tu shell tienen que guardar un token. Quien prefiera el par de siempre
+puede seguir: `mcp proxy` también lee `BUS_URL` y `BUS_TOKEN`, y los usa
+cuando no aplica ningún perfil.
 
 El plugin trae todo preconfigurado:
 
-- **MCP** `ai-crew-sync` apuntando a `$BUS_URL` con su `$BUS_TOKEN` (sin tocar JSON a mano).
+- **MCP** `ai-crew-sync` a través del proxy por conversación (sin tocar JSON a
+  mano y sin credencial en la configuración). Cada ventana de Claude Code pasa
+  a ser su propia dirección `agent/session`, probada con una credencial
+  propia; dos ventanas en el mismo repo ya no se pueden confundir.
 - **Hooks**: al arrancar una sesión hace heartbeat y le inyecta a Claude un
   resumen del equipo (DMs sin leer, tareas propias, `team_digest` de las últimas
   8 h — configurable con `BUS_DIGEST_HOURS`); tras cada respuesta renueva la
   presencia con el repo/rama del checkout, y al cerrar sesión marca `idle`.
-  Si `BUS_URL`/`BUS_TOKEN` no están definidos, los hooks no hacen nada.
+  Sin ningún bus configurado, no hacen nada.
 
-Pon `BUS_SESSION` por repo para que cada ventana sea su propio contexto de
-trabajo — `direnv` es la forma limpia, porque Claude Code lee el entorno al
-arrancar:
+Para esto ya no hace falta `BUS_SESSION`: el proxy deriva la sesión del id de
+conversación que le da Claude Code, así que una ventana mantiene su identidad
+al reconectar, un fork estrena una nueva, y presencia, claims y locks se
+separan solos. Lo que sí merece la pena poner por repo es el *proyecto* y el
+*rol*, para que los compañeros encuentren la ventana correcta:
 
 ```bash
-# .envrc en cada repo (ignóralo en git si además guarda un token)
-export BUS_SESSION=market-data
+ai-crew-sync context set-project --profile acme --project market-data --channel market-data
 ```
 
-Con eso el plugin etiqueta la sesión, la presencia enseña el repo correcto de
-cada ventana, y los claims y locks dejan de chocar entre ellas. Sin eso todo
-sigue funcionando igual que antes: la cabecera lleva un fallback `:-`, así que
-una variable sin definir manda vacío y no el literal `${BUS_SESSION}`.
+Eso escribe `.acs.toml` en la raíz del repo — un nombre de perfil y una
+etiqueta de proyecto, jamás una credencial, así que se puede commitear. El rol
+de la ventana sale de la configuración del cliente
+(`ai-crew-sync proxy-config --role review`) o en caliente con la herramienta
+local `configure_session` del proxy.
 
 El hook `Stop` además drena preguntas: cuando el agente de un compañero está
 bloqueado en `ask_agent`, la sesión se mantiene abierta lo justo para
@@ -315,7 +335,17 @@ que no pueda esperar, usa una tarea o un mensaje de canal.
   deploys, `wait_for_updates` para esperar respuestas), que Claude carga solo
   cuando toca coordinarse.
 
-Los hooks solo necesitan `curl` y `python3` en el PATH.
+Los hooks funcionan en dos modos, y eligen por conversación:
+
+- **Autenticado** — la ventana tiene proxy, así que los hooks llaman a
+  `ai-crew-sync context hook`, que lee el binding privado de esa ventana y
+  actúa como esa sesión. La credencial no pasa por ningún script, argumento ni
+  variable de entorno. Necesita el binario en el PATH, que el plugin ya exige.
+- **Legacy** — no hay proxy ni binding, pero `BUS_URL`/`BUS_TOKEN` están
+  exportados. Los hooks caen a `curl` + `python3` pelados y a la etiqueta
+  `X-Crew-Session`, exactamente como antes. No se asume nada más instalado.
+
+Ninguno de los dos configurado: los hooks no hacen nada, en silencio.
 
 ### Opción B (cualquier cliente MCP): configuración manual
 
@@ -705,7 +735,7 @@ nuevo lee una base que escribió uno viejo y al revés. Eso es lo que hace
 seguro un reinicio rodante y superable una vuelta atrás.
 
 ```bash
-export BUS_VERSION=0.6.0
+export BUS_VERSION=0.7.0
 make deploy                                    # Swarm; o:
 docker compose -f Docker/docker-compose.yml pull && \
   docker compose -f Docker/docker-compose.yml up -d
@@ -1124,7 +1154,7 @@ ai-crew-sync admin whoami
 
 ai-crew-sync admin team add --slug roundcrew --name "RoundCrew"    # solo global
 ai-crew-sync admin agent add --team roundcrew --name backend
-ai-crew-sync admin token issue --team roundcrew --agent backend --label "sesion backend"
+ai-crew-sync admin token issue --team roundcrew --agent backend --label "sesión backend"
 ai-crew-sync admin token list --team roundcrew
 ai-crew-sync admin token revoke --team roundcrew --id <uuid>
 
@@ -1152,7 +1182,7 @@ no lo imprime nunca:
 
 ```bash
 ai-crew-sync admin token issue --team roundcrew --agent backend \
-    --label "sesion backend" --save --repo backend
+    --label "sesión backend" --save --repo backend
 # token for backend@roundcrew verified and saved to ~/.config/ai-crew-sync/tokens-roundcrew as backend=…
 ```
 

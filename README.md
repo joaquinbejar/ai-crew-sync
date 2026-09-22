@@ -255,44 +255,62 @@ Cursor, Kimi, Zed, a script — uses the standard MCP config from Option B.
 
 ### Option A (Claude Code): plugin
 
-This repo is also a Claude Code plugin *marketplace*. Each teammate runs,
-inside Claude Code:
+This repo is also a Claude Code plugin *marketplace*. Each teammate installs
+the binary once (Homebrew, `.deb`/`.rpm` or `cargo install`, see **Install**),
+tells it which bus they are on, and then installs the plugin inside Claude
+Code:
+
+```bash
+# --url is the bus's base URL; /mcp is appended for you
+ai-crew-sync context profile add --name acme --default \
+    --url https://bus.your-company.com:8443 --team roundcrew --agent backend
+ai-crew-sync context show            # endpoint, profile, expected identity, token prefix
+ai-crew-sync context verify          # asks the bus who the token REALLY is
+```
+
+The profile reads its credentials from `~/.config/ai-crew-sync/tokens-roundcrew`,
+which the team's administrator fills without ever printing a token
+(`admin token issue --save --repo`, see **Remote administration**).
 
 ```
 /plugin marketplace add your-org/ai-crew-sync
 /plugin install ai-crew-sync@ai-crew-sync
 ```
 
-and exports in their shell (e.g. `~/.zshrc`):
-
-```bash
-export BUS_URL=https://bus.your-company.com/mcp
-export BUS_TOKEN=acs_...   # their personal token, from `ai-crew-sync agent add`
-```
+**The plugin needs `ai-crew-sync` on the PATH.** Its MCP entry is not an HTTP
+URL with a token in it: it starts `ai-crew-sync mcp proxy`, one process per
+conversation, and that process resolves a credential from your local profiles
+and registers the window as an *authenticated session*. Nothing in the plugin
+config, and nothing in your shell, has to hold a token. A teammate who would
+rather keep the old environment pair can: `mcp proxy` reads `BUS_URL` and
+`BUS_TOKEN` too, and uses them when no profile applies.
 
 The plugin comes fully preconfigured:
 
-- **MCP** `ai-crew-sync` pointing at `$BUS_URL` with their `$BUS_TOKEN` (no JSON
-  editing by hand).
+- **MCP** `ai-crew-sync` over the per-conversation proxy (no JSON editing by
+  hand, no credential in the config). Each Claude Code window becomes its own
+  `agent/session` address, proven by a credential of its own; two windows in
+  the same repository can no longer be mistaken for each other.
 - **Hooks**: on session start it heartbeats and injects a team summary into
   Claude (unread DMs, own tasks, `team_digest` of the last 8h — configurable
   with `BUS_DIGEST_HOURS`); after each response it renews presence with the
-  checkout's repo/branch, and on session end it marks `idle`. If
-  `BUS_URL`/`BUS_TOKEN` are not defined, the hooks do nothing.
+  checkout's repo/branch, and on session end it marks `idle`. With no bus
+  configured at all, they do nothing.
 
-Set `BUS_SESSION` per repository so each window is its own working context —
-`direnv` is the tidy way, since Claude Code reads the environment when it
-launches:
+You no longer set `BUS_SESSION` for this: the proxy derives the session from
+the conversation id Claude Code gives it, so a window keeps its identity across
+a reconnect, a fork gets a new one, and presence, claims and locks separate
+themselves. What is worth setting per repository is the *project* and the
+*role*, so teammates can find the right window:
 
 ```bash
-# .envrc in each repo (gitignore it if it also holds a token)
-export BUS_SESSION=market-data
+ai-crew-sync context set-project --profile acme --project market-data --channel market-data
 ```
 
-With it set, the plugin labels the session, presence shows the right repository
-for each window, and claims and locks stop colliding between them. Without it
-everything still works exactly as before — the header carries a `:-` fallback,
-so an unset variable sends nothing rather than the literal `${BUS_SESSION}`.
+That writes `.acs.toml` at the repo root — a profile name and a project label,
+never a credential, so it can be committed. Give the window its role from the
+client config (`ai-crew-sync proxy-config --role review`) or at runtime with
+the proxy's local `configure_session` tool.
 
 The `Stop` hook additionally drains questions: when a teammate's agent is
 blocked on `ask_agent`, the session is held open long enough to answer before
@@ -309,14 +327,51 @@ that must not wait, use a task or a channel message.
   `wait_for_updates` to wait for replies), which Claude loads only when
   coordination is needed.
 
-The hooks only need `curl` and `python3` on the PATH.
+The hooks run in one of two modes, and pick per conversation:
+
+- **Authenticated** — the window has a proxy, so the hooks call
+  `ai-crew-sync context hook`, which reads that window's private binding and
+  acts as that session. The credential never passes through a script, an
+  argument or an environment variable. This needs the binary on the PATH,
+  which the plugin already requires.
+- **Legacy** — no proxy and no binding, but `BUS_URL`/`BUS_TOKEN` are
+  exported. The hooks fall back to plain `curl` + `python3` and the
+  `X-Crew-Session` label, exactly as before. Nothing else is assumed to exist.
+
+Neither configured means the hooks do nothing at all, silently.
 
 ### Option B (any MCP client): manual configuration
 
-Standard MCP server entry — in Claude Code it goes in `~/.claude.json` (user
-scope) or a committed `.mcp.json` at the repo root (see `examples/.mcp.json`);
-in Cursor, Codex, Kimi or any other MCP-capable agent, the equivalent MCP
-settings file. Read the token from an environment variable:
+Two shapes, and the difference is what proves which window is calling.
+
+**Through the proxy (recommended).** The client starts the binary instead of
+opening an HTTP connection; each conversation gets its own authenticated
+session, and no file holds a credential. Generate the block:
+
+```bash
+ai-crew-sync proxy-config                       # .mcp.json shape (most clients)
+ai-crew-sync proxy-config --format toml         # ~/.codex/config.toml (Codex)
+ai-crew-sync proxy-config --role review         # windows here start as reviewers
+```
+
+```json
+{
+  "mcpServers": {
+    "ai-crew-sync": {
+      "command": "ai-crew-sync",
+      "args": ["mcp", "proxy"]
+    }
+  }
+}
+```
+
+A ready-to-copy pair is in `examples/.mcp.json` and `examples/codex-config.toml`.
+
+**Direct HTTP.** No binary needed, and the bus is plain Streamable HTTP with a
+Bearer token — this is what a script, a CI job or an MCP client you cannot
+give a command to uses. Identity is the token; the window is a `X-Crew-Session`
+*label*, which the bus trusts for partitioning presence and claims but never
+as proof of who you are:
 
 ```json
 {
@@ -324,16 +379,20 @@ settings file. Read the token from an environment variable:
     "ai-crew-sync": {
       "type": "http",
       "url": "https://bus.your-company.com/mcp",
-      "headers": { "Authorization": "Bearer ${TEAM_BUS_TOKEN}" }
+      "headers": {
+        "Authorization": "Bearer ${TEAM_BUS_TOKEN}",
+        "X-Crew-Session": "market-data"
+      }
     }
   }
 }
 ```
 
-You can also generate the block with:
+You can also generate that block with:
 
 ```bash
-ai-crew-sync mcp-config --url https://bus.your-company.com/mcp --token acs_...
+ai-crew-sync mcp-config --url https://bus.your-company.com/mcp \
+    --token acs_... --session market-data
 ```
 
 With that, each agent sees the bus tools and uses them on its own. For it to
@@ -695,7 +754,7 @@ database an older one wrote and vice versa. That is what makes a rolling
 restart safe and a rollback survivable.
 
 ```bash
-export BUS_VERSION=0.6.0
+export BUS_VERSION=0.7.0
 make deploy                                    # Swarm; or:
 docker compose -f Docker/docker-compose.yml pull && \
   docker compose -f Docker/docker-compose.yml up -d
@@ -747,11 +806,13 @@ so a release that adds hooks or changes a command reaches nobody until the
 marketplace is refreshed. Turn auto-update on for the marketplace in
 `/plugin` → **Marketplaces** if you would rather not think about it.
 
-**Other MCP clients** — Codex, Cursor, Zed, a script — have nothing to
-upgrade. The tools live on the server, so a new tool or a new argument
-appears the next time the client reconnects. New *headers*, such as
-`X-Crew-Session`, are the exception: those live in the client's config and
-have to be added by hand.
+**Other MCP clients** — Codex, Cursor, Zed, a script. Tools live on the
+server, so a new tool or a new argument appears the next time the client
+reconnects, with nothing to upgrade. Two exceptions live in the client's
+config and have to be changed by hand: new *headers*, such as
+`X-Crew-Session`, and the *proxy* — a client configured with `command:
+ai-crew-sync` runs whichever binary is on the PATH, so that one is upgraded
+with the binary, not with the server.
 
 ## Console client
 
@@ -1095,17 +1156,22 @@ connection.
 
 ### Agent, token, label, session
 
-Four words that are easy to conflate, and the bus treats very differently:
+Five words that are easy to conflate, and the bus treats very differently:
 
 | | What it is | Where it comes from |
 |---|---|---|
 | **agent** | An identity on the bus: who posts, claims, holds locks. One per coding tool per person (`joaquin`, `joaquin-codex`, `backend`). | `admin agent add` |
 | **token** | A credential that *is* one agent. Several tokens can belong to the same agent; revoking one leaves the others working. | `admin token issue` |
 | **label** | A note on a token for humans (`"backend repo"`, `"dani laptop"`). Display only: it never decides who the token is. | `--label` |
-| **session** | Which of an agent's windows is calling, from the `X-Crew-Session` header. Partitions presence, claims and locks; never identity. | `BUS_SESSION` / `--session` |
+| **session label** | Which of an agent's windows *claims* to be calling, from the `X-Crew-Session` header. Partitions presence, claims and locks. Trusted for partitioning, never as proof. | `BUS_SESSION` / `--session` |
+| **authenticated session** | A credential derived from the agent token that *proves* which window is calling. Required for a seat in a private conversation; a sibling window cannot take it by picking the same label. | `ai-crew-sync mcp proxy` (or `register_session`) |
 
 One token per repository is the shape everything below assumes: the token
-says *who*, the session says *where*.
+says *who*, the session says *where*. The label was enough while "where" only
+had to separate presence and claims; once one window can be addressed and
+held to a receipt that another must not be able to forge, it stopped being
+enough — hence the credential. Both still work, and the label is not going
+away.
 
 ### Daily administration: `ai-crew-sync admin`
 
@@ -1115,7 +1181,7 @@ ai-crew-sync admin whoami
 
 ai-crew-sync admin team add --slug roundcrew --name "RoundCrew"    # global only
 ai-crew-sync admin agent add --team roundcrew --name backend
-ai-crew-sync admin token issue --team roundcrew --agent backend --label "sesion backend"
+ai-crew-sync admin token issue --team roundcrew --agent backend --label "backend repo"
 ai-crew-sync admin token list --team roundcrew
 ai-crew-sync admin token revoke --team roundcrew --id <uuid>
 
@@ -1142,7 +1208,7 @@ prints it:
 
 ```bash
 ai-crew-sync admin token issue --team roundcrew --agent backend \
-    --label "sesion backend" --save --repo backend
+    --label "backend repo" --save --repo backend
 # token for backend@roundcrew verified and saved to ~/.config/ai-crew-sync/tokens-roundcrew as backend=…
 ```
 
@@ -1274,19 +1340,27 @@ publish the multi-arch image.
 
 ```
 src/
-  main.rs        CLI (serve / migrate / team / agent / token / client / mcp-config)
+  main.rs        CLI (serve / migrate / team / agent / token / webhook /
+                 conversations / admin / context / mcp / client / *-config)
   serve.rs       axum + MCP Streamable HTTP transport + auth middleware
-  auth.rs        bearer tokens -> AuthCtx (agent + team)
+  auth.rs        bearer tokens -> AuthCtx (agent + team + session)
+  context.rs     local resolver: profiles, .acs.toml, host-session binding
+  proxy.rs       `mcp proxy` — one stdio MCP server per conversation
+  hook.rs        `context hook` — what an authenticated lifecycle hook calls
   tools/         MCP layer (one tool per operation, typed with schemars)
-  store/         all the logic and all the SQL
-  admin.rs       operator commands
+  store/         all the logic and all the SQL; backend.rs + routing.rs pick
+                 where a conversation body lives
+  admin.rs       operator commands next to Postgres
+  admin_api.rs   /admin/* REST API (acsa_ credentials, never MCP)
+  admin_cli.rs   `ai-crew-sync admin …` against a remote bus
   client.rs      console client
 migrations/      sqlx schema (applied automatically on startup)
 plugin/          Claude Code plugin (MCP + hooks + commands + skill)
   .claude-plugin/plugin.json
-  .mcp.json      MCP server parameterized with BUS_URL/BUS_TOKEN
+  .mcp.json      starts `ai-crew-sync mcp proxy`; carries no credential
   hooks/         SessionStart (catch-up + heartbeat), Stop and SessionEnd
-  scripts/       bus-call.sh, heartbeat.sh, session-start.sh (curl + python3)
+  scripts/       bus-call.sh, heartbeat.sh, session-start.sh, stop-drain.sh
+                 (authenticated via the binary, or curl + python3 as fallback)
   commands/      /ai-crew-sync:standup|catchup|announce|ask
   skills/        coordination conventions
 Docker/          Dockerfile + the one compose file (published image, local build, Swarm-ready)
@@ -1366,14 +1440,20 @@ second copy of an attachment anywhere.
 ## Architecture decisions
 
 `docs/adr/0001-authenticated-sessions-and-staged-messaging.md` records the
-accepted direction: session credentials issued by the server and derived from
-an agent token, lifecycle hooks backed by the `ai-crew-sync` binary,
-conversations and per-recipient receipts delivered on Postgres, and an
-optional JetStream route for conversation bodies and inbox fanout afterwards.
-Seven independently deployable phases; nothing in it is active until the
-corresponding release ships and an operator opts in. Today's behavior — all
-state in Postgres, `X-Crew-Session` as a caller-supplied label, hooks that
-need only `curl` and `python3` — keeps working throughout.
+accepted direction, and all seven of its phases are now implemented: session
+credentials issued by the server and derived from an agent token, lifecycle
+hooks backed by the `ai-crew-sync` binary, conversations and per-recipient
+receipts on Postgres, and an optional JetStream route for conversation bodies
+and inbox fanout.
+
+Implemented is not the same as active. Conversations are off until an operator
+turns them on for a team (`team capability --conversations on`), JetStream is
+off until one both provisions a stream and routes the team to it, and a
+default installation contacts no broker at all. Installing a release turns on
+nothing by itself. The earlier behavior — all state in Postgres,
+`X-Crew-Session` as a caller-supplied label, hooks that need only `curl` and
+`python3` — keeps working throughout, and is still what a client with no
+binary and an exported `BUS_TOKEN` gets.
 
 ## Contribution and Contact
 
