@@ -5740,7 +5740,7 @@ async fn proxy_switches_profiles_only_after_verification_and_never_across_teams(
     let marta = seed_agent(&h.pool, "acme", "marta").await;
     let eve = seed_agent(&h.pool, "other", "eve").await;
     let dir = proxy_config_dir(
-        &h.base,
+        h.base.as_str(),
         &[
             ("me", "acme", "joaquin", &joaquin),
             ("marta", "acme", "marta", &marta),
@@ -12642,7 +12642,7 @@ async fn audit_stop_drain_reads_the_bound_window_whatever_the_environment_says()
     let bobby_token = seed_agent(&h.pool, "acme", "bobby").await;
     let alice_token = seed_agent(&h.pool, "acme", "alice").await;
     let dir = proxy_config_dir(
-        &h.base,
+        h.base.as_str(),
         &[
             ("acme", "acme", "bob", &bob_token),
             ("acme-bobby", "acme", "bobby", &bobby_token),
@@ -14259,5 +14259,137 @@ async fn session_status_reports_a_registration_refusal_in_the_bus_words() {
 
     let _ = proxy.cancel().await;
     let _ = agent.cancel().await;
+    h.shutdown().await;
+}
+
+/// A request the bus refuses over HTTP before running anything (here the
+/// body limit, 64 KiB in this harness) reaches the model through the proxy
+/// in the bus's own words, and says the call did not run. rmcp hands such
+/// an answer back as a transport error, which the proxy used to report as
+/// a lost connection where "may or may not have run" sent the model off to
+/// check for a post that never happened (#178 review).
+#[tokio::test]
+async fn a_proxy_forwards_the_bus_http_refusal_and_says_nothing_ran() {
+    let h = match setup_rate_limited("t_proxy_http_refusal", 0).await {
+        Some(h) => h,
+        None => {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        }
+    };
+    let token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-refused"], &[]).await;
+
+    let huge = "x".repeat(100 * 1024);
+    let refused = call_error_data(
+        &proxy,
+        "post_message",
+        json!({"channel": "general", "body": huge}),
+    )
+    .await;
+    assert_eq!(
+        refused.code,
+        rmcp::model::ErrorCode::INVALID_REQUEST,
+        "{refused:?}"
+    );
+    assert!(
+        refused.message.contains("request body is too large") && refused.message.contains("65536"),
+        "the bus's own words reach the model: {}",
+        refused.message
+    );
+    assert!(
+        refused.message.contains("before running it"),
+        "the model is told nothing ran: {}",
+        refused.message
+    );
+    for noise in [
+        "may or may not have run",
+        "could not reach the bus",
+        "HTTP 413",
+        "Transport",
+        "http://",
+    ] {
+        assert!(
+            !refused.message.contains(noise),
+            "a refusal read as a lost connection ({noise:?}): {}",
+            refused.message
+        );
+    }
+    let (posted,): (i64,) = sqlx::query_as("SELECT count(*) FROM messages")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(posted, 0, "the refusal is true: nothing was posted");
+    // The proxy is still connected; the refusal was not a lost bus.
+    assert_eq!(call(&proxy, "whoami", json!({})).await["agent"], "bob");
+
+    let _ = proxy.cancel().await;
+    h.shutdown().await;
+}
+
+/// The same refusal at connect time: a token already throttled when the
+/// proxy starts is reported by `session_status` in the bus's words, not as
+/// a connection that failed, and without the bus's URL (#178 review).
+#[tokio::test]
+async fn session_status_reports_an_http_refusal_at_connect_in_the_bus_words() {
+    let h = match setup_rate_limited("t_proxy_connect_refused", 1).await {
+        Some(h) => h,
+        None => {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return;
+        }
+    };
+    let token = seed_agent(&h.pool, "acme", "bob").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "bob", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+
+    // Spend the token's burst so the proxy's first request is throttled.
+    let http = reqwest::Client::new();
+    let mut throttled = false;
+    for _ in 0..40 {
+        let resp = http
+            .post(format!("{}/mcp", h.base))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/json, text/event-stream")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                          "params":{"name":"whoami","arguments":{}}}))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 429 {
+            throttled = true;
+            break;
+        }
+    }
+    assert!(throttled, "a burst of 40 must exhaust a 1/min bucket");
+
+    let proxy = spawn_proxy(&dir, &repo, &["--host-session", "conv-throttled"], &[]).await;
+    let status = call(&proxy, "session_status", json!({})).await;
+    assert_eq!(status["connected"], false, "{status}");
+    let error = status["error"].as_str().expect("the refusal is reported");
+    assert!(
+        error.contains("rate limit exceeded"),
+        "the bus's own words reach the model: {error}"
+    );
+    for noise in [
+        "failed before an answer came back",
+        "HTTP 429",
+        "Transport",
+        "http://",
+        h.base.as_str(),
+    ] {
+        assert!(
+            !error.contains(noise),
+            "a refusal read as a lost connection ({noise:?}): {error}"
+        );
+    }
+
+    let _ = proxy.cancel().await;
     h.shutdown().await;
 }

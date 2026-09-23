@@ -55,7 +55,7 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
     },
-    service::{RequestContext, RoleServer, RunningService, ServiceError},
+    service::{ClientInitializeError, RequestContext, RoleServer, RunningService, ServiceError},
     transport::{
         StreamableHttpClientTransport,
         streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpError},
@@ -388,7 +388,36 @@ async fn connect_remote(
     let remote = rmcp::model::ClientConfig::default()
         .serve(transport)
         .await
-        .with_context(|| format!("could not connect to {url}"))?;
+        .map_err(|e| {
+            // `session_status` and every refusal while disconnected show
+            // this text to the model: the bus's words when it refused, one
+            // sentence when it could not be reached, the URL and the OS
+            // error only in the log.
+            tracing::warn!(error = %e, url, "could not open a connection to the bus");
+            let lost = || "the connection failed before an answer came back".to_owned();
+            let (why, rejected) = match &e {
+                ClientInitializeError::JsonRpcError(data) => (data.message.to_string(), false),
+                ClientInitializeError::TransportError { error, .. } => {
+                    let rejected = matches!(
+                        http_error_in(&*error.error),
+                        Some(StreamableHttpError::AuthRequired(_))
+                    );
+                    let why = match refusal_in(&*error.error) {
+                        Some(r) => r.text(),
+                        None if rejected => "the bus rejected the credential".to_owned(),
+                        None => lost(),
+                    };
+                    (why, rejected)
+                }
+                _ => (lost(), false),
+            };
+            let text = format!("could not connect to the bus: {why}");
+            if rejected {
+                anyhow::Error::new(Verdict::Unauthorized).context(text)
+            } else {
+                anyhow::anyhow!(text)
+            }
+        })?;
     Ok(remote)
 }
 
@@ -401,16 +430,28 @@ fn unauthorized(e: &ServiceError) -> bool {
     let ServiceError::TransportSend(sent) = e else {
         return false;
     };
-    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&*sent.error);
+    match http_error_in(&*sent.error) {
+        Some(http) => matches!(http, StreamableHttpError::AuthRequired(_)),
+        // A transport error that is not the reqwest one: fall back to the
+        // wording rmcp gives a rejected bearer, still never a tool's text.
+        None => sent.error.to_string().contains("Auth required"),
+    }
+}
+
+/// The HTTP transport's own error inside a transport failure, found by
+/// type along the source chain. Every classification of a failed request
+/// (rejected bearer, HTTP refusal) reads it, never the rendered text.
+fn http_error_in<'a>(
+    root: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a StreamableHttpError<reqwest::Error>> {
+    let mut cause = Some(root);
     while let Some(err) = cause {
         if let Some(http) = err.downcast_ref::<StreamableHttpError<reqwest::Error>>() {
-            return matches!(http, StreamableHttpError::AuthRequired(_));
+            return Some(http);
         }
         cause = err.source();
     }
-    // A transport error that is not the reqwest one: fall back to the
-    // wording rmcp gives a rejected bearer, still never a tool's text.
-    sent.error.to_string().contains("Auth required")
+    None
 }
 
 /// The bus has no such tool. rmcp answers an unknown tool with
@@ -477,20 +518,73 @@ fn settled_ids(reply: Option<&Value>, sent: &[String]) -> std::collections::Hash
     settled
 }
 
+/// The bus answered over HTTP and refused the request before running it.
+///
+/// The bus's middleware (the body limit, the rate limit, a stale epoch, an
+/// expired session credential) answers with a status and `{"error": "…"}`
+/// written for the model. That body is not a JSON-RPC error, so rmcp does
+/// not hand it back as one: it arrives as
+/// `UnexpectedServerResponse("HTTP {status}: {body}")` inside the transport
+/// error, where it looks like a lost connection unless read for its shape.
+#[derive(Debug, PartialEq, Eq)]
+struct Refusal {
+    status: u16,
+    /// The bus's own words, when the body was the bus's `{"error": …}`.
+    said: Option<String>,
+}
+
+impl Refusal {
+    fn text(&self) -> String {
+        match &self.said {
+            Some(said) => format!("the bus refused it before running it: {said}"),
+            None => format!(
+                "the bus refused it with HTTP {} before running it",
+                self.status
+            ),
+        }
+    }
+}
+
+/// The refusal inside a transport error, if the bus answered with one.
+/// Only an answer that certainly ran nothing counts: the bus's own body at
+/// any status, or a bare 4xx. A bare 5xx may come from a gateway that timed
+/// out waiting for a call that did run, so it stays a lost connection.
+fn refusal_in(root: &(dyn std::error::Error + 'static)) -> Option<Refusal> {
+    let StreamableHttpError::UnexpectedServerResponse(msg) = http_error_in(root)? else {
+        return None;
+    };
+    let rest = msg.strip_prefix("HTTP ")?;
+    let (head, body) = rest.split_once(": ").unwrap_or((rest, ""));
+    let status: u16 = head.split_whitespace().next()?.parse().ok()?;
+    let said = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("error")?.as_str().map(str::to_owned));
+    (said.is_some() || (400..500).contains(&status)).then_some(Refusal { status, said })
+}
+
+fn refusal(e: &ServiceError) -> Option<Refusal> {
+    match e {
+        ServiceError::TransportSend(sent) => refusal_in(&*sent.error),
+        _ => None,
+    }
+}
+
 /// What a failed call to the bus means, in words the model can use.
 ///
 /// The bus writes its errors for the model, so an MCP error from it is its
 /// own message — never `ServiceError`'s rendering of it (`"Mcp error:
 /// -32602: …"`), which names a JSON-RPC code nobody downstream can act on.
-/// Anything else is this proxy losing the bus: said once, without the
-/// transport's internals (URLs, OS errors), which go to the log.
+/// An HTTP refusal is the bus's too, in its middleware's words. Anything
+/// else is this proxy losing the bus: said once, without the transport's
+/// internals (URLs, OS errors), which go to the log.
 fn remote_error_text(e: &ServiceError) -> String {
-    match e {
-        ServiceError::McpError(data) => data.message.to_string(),
-        other => {
-            tracing::warn!(error = %other, "the call to the bus failed in transport");
-            "the connection to the bus failed before an answer came back".to_owned()
-        }
+    if let ServiceError::McpError(data) = e {
+        return data.message.to_string();
+    }
+    tracing::warn!(error = %e, "the call to the bus failed in transport");
+    match refusal(e) {
+        Some(r) => r.text(),
+        None => "the connection to the bus failed before an answer came back".to_owned(),
     }
 }
 
@@ -609,26 +703,33 @@ async fn establish(
     let resolved = context::resolve(inputs)?;
     // First connection: the agent token, with the label in a header, exactly
     // as any direct client would.
-    let remote = connect_remote(&resolved.mcp_url, &resolved.token, session, None).await?;
+    // The same wording a forwarded 401 gets, so a window started with a
+    // rotated token says what to do rather than "the bus did not accept the
+    // credential". The bus refuses it at connect or at whoami.
+    let rejected = || {
+        anyhow::anyhow!(
+            "the bus rejected this window's credential — it has been revoked or \
+             rotated{}. Issue a new token (`ai-crew-sync admin token issue --save`) \
+             or select another approved profile",
+            resolved
+                .profile
+                .as_deref()
+                .map(|p| format!(" (profile '{p}')"))
+                .unwrap_or_default()
+        )
+    };
+    let remote = match connect_remote(&resolved.mcp_url, &resolved.token, session, None).await {
+        Ok(remote) => remote,
+        Err(e) if verdict_of(&e) == Some(Verdict::Unauthorized) => return Err(rejected()),
+        Err(e) => return Err(e),
+    };
     let me = match call_remote(&remote, "whoami", json!({})).await {
         Ok(me) => me,
         Err(e) => {
             let raw = e.to_string();
             let _ = remote.cancel().await;
-            // The same wording a forwarded 401 gets, so a window started
-            // with a rotated token says what to do rather than "the bus did
-            // not accept the credential".
             if verdict_of(&e) == Some(Verdict::Unauthorized) {
-                anyhow::bail!(
-                    "the bus rejected this window's credential — it has been revoked or \
-                     rotated{}. Issue a new token (`ai-crew-sync admin token issue --save`) \
-                     or select another approved profile",
-                    resolved
-                        .profile
-                        .as_deref()
-                        .map(|p| format!(" (profile '{p}')"))
-                        .unwrap_or_default()
-                );
+                return Err(rejected());
             }
             anyhow::bail!("the bus did not accept the credential: {raw}");
         }
@@ -664,18 +765,16 @@ async fn establish(
                 connect_remote(&resolved.mcp_url, &proof.token, session, Some(proof.epoch))
                     .await
                     .context("the session credential could not open a connection")?;
-            let tools = remote
-                .list_all_tools()
-                .await
-                .context("could not list the bus's tools")?;
+            let tools = remote.list_all_tools().await.map_err(|e| {
+                anyhow::anyhow!("could not list the bus's tools: {}", remote_error_text(&e))
+            })?;
             let instructions = remote.peer_info().and_then(|i| i.instructions.clone());
             (remote, tools, instructions)
         }
         None => {
-            let tools = remote
-                .list_all_tools()
-                .await
-                .context("could not list the bus's tools")?;
+            let tools = remote.list_all_tools().await.map_err(|e| {
+                anyhow::anyhow!("could not list the bus's tools: {}", remote_error_text(&e))
+            })?;
             let instructions = remote.peer_info().and_then(|i| i.instructions.clone());
             (remote, tools, instructions)
         }
@@ -1321,6 +1420,11 @@ impl Proxy {
                     // The bus wrote this for the model: same code, same
                     // words, same data, exactly as a direct call gets it.
                     data
+                } else if let Some(r) = refusal(&e) {
+                    // The bus answered and ran nothing: its middleware's
+                    // words, and the caller knows the call did not happen.
+                    tracing::warn!(error = %e, tool = %name, "the bus refused a forwarded call");
+                    ErrorData::invalid_request(format!("{name}: {}", r.text()), None)
                 } else {
                     // This proxy lost the bus. One classification, and the
                     // fact the caller needs to act safely: whether the call
@@ -1991,6 +2095,42 @@ mod unauthorized_tests {
         assert_eq!(verdict_of(&e), Some(Verdict::NoSuchTool));
         let e = anyhow::anyhow!("register_session failed: tool not found -32601 Method");
         assert_eq!(verdict_of(&e), None, "words are not a verdict");
+    }
+
+    #[test]
+    fn an_http_refusal_is_read_for_its_shape() {
+        let answered = |msg: &str| {
+            transport(StreamableHttpError::UnexpectedServerResponse(
+                msg.to_owned().into(),
+            ))
+        };
+        // The bus's middleware body, at any status: its words, nothing ran.
+        let e = answered(r#"HTTP 429 Too Many Requests: {"error":"rate limit exceeded"}"#);
+        assert_eq!(
+            refusal(&e),
+            Some(Refusal {
+                status: 429,
+                said: Some("rate limit exceeded".into())
+            })
+        );
+        assert!(remote_error_text(&e).contains("rate limit exceeded"));
+        assert!(!unauthorized(&e));
+        // A bare 4xx from something in front of the bus still ran nothing.
+        let e = answered("HTTP 404 Not Found: <html>nope</html>");
+        assert_eq!(
+            refusal(&e),
+            Some(Refusal {
+                status: 404,
+                said: None
+            })
+        );
+        // A bare 5xx may be a gateway that gave up on a call that ran.
+        assert_eq!(refusal(&answered("HTTP 504 Gateway Timeout: ")), None);
+        assert_eq!(
+            refusal(&answered("invalid www-authenticate header value")),
+            None
+        );
+        assert_eq!(refusal(&ServiceError::TransportClosed), None);
     }
 
     #[test]
