@@ -232,8 +232,8 @@ enum TeamCmd {
         /// Where this team's NEW conversations store their bodies. Existing
         /// threads keep the backend they were created on, always: a thread
         /// with half its history in each place is unreadable. Requires the
-        /// team's stream to exist (`team stream --provision`) and the server
-        /// to be started with --nats-url.
+        /// team's streams to exist (`team stream --team <team> --nats-url <url>`)
+        /// and the server to be started with --nats-url.
         #[arg(long, value_parser = ["postgres", "jetstream"])]
         backend: Option<String>,
     },
