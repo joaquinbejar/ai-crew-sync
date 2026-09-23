@@ -14393,3 +14393,343 @@ async fn session_status_reports_an_http_refusal_at_connect_in_the_bus_words() {
     let _ = proxy.cancel().await;
     h.shutdown().await;
 }
+
+/// Wait until some backend is blocked behind `blocker_pid`, so the call
+/// under test is parked exactly where the test holds it open. Keyed on the
+/// blocker's pid, so a lock wait in another test's schema never counts.
+async fn wait_until_blocked_by(pool: &PgPool, blocker_pid: i32) {
+    for _ in 0..400 {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(blocker_pid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("nothing ever waited on the blocking transaction");
+}
+
+/// Make every insert into `table` in this test's schema fail, optionally
+/// only for rows matching `when` (a trigger WHEN condition on NEW).
+async fn inject_insert_failure(pool: &PgPool, table: &str, when: Option<&str>) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION injected_failure() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let when = when.map(|w| format!("WHEN ({w})")).unwrap_or_default();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER injected_failure BEFORE INSERT ON {table} FOR EACH ROW {when} \
+         EXECUTE FUNCTION injected_failure()"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn lift_insert_failure(pool: &PgPool, table: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER injected_failure ON {table}"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A task declared with `depends_on` is never claimable before its
+/// dependencies are recorded. `create_task` used to commit the task row and
+/// then write its `task_deps` rows one by one, so in between the task was
+/// open and dependency-free and both claim paths handed it out (#179). The
+/// window is held open from another transaction: EXCLUSIVE on `task_deps`
+/// parks the dependency insert (ROW EXCLUSIVE) but not the claims'
+/// `NOT EXISTS` read (ACCESS SHARE).
+#[tokio::test]
+async fn a_task_is_never_claimable_before_its_dependencies_are_recorded() {
+    let h = require_db!("t_deps_atomic");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let b = seed_agent(&h.pool, "acme", "marta").await;
+    let joaquin = connect(&h.base, &a).await;
+    let marta = connect(&h.base, &b).await;
+
+    call(
+        &joaquin,
+        "create_task",
+        json!({"key": "migrate-schema", "title": "migrate the users schema"}),
+    )
+    .await;
+    // Held, so claim_next_task has nothing older to hand out first.
+    let held = call(&joaquin, "claim_task", json!({"key": "migrate-schema"})).await;
+    assert_eq!(held["claimed"], true, "{held}");
+
+    let mut blocker = h.pool.begin().await.unwrap();
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    sqlx::query("LOCK TABLE task_deps IN EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let creator = tokio::spawn(async move {
+        let created = call(
+            &joaquin,
+            "create_task",
+            json!({"key": "update-clients", "title": "update the API clients",
+                   "depends_on": ["migrate-schema"]}),
+        )
+        .await;
+        (joaquin, created)
+    });
+    wait_until_blocked_by(&h.pool, blocker_pid).await;
+
+    // The create is parked on its dependency insert. Whatever the task looks
+    // like from outside now, it must not be claimable.
+    let next = call(&marta, "claim_next_task", json!({})).await;
+    let named = marta
+        .call_tool(
+            CallToolRequestParams::new("claim_task")
+                .with_arguments(serde_json::from_value(json!({"key": "update-clients"})).unwrap()),
+        )
+        .await;
+
+    blocker.rollback().await.unwrap();
+    let (joaquin, created) = creator.await.unwrap();
+
+    assert_eq!(
+        next["claimed"], false,
+        "claim_next_task handed out a task before its dependency was recorded: {next}"
+    );
+    match named {
+        // Not visible yet: the task does not exist for anyone until its
+        // dependencies do.
+        Err(e) => assert!(e.to_string().contains("not found"), "{e}"),
+        Ok(r) if r.is_error == Some(true) => {
+            let said = format!("{:?}", r.content);
+            assert!(said.contains("not found"), "{said}");
+        }
+        // Visible: then it must already be refused on its dependency.
+        Ok(r) => {
+            let v = r.structured_content.unwrap_or_default();
+            assert_eq!(
+                v["claimed"], false,
+                "claim_task took a task before its dependency was recorded: {v}"
+            );
+            assert!(
+                v["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("migrate-schema"),
+                "{v}"
+            );
+        }
+    }
+
+    // Once the create returns, the task carries its dependency and stays
+    // blocked on it.
+    assert_eq!(created["depends_on"][0], "migrate-schema", "{created}");
+    assert_eq!(created["blocked"], true, "{created}");
+    let denied = call(&marta, "claim_task", json!({"key": "update-clients"})).await;
+    assert_eq!(denied["claimed"], false, "{denied}");
+    assert!(
+        denied["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("migrate-schema"),
+        "{denied}"
+    );
+
+    let _ = joaquin.cancel().await;
+    let _ = marta.cancel().await;
+    h.shutdown().await;
+}
+
+/// A create that fails after the task row is written leaves nothing behind:
+/// no task, no event, so the same call retried succeeds instead of hitting
+/// "already exists" on an orphan that was claimable with no dependencies
+/// (#179).
+#[tokio::test]
+async fn a_failed_create_leaves_no_task_behind_and_a_retry_succeeds() {
+    let h = require_db!("t_create_rollback");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let joaquin = connect(&h.base, &a).await;
+    call(
+        &joaquin,
+        "create_task",
+        json!({"key": "migrate-schema", "title": "migrate the users schema"}),
+    )
+    .await;
+    let events_before: i64 = sqlx::query_scalar("SELECT count(*) FROM task_events")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+
+    let request = json!({"key": "update-clients", "title": "update the API clients",
+                         "depends_on": ["migrate-schema"]});
+    inject_insert_failure(&h.pool, "task_deps", None).await;
+    let err = call_expect_error(&joaquin, "create_task", request.clone()).await;
+    assert!(err.contains("database error"), "{err}");
+
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE key = 'update-clients'")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "a failed create left its task behind");
+    let events_after: i64 = sqlx::query_scalar("SELECT count(*) FROM task_events")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(events_after, events_before, "and no history for it");
+
+    lift_insert_failure(&h.pool, "task_deps").await;
+    let created = call(&joaquin, "create_task", request).await;
+    assert_eq!(created["depends_on"][0], "migrate-schema", "{created}");
+    assert_eq!(created["blocked"], true, "{created}");
+
+    let _ = joaquin.cancel().await;
+    h.shutdown().await;
+}
+
+/// A claim whose history entry cannot be written does not stand. The
+/// `claimed` event used to be written after the claim committed, so the
+/// caller was told "database error" while holding the lease (#179).
+#[tokio::test]
+async fn a_claim_whose_event_cannot_be_recorded_does_not_stand() {
+    let h = require_db!("t_claim_event_atomic");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let joaquin = connect(&h.base, &a).await;
+    call(
+        &joaquin,
+        "create_task",
+        json!({"key": "deploy-api", "title": "deploy the API"}),
+    )
+    .await;
+
+    inject_insert_failure(&h.pool, "task_events", Some("NEW.event = 'claimed'")).await;
+    let err = call_expect_error(&joaquin, "claim_task", json!({"key": "deploy-api"})).await;
+    assert!(err.contains("database error"), "{err}");
+    let task = call(&joaquin, "get_task", json!({"key": "deploy-api"})).await;
+    assert_eq!(
+        task["task"]["status"], "open",
+        "a claim reported as failed stood: {task}"
+    );
+    assert!(task["task"]["claimed_by"].is_null(), "{task}");
+
+    // The other claim path, on the same task.
+    let err = call_expect_error(&joaquin, "claim_next_task", json!({})).await;
+    assert!(err.contains("database error"), "{err}");
+    let task = call(&joaquin, "get_task", json!({"key": "deploy-api"})).await;
+    assert_eq!(task["task"]["status"], "open", "{task}");
+
+    lift_insert_failure(&h.pool, "task_events").await;
+    let claimed = call(&joaquin, "claim_task", json!({"key": "deploy-api"})).await;
+    assert_eq!(claimed["claimed"], true, "{claimed}");
+
+    let _ = joaquin.cancel().await;
+    h.shutdown().await;
+}
+
+/// A note write that cannot record its revision changes nothing: the value
+/// and its revision used to commit separately, so a failure between them
+/// left an overwrite with no revision to recover the old value from (#179).
+#[tokio::test]
+async fn a_note_write_that_cannot_record_its_revision_changes_nothing() {
+    let h = require_db!("t_note_revision_atomic");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let joaquin = connect(&h.base, &a).await;
+    let note = json!({"scope": "api", "key": "cache-backend"});
+    call(
+        &joaquin,
+        "set_note",
+        json!({"scope": "api", "key": "cache-backend", "value": "valkey"}),
+    )
+    .await;
+
+    inject_insert_failure(&h.pool, "note_revisions", None).await;
+    let err = call_expect_error(
+        &joaquin,
+        "set_note",
+        json!({"scope": "api", "key": "cache-backend", "value": "memcached"}),
+    )
+    .await;
+    assert!(err.contains("database error"), "{err}");
+
+    let read = call(&joaquin, "get_note", note.clone()).await;
+    assert_eq!(read["note"]["value"], "valkey", "{read}");
+    let revisions: i64 = sqlx::query_scalar("SELECT count(*) FROM note_revisions")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(revisions, 1, "only the first write has a revision");
+
+    lift_insert_failure(&h.pool, "note_revisions").await;
+    call(
+        &joaquin,
+        "set_note",
+        json!({"scope": "api", "key": "cache-backend", "value": "memcached"}),
+    )
+    .await;
+    let read = call(&joaquin, "get_note", note).await;
+    assert_eq!(read["note"]["value"], "memcached", "{read}");
+    let revisions: i64 = sqlx::query_scalar("SELECT count(*) FROM note_revisions")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(revisions, 2, "{revisions}");
+
+    let _ = joaquin.cancel().await;
+    h.shutdown().await;
+}
+
+/// Two creates of one key race to the same conflict the sequential case
+/// gets. The existence check used to be a separate read, so the loser
+/// passed it, then hit the unique index and answered "database error"
+/// (#179).
+#[tokio::test]
+async fn two_creates_of_one_key_race_to_a_conflict() {
+    let h = require_db!("t_create_race");
+    let a = seed_agent(&h.pool, "acme", "joaquin").await;
+    let joaquin = connect(&h.base, &a).await;
+    let team_id: Uuid = sqlx::query_scalar("SELECT id FROM teams WHERE slug = 'acme'")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+
+    // The winner, still in flight.
+    let mut winner = h.pool.begin().await.unwrap();
+    let winner_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *winner)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO tasks (team_id, key, title) VALUES ($1, 'deploy-api', 'first')")
+        .bind(team_id)
+        .execute(&mut *winner)
+        .await
+        .unwrap();
+
+    let loser = tokio::spawn(async move {
+        let err = call_expect_error(
+            &joaquin,
+            "create_task",
+            json!({"key": "deploy-api", "title": "second"}),
+        )
+        .await;
+        (joaquin, err)
+    });
+    wait_until_blocked_by(&h.pool, winner_pid).await;
+    winner.commit().await.unwrap();
+    let (joaquin, err) = loser.await.unwrap();
+
+    assert!(err.contains("already exists"), "{err}");
+    assert!(!err.contains("database error"), "{err}");
+
+    let _ = joaquin.cancel().await;
+    h.shutdown().await;
+}

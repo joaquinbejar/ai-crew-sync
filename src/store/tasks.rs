@@ -157,26 +157,9 @@ const TASK_SELECT: &str = r#"
 const EFFECTIVE_STATUS: &str =
     "CASE WHEN t.status = 'claimed' AND t.lease_expires_at <= now() THEN 'open' ELSE t.status END";
 
-async fn log_event(
-    pool: &PgPool,
-    task_id: Uuid,
-    agent_id: Uuid,
-    event: &str,
-    detail: Option<&str>,
-) -> BusResult<()> {
-    sqlx::query("INSERT INTO task_events (task_id, agent_id, event, detail) VALUES ($1,$2,$3,$4)")
-        .bind(task_id)
-        .bind(agent_id)
-        .bind(event)
-        .bind(detail)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// The same row, on the transaction that made the change. A history entry
-/// that commits separately can outlive a rolled-back mutation, or be lost
-/// by one that committed.
+/// A task's history entry, always on the transaction that made the change.
+/// One that commits separately can outlive a rolled-back mutation, or be
+/// lost by one that committed and then answered the caller with an error.
 async fn log_event_tx(
     conn: &mut sqlx::PgConnection,
     task_id: Uuid,
@@ -235,18 +218,6 @@ pub async fn create_task(pool: &PgPool, auth: &AuthCtx, input: CreateInput) -> B
     super::check_metadata("task", metadata_in.as_ref())?;
     let metadata = metadata_in.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
 
-    let existing: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM tasks WHERE team_id = $1 AND key = $2")
-            .bind(auth.team_id)
-            .bind(&key)
-            .fetch_optional(pool)
-            .await?;
-    if existing.is_some() {
-        return Err(BusError::conflict(format!(
-            "task '{key}' already exists; use get_task to inspect it"
-        )));
-    }
-
     if input.depends_on.len() > MAX_DEPENDENCIES {
         return Err(BusError::invalid(format!(
             "a task declares at most {MAX_DEPENDENCIES} dependencies; got {}. \
@@ -254,23 +225,61 @@ pub async fn create_task(pool: &PgPool, auth: &AuthCtx, input: CreateInput) -> B
             input.depends_on.len()
         )));
     }
-
-    // Resolve dependency keys before inserting anything, so a typo fails the
-    // whole call instead of leaving a half-registered task.
-    let mut dep_ids: Vec<Uuid> = Vec::with_capacity(input.depends_on.len());
+    let mut dep_keys: Vec<String> = Vec::with_capacity(input.depends_on.len());
     for dep_key in &input.depends_on {
         let dep_key = normalize_key(dep_key)?;
         if dep_key == key {
             return Err(BusError::invalid("a task cannot depend on itself"));
         }
-        let dep: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM tasks WHERE team_id = $1 AND key = $2")
-                .bind(auth.team_id)
-                .bind(&dep_key)
-                .fetch_optional(pool)
-                .await?;
-        match dep {
-            Some((id,)) => dep_ids.push(id),
+        dep_keys.push(dep_key);
+    }
+
+    // The task, its dependencies and its `created` event commit together.
+    // Written one by one, the task was committed, open and dependency-free
+    // until its `task_deps` rows landed, so a claim in between took work
+    // whose upstream was unfinished, and a failure in between left it that
+    // way for good (#179). The NOTIFY a waiter wakes on fires at this commit
+    // too, so nobody is woken into the gap.
+    let mut tx = pool.begin().await?;
+
+    // The existence check is the insert itself: a concurrent create of the
+    // same key waits here for the other to commit and then gets the same
+    // conflict, not a unique violation.
+    let inserted: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+        INSERT INTO tasks (team_id, key, title, description, metadata, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (team_id, key) DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(auth.team_id)
+    .bind(&key)
+    .bind(&title)
+    .bind(description.as_deref())
+    .bind(&metadata)
+    .bind(auth.agent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((id,)) = inserted else {
+        return Err(BusError::conflict(format!(
+            "task '{key}' already exists; use get_task to inspect it"
+        )));
+    };
+
+    // Resolved inside the same transaction, so a missing key rolls the task
+    // back with it: a typo fails the whole call and leaves nothing behind.
+    let found: Vec<(String, Uuid)> =
+        sqlx::query_as("SELECT key, id FROM tasks WHERE team_id = $1 AND key = ANY($2)")
+            .bind(auth.team_id)
+            .bind(&dep_keys)
+            .fetch_all(&mut *tx)
+            .await?;
+    let found: std::collections::HashMap<String, Uuid> = found.into_iter().collect();
+    let mut dep_ids: Vec<Uuid> = Vec::with_capacity(dep_keys.len());
+    for dep_key in &dep_keys {
+        match found.get(dep_key) {
+            Some(id) => dep_ids.push(*id),
             None => {
                 return Err(BusError::not_found(format!(
                     "dependency '{dep_key}' does not exist; create it first"
@@ -281,33 +290,20 @@ pub async fn create_task(pool: &PgPool, auth: &AuthCtx, input: CreateInput) -> B
     dep_ids.sort();
     dep_ids.dedup();
 
-    let (id,): (Uuid,) = sqlx::query_as(
-        r#"
-        INSERT INTO tasks (team_id, key, title, description, metadata, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id
-        "#,
-    )
-    .bind(auth.team_id)
-    .bind(&key)
-    .bind(&title)
-    .bind(description.as_deref())
-    .bind(&metadata)
-    .bind(auth.agent_id)
-    .fetch_one(pool)
-    .await?;
-
     // Dependencies only point at pre-existing tasks and this task is brand
     // new, so no cycle is possible by construction.
-    for dep_id in &dep_ids {
-        sqlx::query("INSERT INTO task_deps (task_id, blocked_by_task_id) VALUES ($1, $2)")
-            .bind(id)
-            .bind(dep_id)
-            .execute(pool)
-            .await?;
+    if !dep_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO task_deps (task_id, blocked_by_task_id) SELECT $1, unnest($2::uuid[])",
+        )
+        .bind(id)
+        .bind(&dep_ids)
+        .execute(&mut *tx)
+        .await?;
     }
 
-    log_event(pool, id, auth.agent_id, "created", Some(&title)).await?;
+    log_event_tx(&mut tx, id, auth.agent_id, "created", Some(&title)).await?;
+    tx.commit().await?;
     fetch_task(pool, auth, &key).await
 }
 
@@ -480,17 +476,20 @@ pub async fn claim_task(
     .bind(&auth.session)
     .fetch_optional(&mut *tx)
     .await?;
+    // The history entry commits with the claim. Written after the commit, a
+    // failed write answered "database error" for a claim that stood, so the
+    // caller held a lease it had been told it did not get.
+    if let Some((id,)) = updated {
+        log_event_tx(&mut tx, id, auth.agent_id, "claimed", None).await?;
+    }
     tx.commit().await?;
 
     match updated {
-        Some((id,)) => {
-            log_event(pool, id, auth.agent_id, "claimed", None).await?;
-            Ok(ClaimResult {
-                claimed: true,
-                task: Some(fetch_task(pool, auth, &key).await?),
-                reason: None,
-            })
-        }
+        Some(_) => Ok(ClaimResult {
+            claimed: true,
+            task: Some(fetch_task(pool, auth, &key).await?),
+            reason: None,
+        }),
         None => {
             // Distinguish "does not exist" from "someone else holds it".
             let current = fetch_task(pool, auth, &key).await?;

@@ -106,6 +106,12 @@ pub async fn set_note(pool: &PgPool, auth: &AuthCtx, input: SetInput) -> BusResu
         super::check_text("note tag", tag, MAX_TAG_BYTES)?;
     }
 
+    // The value and its revision commit together: written one by one, a
+    // failure between them left an overwrite with no revision, exactly the
+    // write the trail exists to undo. The row lock held until the commit
+    // also records concurrent writers' revisions in the order their values
+    // landed.
+    let mut tx = pool.begin().await?;
     let (id,): (Uuid,) = sqlx::query_as(
         r#"
         INSERT INTO notes (team_id, scope, key, value, tags, updated_by)
@@ -124,7 +130,7 @@ pub async fn set_note(pool: &PgPool, auth: &AuthCtx, input: SetInput) -> BusResu
     .bind(&input.value)
     .bind(&tags)
     .bind(auth.agent_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
 
     // Keep an append-only trail so a bad overwrite is recoverable.
@@ -132,8 +138,9 @@ pub async fn set_note(pool: &PgPool, auth: &AuthCtx, input: SetInput) -> BusResu
         .bind(id)
         .bind(&input.value)
         .bind(auth.agent_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     get_note(pool, auth, Some(scope), &key)
         .await?
