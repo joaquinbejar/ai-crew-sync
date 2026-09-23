@@ -42,6 +42,17 @@ impl BusError {
     }
 }
 
+/// The one boundary where a store error becomes what a caller reads.
+///
+/// The rule every message crossing it keeps: it is written for its reader —
+/// the model that made the call, or the human that model works for — and
+/// says what to do. Text written for someone else (this server's operator,
+/// the broker, the transport) is never forwarded into a tool result, not
+/// even interpolated as `({e})`: it is rewritten where it crosses, in the
+/// caller's terms, and the original goes to `tracing`. `Db` below is the
+/// general case; `broker_unreadable_note` in `store/inbox.rs` and
+/// `remote_error_text` in `proxy.rs` are the same rule at the two other
+/// boundaries a tool result can cross.
 impl From<BusError> for ErrorData {
     fn from(err: BusError) -> Self {
         match err {

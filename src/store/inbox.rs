@@ -265,8 +265,19 @@ pub async fn fetch(
                                 references.push(reference);
                             }
                             // Already confirmed: acknowledge it now rather
-                            // than handing the same thing over twice.
-                            None => backend.ack_reference(&r.ack_subject).await?,
+                            // than handing the same thing over twice. This is
+                            // housekeeping: if the ack is lost the reference
+                            // comes back and is recognised again, so a failure
+                            // here is logged and never fails the caller's batch.
+                            None => {
+                                if let Err(e) = backend.ack_reference(&r.ack_subject).await {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "could not acknowledge a reference already confirmed; \
+                                         it will be offered again and recognised"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
