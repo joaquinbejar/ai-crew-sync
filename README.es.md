@@ -62,10 +62,13 @@ y puede:
 | **Locks genéricos** con TTL sobre recursos ("deploy:staging") | `acquire_lock`, `release_lock`, `list_locks` |
 | Presencia (quién está en qué repo/rama haciendo qué), con las sesiones abiertas de cada compañero bajo su nombre; descubrimiento de sesiones por proyecto y rol | `heartbeat`, `list_agents`, `list_sessions` |
 | Ventanas autenticadas: una credencial que demuestra qué ventana llama, derivada de tu token de agente | `register_session`, `resume_session`, `renew_session`, `revoke_session` |
-| Conversaciones: hilos dirigidos con pertenencia explícita y receipts por destinatario (opt-in por equipo) | `create_conversation`, `send_conversation_message`, `read_conversation`, `ack_message`, `get_message_receipts`, `fetch_conversation_inbox`, … |
+| **Conversaciones** (opt-in por equipo): hilos dirigidos con pertenencia explícita | `create_conversation`, `list_conversations`, `invite_to_conversation`, `join_conversation`, `leave_conversation`, `remove_conversation_member`, `transfer_membership`, `archive_conversation` |
+| Mensajes de conversación con receipts por destinatario, y un long poll que devuelve cuentas | `send_conversation_message`, `read_conversation`, `get_conversation_message`, `ack_message`, `get_message_receipts`, `wait_for_conversation_updates` |
+| El inbox duradero de referencias de cada ventana, y lo que puede significar `delivered` | `fetch_conversation_inbox`, `confirm_inbox_delivery`, `conversation_inbox_status` |
+| Hilos de proyecto, y recuperación auditada de la historia de un asiento | `create_project`, `list_projects`, `grant_project_access`, `recover_conversation_history` |
 | Memoria compartida del equipo (notas con historial) | `set_note`, `get_note`, `list_notes`, `search_notes`, `delete_note` |
 | **Resumen de actividad** de las últimas N horas | `team_digest` |
-| **Sesiones**: un token, un contexto de trabajo por repo | cabecera `X-Crew-Session` (abajo) |
+| **Sesiones**: un token, un contexto de trabajo por ventana (una por conversación con `mcp proxy`, o por etiqueta `X-Crew-Session`) | ver [Sesiones](#sesiones-un-agente-varias-ventanas) |
 | **Anuncios** que llegan a todas las sesiones estén en lo que estén | `announce` en `post_message` |
 | Identidad | `whoami` |
 
@@ -75,8 +78,10 @@ Decisiones de diseño:
   hablar en nombre de otro.
 - **Multi-equipo**: todo está aislado por `team`; un despliegue sirve para
   varios squads.
-- **Stateless**: transporte MCP Streamable HTTP sin sesiones, así que escala
-  horizontal detrás de cualquier balanceador.
+- **Stateless**: MCP Streamable HTTP sin sesiones *de transporte*. Las
+  etiquetas de sesión y las ventanas autenticadas son estado de aplicación en
+  Postgres, así que cualquier réplica atiende cualquier petición y el bus
+  escala horizontal detrás de cualquier balanceador.
 - **Locks honestos**: los claims de tareas llevan lease con TTL; si un agente
   muere, su tarea vuelve a estar disponible. `claim_next_task` usa
   `FOR UPDATE SKIP LOCKED`, así que N agentes en paralelo nunca reciben la
@@ -102,10 +107,14 @@ cargo install ai-crew-sync
 docker pull ghcr.io/joaquinbejar/ai-crew-sync:latest
 ```
 
-Un solo binario es el servidor, el CLI de operador y el cliente de consola.
-El `.deb` y el `.rpm` instalan además una unidad systemd endurecida y un
-fichero de entorno legible solo por root en
-`/etc/ai-crew-sync/ai-crew-sync.env`. El servicio queda **deshabilitado**,
+Un solo binario es el servidor, el CLI de operador (aprovisionamiento junto a
+Postgres, más `admin` para la administración remota), el cliente de consola y
+el proxy MCP por conversación (`ai-crew-sync mcp proxy`) que arrancan el
+plugin y las configuraciones de cliente recomendadas; así que instálalo en la
+máquina de cada desarrollador además de en el servidor. El `.deb` y el `.rpm`
+instalan además una unidad systemd endurecida y un fichero de entorno en
+`/etc/ai-crew-sync/ai-crew-sync.env`, legible solo por root y por el grupo del
+servicio (`root:ai-crew-sync`, `0640`). El servicio queda **deshabilitado**,
 porque no puede funcionar hasta que `DATABASE_URL` apunte a un Postgres real:
 
 ```bash
@@ -121,34 +130,56 @@ una release lo publique.
 ## Arranque rápido (docker-compose)
 
 ```bash
-make up      # = docker compose -f Docker/docker-compose.yml up -d --no-build (imagen de GHCR)
+make up      # crea la red `edge` si no existe, y después:
+             # docker compose --project-directory . -f Docker/docker-compose.yml up -d --no-build
 ```
 
 Todas las variables tienen default razonable; se sobrescriben por entorno o
 en `./.env` (parte de `.env.example`, que documenta cada knob con su
-default — pon un `POSTGRES_PASSWORD` real para cualquier cosa no local). `make up-dev` construye desde el checkout.
-**Docker Swarm** funciona con el mismo fichero:
+default — pon un `POSTGRES_PASSWORD` real para cualquier cosa no local). El
+`--project-directory .` es lo que hace que compose lea `./.env`; ejecuta los
+comandos de compose con él desde la raíz del repositorio, o usa los targets de
+`make`. `make up-dev` construye desde el checkout. **Docker Swarm** funciona
+con el mismo fichero:
 
 ```bash
 export POSTGRES_PASSWORD=...   # Swarm no lee ficheros .env
-docker stack deploy -c Docker/docker-compose.yml crew   # o: make deploy
+docker network create --driver overlay --attachable edge   # el bus siempre se une a ella, con Traefik o sin él
+docker stack deploy -c Docker/docker-compose.yml crew
 ```
 
-El bus es stateless — escala réplicas de `bus` sin más tras el routing mesh.
+(`make deploy` hace lo mismo tras un preflight que además necesita las
+variables de producción de abajo. `TRAEFIK_NETWORK` nombra un overlay
+existente en lugar de `edge`.) El bus es stateless — escala réplicas de `bus`
+sin más tras el routing mesh.
 
-El servidor migra la base de datos al arrancar y expone:
+El servidor escucha en `0.0.0.0:8787` (`BUS_BIND`), migra la base de datos al
+arrancar (`BUS_AUTO_MIGRATE`, activado por defecto) y expone:
 
-- `POST /mcp` — endpoint MCP (requiere `Authorization: Bearer acs_...`)
-- `GET /health` — para el balanceador; informa de la base de datos, el broker
-  y de si el listener de eventos aún se oye a sí mismo (`events.listener`)
+- `POST /mcp` — el endpoint MCP. Requiere `Authorization: Bearer` con un
+  token de agente (`acs_…`) o una credencial de sesión (`acss_…`, que
+  `mcp proxy` envía tras registrar su ventana). Las credenciales
+  administrativas `acsa_` se rechazan aquí.
+- `GET /health` — para el balanceador. `503` solo cuando la base de datos
+  está caída; si no, `200` con `status` `ok`, o `degraded` cuando el listener
+  de eventos ha dejado de oírse a sí mismo (`events.listener`). Con un broker
+  configurado añade `broker` (`configured`; `/health?broker=check` lo sondea
+  de verdad) y el backlog del outbox en `publication`.
 - `GET /dashboard` — panel read-only para humanos (presencia, tareas, locks,
-  últimos mensajes de canal; los DMs nunca aparecen). Se refresca solo cada
-  15s. Ábrelo en el navegador y pega un token de agente una vez: se
+  últimos mensajes de canal y notas actualizadas hace poco; los DMs y las
+  conversaciones nunca aparecen). Se refresca solo cada 15s. Ábrelo en el
+  navegador y pega un token de agente una vez: `POST /dashboard/login` lo
   intercambia por una cookie de sesión HttpOnly, de vida corta y de solo
   lectura, que **no puede llamar a herramientas MCP**. Los scripts se saltan
   el intercambio y mandan `Authorization: Bearer acs_...` directamente. El
   token nunca se acepta en la query string — una URL acaba en el historial,
   en los referrers y en los logs del proxy.
+- `/admin/*` — la API de administración, solo para credenciales
+  administrativas `acsa_`; los comandos `ai-crew-sync admin` hablan con ella
+  (ver [Administración remota](#administración-remota)).
+
+Siguiente: [crear la primera credencial administrativa](#dar-de-alta-al-equipo),
+el único paso que se ejecuta junto a Postgres.
 
 ### Desplegar en producción
 
@@ -158,53 +189,132 @@ preflight que `make deploy` ejecuta antes de tocar el clúster:
 
 ```bash
 export POSTGRES_PASSWORD=…        # no el valor de ejemplo
-export BUS_VERSION=0.4.1          # inmutable, nunca `latest`
-export BUS_ALLOWED_HOSTS=bus.tu-empresa.com
+export BUS_VERSION=0.7.0          # una versión de release completa, nunca `latest`
+export BUS_ALLOWED_HOSTS=crew.example.com
 export BUS_DASHBOARD_SECRET=…     # compartido, para que la sesión valga en cualquier réplica
 make deploy                       # preflight y después docker stack deploy
 ```
 
-`make deploy` se niega si falta alguno, si sigue la contraseña de ejemplo o
-si el tag es móvil. `make deploy-check` ejecuta solo el preflight.
+`make deploy` se niega si falta alguno, si la contraseña sigue siendo
+`change-me`, si `BUS_VERSION` es `latest`, o si se pone `TRAEFIK_ENABLE=true`
+sin `BUS_PUBLIC_HOST`; también se niega cuando la red del proxy
+(`TRAEFIK_NETWORK`, por defecto `edge`) no existe en el swarm. `make
+deploy-check` ejecuta solo las comprobaciones de variables y nunca contacta
+con el clúster. Fija una versión completa como `0.7.0`: cada release publica
+además un tag móvil `0.7`, y el preflight no lo detecta.
 
 Detrás de un proxy Traefik v3 (`--providers.swarm`) que ya termina TLS, pon
-`TRAEFIK_ENABLE=true` y `BUS_PUBLIC_HOST=crew.tu-empresa.com` (más
+`TRAEFIK_ENABLE=true` y `BUS_PUBLIC_HOST=crew.example.com` (más
 `TRAEFIK_NETWORK`/`TRAEFIK_ENTRYPOINT`/`TRAEFIK_CERTRESOLVER` si difieren de
-`edge`/`websecure`/`le`): el bus lleva las labels del router y se une a la red
-del proxy, que el stack del proxy debe haber creado como overlay attachable.
+`edge`/`websecure`/`le`): el bus lleva las labels del router. Se une a la red
+del proxy en todos los despliegues, con Traefik o sin él (solo las labels
+dependen de `TRAEFIK_ENABLE`), y el stack del proxy debe haber creado esa red
+como overlay attachable. Traefik reenvía la cabecera `Host` original, así que
+`BUS_ALLOWED_HOSTS` debe incluir `BUS_PUBLIC_HOST` (o ser `*` cuando el proxy
+ya valida `Host`); si no, toda llamada a `/mcp` que pase por él se rechaza con
+`403`.
 
 ## Dar de alta al equipo
 
-```bash
-export DATABASE_URL=postgres://bus:...@localhost:5432/bus
+La administración se hace desde tu propia máquina con una **credencial
+administrativa** (prefijo `acsa_`). Solo la primera hay que emitirla junto a
+Postgres, porque todavía no existe nada que pueda autorizar una petición
+remota. Tres pasos, una vez por despliegue:
 
+### 1. Bootstrap: la primera credencial administrativa
+
+`admin bootstrap` necesita `DATABASE_URL` y una base de datos migrada: el
+servidor migra al arrancar; si no, ejecuta antes `ai-crew-sync migrate`. No
+hace falta que exista ningún equipo todavía. Ejecútalo donde tengas
+`DATABASE_URL` a mano:
+
+```bash
+# Stack de Compose, desde la raíz del repositorio: el contenedor del bus tiene DATABASE_URL
+docker compose --project-directory . -f Docker/docker-compose.yml exec bus \
+    ai-crew-sync admin bootstrap --label "portátil de joaquin"
+
+# Docker Swarm (stack `crew`), en un nodo que ejecute una réplica del bus
+docker exec -it $(docker ps -q -f name=crew_bus | head -n1) \
+    ai-crew-sync admin bootstrap --label "portátil de joaquin"
+
+# .deb / .rpm: DATABASE_URL vive en el fichero de entorno del servicio
+sudo sh -c 'set -a; . /etc/ai-crew-sync/ai-crew-sync.env; exec ai-crew-sync admin bootstrap --label "portátil de joaquin"'
+
+# Cualquier otro sitio que llegue a la base de datos
+DATABASE_URL=postgres://bus:…@db-host:5432/bus ai-crew-sync admin bootstrap --label "portátil de joaquin"
+```
+
+```text
+Global administrative credential — shown once, store it now:
+
+  acsa_3f9c…
+
+Use it from your machine with `ai-crew-sync admin login --url <bus>`.
+1 global credential(s) are now active; list them with `admin credential list`.
+```
+
+El secreto se imprime una sola vez; el bus guarda solo su SHA-256.
+`bootstrap` nunca se niega porque ya exista una credencial (cada ejecución
+emite una credencial global más), y eso lo convierte también en la forma de
+volver a entrar cuando se pierde la última (ver
+[Recuperación](#recuperación-se-ha-perdido-la-última-credencial-global)). El
+label es una nota para humanos.
+
+Una credencial administrativa es una clase distinta del token de agente
+(`acs_`): no identifica a nadie en el bus, no puede publicar, reclamar ni leer
+nada, y solo gestiona equipos, agentes, tokens de agente y credenciales
+administrativas. Los tokens de agente, a su vez, nunca pueden emitir
+credenciales administrativas ni otros tokens de agente, ni siquiera para su
+propio agente: lo único que derivan es una credencial de sesión para una de
+sus propias ventanas (`register_session`). Cada emisión, concesión y
+revocación queda en una tabla de auditoría que jamás contiene un secreto.
+
+### 2. Iniciar sesión desde tu máquina
+
+```bash
+ai-crew-sync admin login --url https://crew.example.com   # pide el secreto acsa_… (sin eco)
+ai-crew-sync admin whoami                                 # qué credencial, y qué puede administrar
+```
+
+`login` comprueba la credencial contra el bus antes de guardarla (permisos
+`0600`, en el directorio de configuración). A partir de aquí nada necesita
+SSH, `docker exec` ni conexión a la base de datos.
+
+### 3. Crear el equipo, sus agentes y sus tokens
+
+```bash
+ai-crew-sync admin team add --slug acme --name "Acme Squad"
+ai-crew-sync admin agent add --team acme --name joaquin
+ai-crew-sync admin agent add --team acme --name marta
+ai-crew-sync admin token issue --team acme --agent joaquin --label "portátil de joaquin"   # se imprime una vez
+ai-crew-sync admin token issue --team acme --agent marta   --label "portátil de marta"
+```
+
+Cada token se enseña **una sola vez**, y solo después de que el bus haya
+confirmado que autentica exactamente como ese agente. Dos formas de no ir
+pasando tokens de mano en mano: `admin token issue … --save --repo <entrada>`
+lo escribe directamente en `tokens-<equipo>` en la máquina que lo ejecuta y
+no lo imprime nunca, y `admin grant --team acme` le da a un compañero una
+credencial administrativa limitada a ese equipo, para que emita los suyos.
+[Administración remota](#administración-remota) tiene el juego completo de
+comandos.
+
+**Sin la API remota.** Junto a Postgres, lo mismo se puede hacer con los
+comandos locales de operador, que necesitan `DATABASE_URL` y ninguna
+credencial:
+
+```bash
 ai-crew-sync team create --slug acme --name "Acme Squad"
-ai-crew-sync agent add --team acme --name joaquin     # imprime su token
+ai-crew-sync agent add --team acme --name joaquin     # siempre emite un token y lo imprime una vez
 ai-crew-sync agent add --team acme --name marta
 ```
 
-El token se enseña **una sola vez**.
-
-Gestión posterior: `agent list`, `agent disable`, `token issue`, `token list`,
-`token revoke`.
-
-Estos comandos necesitan `DATABASE_URL`: se ejecutan junto a Postgres, casi
-siempre dentro del contenedor del bus. Hazlo allí **una sola vez** para emitir
-una credencial administrativa global: la base para administrar el bus desde
-tu propia máquina (la API remota y los comandos `admin` que la usan llegan en
-los cambios siguientes, #81 y #82):
-
-```bash
-ai-crew-sync admin bootstrap --label "portátil de joaquin"   # imprime acsa_… una vez
-```
-
-Una credencial administrativa (prefijo `acsa_`) es una clase distinta del token
-de agente (`acs_`): no identifica a nadie en el bus, no puede publicar, reclamar
-ni leer nada, y solo gestiona equipos, agentes y tokens. Los tokens de agente, a
-su vez, nunca pueden emitir credenciales, ni siquiera para su propio agente.
-`admin credential list` / `admin credential revoke --id …` gestionan esta clase;
-cada emisión, concesión y revocación queda en una tabla de auditoría que jamás
-contiene un secreto.
+Gestión posterior: `team list`, `agent list`, `agent disable` (volver a
+ejecutar `agent add` rehabilita un agente deshabilitado, con un token nuevo),
+`token issue`, `token list`, `token revoke`. Todos salvo `agent disable`
+existen también en remoto como `admin team|agent|token …`. Todos los comandos
+están en la [referencia de la línea de
+comandos](#referencia-de-la-línea-de-comandos).
 
 ### Un agente por herramienta, no por persona
 
@@ -212,16 +322,23 @@ Si usas Claude Code *y* Codex —o dos agentes de código cualesquiera— dale a
 cada uno su propio agente:
 
 ```bash
-ai-crew-sync agent add --team acme --name joaquin        --with-token   # Claude Code
-ai-crew-sync agent add --team acme --name joaquin-codex  --with-token   # Codex
+ai-crew-sync admin agent add --team acme --name joaquin         # Claude Code
+ai-crew-sync admin agent add --team acme --name joaquin-codex   # Codex
 ```
 
 Compartir un token entre dos herramientas las convierte en **el mismo agente**
-para el bus, y la coordinación deja de funcionar entre ellas en silencio: las
-dos reclaman la misma tarea y a las dos se les dice que la tienen, una suelta
-el lock de la otra, sus heartbeats se pisan, y leer en una marca como leídos
-los mensajes de la otra. Nada da error — son indistinguibles, así que no hay
-nada que rechazar.
+para el bus. A través de `mcp proxy` (o con etiquetas `X-Crew-Session`
+distintas) cada ventana sigue teniendo su propia sesión, así que claims,
+locks, presencia y cursores de lectura se mantienen separados, y el claim de
+una ventana hermana se rechaza ("claimed by your own … session"). Lo que
+pierdes es la identidad: las dos herramientas son un solo nombre en `whoami`,
+`list_agents` y `team_digest`, un mensaje directo a `joaquin` a secas llega a
+las dos, revocar o deshabilitar una corta a las dos, y tus compañeros no
+pueden saber qué herramienta contestó. Dos clientes que no envían ninguna
+sesión comparten una, y entonces la coordinación deja de funcionar entre ellos
+en silencio: los dos reclaman la misma tarea y a los dos se les dice que la
+tienen, uno suelta el lock del otro, y leer en uno marca como leídos los
+mensajes del otro.
 
 Con agentes separados todo eso funciona como debe, revocarle el acceso a una
 herramienta no toca la otra, y además pueden hablarse: `ask_agent` de Claude
@@ -242,8 +359,11 @@ create_channel core-manager
 create_channel general
 ```
 
-Llamar a un canal como un repo es lo que hace funcionar el canal por defecto de
-la sesión — ver [Sesiones](#sesiones-una-persona-varios-repos) más abajo.
+Un canal se convierte en el canal por defecto de una ventana cuando se llama
+como el proyecto de esa ventana (`context set-project`, que por defecto toma
+el nombre del directorio) o cuando se nombra directamente con `--channel` /
+`configure_session`; ver [El canal de la sesión](#el-canal-de-la-sesión) más
+abajo.
 
 Dos convenciones que importan en cuanto un equipo tiene más de un repo:
 
@@ -270,21 +390,29 @@ de Claude Code:
 ```bash
 # --url es la URL base del bus; el /mcp se añade solo
 ai-crew-sync context profile add --name acme --default \
-    --url https://bus.tu-empresa.com:8443 --team roundcrew --agent backend
+    --url https://crew.example.com --team acme --agent joaquin
 ai-crew-sync context show            # endpoint, perfil, identidad esperada, prefijo del token
 ai-crew-sync context verify          # le pregunta al bus quién es DE VERDAD ese token
 ```
 
+El perfil lee sus credenciales de `tokens-acme` en el directorio de
+configuración del propio compañero (`~/.config/ai-crew-sync` por defecto). O
+bien lo rellena el compañero en su máquina: con una credencial administrativa
+de equipo (`admin grant --team acme`), `admin token issue --team acme --agent
+joaquin --save --repo <entrada>` escribe ahí el token y nunca lo imprime; o
+bien un administrador lo emite sin `--save` y le pasa el token impreso.
+`<entrada>` es el nombre del proyecto (`context set-project`, por defecto el
+nombre del directorio), un `key` de `.acs.toml` o del perfil, o `_base`.
+
 ```
-/plugin marketplace add tu-org/ai-crew-sync
+/plugin marketplace add joaquinbejar/ai-crew-sync     # o tu fork
 /plugin install ai-crew-sync@ai-crew-sync
 ```
 
-El perfil lee sus credenciales de `~/.config/ai-crew-sync/tokens-roundcrew`,
-que quien administra el equipo rellena sin llegar a imprimir un token
-(`admin token issue --save --repo`, ver **Administración remota**).
-
-**El plugin necesita `ai-crew-sync` en el PATH.** Su entrada MCP no es una URL
+**El plugin necesita `ai-crew-sync` en el PATH**, y sus hooks necesitan además
+`python3` (sin él, las herramientas MCP y la presencia siguen funcionando; el
+resumen de inicio de sesión y el drenaje de preguntas no hacen nada, en
+silencio). Su entrada MCP no es una URL
 HTTP con un token dentro: arranca `ai-crew-sync mcp proxy`, un proceso por
 conversación, y ese proceso resuelve una credencial de tus perfiles locales y
 registra la ventana como *sesión autenticada*. Ni la configuración del plugin
@@ -320,11 +448,14 @@ separan solos. Lo que sí merece la pena poner por repo es el *proyecto* y el
 ai-crew-sync context set-project --profile acme --project market-data --channel market-data
 ```
 
-Eso escribe `.acs.toml` en la raíz del repo — un nombre de perfil y una
-etiqueta de proyecto, jamás una credencial, así que se puede commitear. El rol
-de la ventana sale de la configuración del cliente
-(`ai-crew-sync proxy-config --role review`) o en caliente con la herramienta
-local `configure_session` del proxy.
+Ejecútalo desde la raíz del repositorio (o pasa `--dir`). Escribe
+`.acs.toml`: el nombre del perfil, la etiqueta de proyecto (por defecto el
+nombre del directorio; también la entrada de `tokens-<equipo>` de la que se lee
+la credencial, salvo que `--key` nombre otra) y el canal por defecto; jamás
+una URL ni una credencial, así que se puede commitear. Con el plugin, el rol
+de la ventana se fija en caliente con la herramienta local `configure_session`
+del proxy; `ai-crew-sync proxy-config --role review` es para una configuración
+de cliente escrita a mano (opción B).
 
 El hook `Stop` además drena preguntas: cuando el agente de un compañero está
 bloqueado en `ask_agent`, la sesión se mantiene abierta lo justo para
@@ -344,7 +475,9 @@ que no pueda esperar, usa una tarea o un mensaje de canal.
   `/ai-crew-sync:thread <direcciones> -- <título>`, `/ai-crew-sync:inbox` y
   `/ai-crew-sync:review <agente> <PR>`. Cada uno es un procedimiento escrito
   sobre los tools del bus: las mismas tres o cuatro llamadas en el mismo orden,
-  con las mismas salvaguardas, desde cualquier ventana.
+  con las mismas salvaguardas, desde cualquier ventana. `thread` e `inbox`
+  necesitan la capacidad de conversaciones del equipo (`ai-crew-sync team
+  capability --team <equipo> --conversations on`, junto a Postgres).
 - **Skill** con las convenciones (reclamar antes de trabajar, locks para
   deploys, `wait_for_updates` para esperar respuestas), que Claude carga solo
   cuando toca coordinarse.
@@ -354,15 +487,16 @@ que no pueda esperar, usa una tarea o un mensaje de canal.
 Los comandos se generan desde `recipes/`, un Markdown por procedimiento
 escrito para un agente que tiene los tools del bus y nada más: sin
 frontmatter, sin supuestos de host, con `{{input}}` donde van los argumentos.
-Codex los lee desde `AGENTS.md` ("para los movimientos rutinarios sigue
-`recipes/<nombre>.md`"), a Kimi Code, Grok o cualquier cliente MCP se le
+Para Codex, añade una línea al `AGENTS.md` de tu propio repositorio que apunte
+a ellos (`ai-crew-sync recipes <nombre>`; `examples/CLAUDE.md-snippet.md` trae
+la redacción lista). A Kimi Code, Grok o cualquier cliente MCP se le
 pega uno tal cual, y una máquina con el binario pero sin el repositorio los
 obtiene con `ai-crew-sync recipes` (lista) y `ai-crew-sync recipes catchup`
 (uno). `make recipes` regenera los slash commands; `make check` y los tests
 unitarios fallan si un comando se aparta de su receta, así que cada
 procedimiento se edita en un solo sitio.
 
-Los hooks funcionan en dos modos, y eligen por conversación:
+Los hooks eligen una de tres vías por conversación, probadas en este orden:
 
 - **Autenticado** — la ventana tiene proxy, así que los hooks llaman a
   `ai-crew-sync context hook`, que lee el binding privado de esa ventana y
@@ -373,26 +507,40 @@ Los hooks funcionan en dos modos, y eligen por conversación:
   otra sesión. El binario sirve a los hooks solo las cuatro herramientas que
   usan sus scripts (`whoami`, `read_messages`, `team_digest`, `heartbeat`),
   así que un hook nunca puede emitir, rotar ni revocar una credencial. Solo
-  una conversación sin binding alguno toma la vía legacy de abajo.
-- **Legacy** — no hay proxy ni binding, pero `BUS_URL`/`BUS_TOKEN` están
-  exportados. Los hooks caen a `curl` + `python3` pelados y a la etiqueta
-  `X-Crew-Session`, exactamente como antes. No se asume nada más instalado.
+  una conversación sin binding alguno toma las vías de abajo.
+- **Perfiles locales** — no hay binding utilizable ni `BUS_TOKEN` exportado,
+  pero el binario está en el PATH. Los hooks ejecutan
+  `ai-crew-sync client --json call` con credenciales de `profiles.toml` y
+  `.acs.toml`, y la misma etiqueta de sesión que el proxy de la conversación
+  deriva de su id (una etiqueta, no una prueba).
+- **Legacy** — `BUS_URL`/`BUS_TOKEN` exportados. Los hooks caen a `curl` +
+  `python3` pelados y a la etiqueta `X-Crew-Session`, exactamente como antes.
+  No se asume nada más instalado.
 
-Ninguno de los dos configurado: los hooks no hacen nada, en silencio.
+Ninguna de las tres configurada: los hooks no hacen nada, en silencio.
 
 ### Opción B (cualquier cliente MCP): configuración manual
 
 Dos formas, y la diferencia es qué prueba qué ventana está llamando.
 
 **Por el proxy (recomendado).** El cliente arranca el binario en vez de abrir
-una conexión HTTP; cada conversación tiene su propia sesión autenticada y
-ningún fichero guarda una credencial. Genera el bloque:
+una conexión HTTP; cada conversación tiene su propia sesión autenticada, y la
+configuración del cliente no guarda ninguna credencial: el proxy resuelve el
+token del agente desde tu perfil local (o `BUS_TOKEN`/`BUS_URL`) y guarda su
+credencial de sesión en un fichero privado `0600`. Genera el
+bloque:
 
 ```bash
 ai-crew-sync proxy-config                       # forma .mcp.json (la mayoría de clientes)
 ai-crew-sync proxy-config --format toml         # ~/.codex/config.toml (Codex)
 ai-crew-sync proxy-config --role review         # las ventanas de aquí arrancan como revisoras
 ```
+
+`proxy-config` también acepta `--project` y `--profile`, y el propio
+`mcp proxy` acepta `--project`, `--role`, `--channel` y `--profile` (las
+etiquetas y el perfil con los que arranca la ventana, por encima de
+`.acs.toml` y del valor por defecto del usuario) más `--project-dir` y
+`--host-session`: los equivalentes de arranque de `configure_session`.
 
 ```json
 {
@@ -418,7 +566,7 @@ claims, pero nunca como prueba de quién eres:
   "mcpServers": {
     "ai-crew-sync": {
       "type": "http",
-      "url": "https://bus.tu-empresa.com/mcp",
+      "url": "https://crew.example.com/mcp",
       "headers": {
         "Authorization": "Bearer ${TEAM_BUS_TOKEN}",
         "X-Crew-Session": "market-data"
@@ -431,9 +579,14 @@ claims, pero nunca como prueba de quién eres:
 Listo para copiar: `examples/.mcp.http.json`. El bloque también se genera:
 
 ```bash
-ai-crew-sync mcp-config --url https://bus.tu-empresa.com/mcp \
+ai-crew-sync mcp-config --url https://crew.example.com/mcp \
     --token acs_... --session market-data
 ```
+
+`mcp-config` escribe el token en el bloque tal cual (`Bearer acs_…`): deja el
+fichero generado fuera del control de versiones, o sustituye el valor por una
+referencia a una variable de entorno como `${TEAM_BUS_TOKEN}`, igual que
+arriba. Sin `--url` apunta a `http://localhost:8787/mcp`.
 
 Con eso, cada agente ve las herramientas del bus y las usa solo. Para que las
 use *bien*, añade las convenciones del equipo al fichero de instrucciones del
@@ -446,16 +599,29 @@ El cliente de consola (y todo lo que se apoya en él) puede encontrar sus
 credenciales sin exportar nada en cada shell ni usar una función envoltorio.
 Lo hacen dos ficheros locales:
 
-- **Perfiles** — `~/.config/ai-crew-sync/profiles.toml`: qué bus, equipo y
-  agente esperados, y *qué fichero de tokens* guarda la credencial (los mismos
-  `tokens-<equipo>` que escribe `admin token issue --save`). El perfil no
-  contiene ningún secreto.
+- **Perfiles** — `profiles.toml` en el directorio de configuración: qué bus,
+  equipo y agente esperados, y *qué fichero de tokens* guarda la credencial
+  (los mismos `tokens-<equipo>` que escribe `admin token issue --save`). El
+  perfil no contiene ningún secreto.
 - **Valores del proyecto** — `.acs.toml` en la raíz del proyecto, commiteado
-  con el código: nombra un perfil aprobado y el proyecto lógico. Nada más.
+  con el código: nombra un perfil aprobado, el proyecto lógico y,
+  opcionalmente, un `channel` por defecto y un `key` de fichero de tokens.
+  Nada más: cualquier otra clave se rechaza, y `url`, `endpoint`, `token`,
+  `tokens`, `bearer` o `secret` se rechazan con un error explícito.
+
+El directorio de configuración es `$BUS_CONFIG_DIR` si está definido; si no,
+`$XDG_CONFIG_HOME/ai-crew-sync`; y si no, `~/.config/ai-crew-sync`. Contiene
+`profiles.toml`, los ficheros `tokens-<equipo>`, el fichero de login `admin` y
+`sessions/` (`0700`), donde cada proxy guarda el binding y la credencial de
+sesión de su conversación en un fichero `0600` cuyo nombre es un SHA-256 del id
+de conversación.
 
 ```bash
-ai-crew-sync context profile add --name acme --url https://bus.tu-empresa.com:8443 \
+ai-crew-sync context profile add --name acme --url https://crew.example.com \
     --team acme --agent joaquin --tokens tokens-acme --default
+ai-crew-sync context profile list
+ai-crew-sync context profile default acme      # o: --clear
+ai-crew-sync context profile remove old-bus
 cd ~/Repos/acme/market-data
 ai-crew-sync context set-project --profile acme --project market-data --channel market-data
 ai-crew-sync context show      # endpoint, perfil, entrada del token (solo prefijo), proyecto
@@ -463,16 +629,23 @@ ai-crew-sync context verify    # pregunta al bus: debe ser joaquin@acme, o falla
 ai-crew-sync client whoami     # sin BUS_TOKEN
 ```
 
-La entrada del token se elige en este orden: `key` de `.acs.toml`, el nombre
-del proyecto, el `key` del perfil y por último `_base`. La precedencia entre
-fuentes es fija y `context show` la imprime:
+La entrada del token se elige en este orden: `key` de `.acs.toml`
+(`set-project --key`), el nombre del proyecto, el `key` del perfil
+(`profile add --key`) y por último `_base`; `--tokens` vale por defecto
+`tokens-<equipo>`. La precedencia entre fuentes es fija, y `context show`
+imprime cuál ganó (`explicit`, `profile-flag`, `project-default` o
+`user-default`):
 
 | Orden | Fuente | Notas |
 |---|---|---|
-| 1 | `--token` / `BUS_TOKEN` (+ `--url` / `BUS_URL`) | Las credenciales explícitas siempre ganan; `.acs.toml` sigue aportando proyecto y canal. Junto con `--profile` es un error, no una elección silenciosa. |
-| 2 | `--profile` / `BUS_PROFILE` | Elección por invocación; nunca reescribe los valores del proyecto. |
+| 1 | `--token` / `BUS_TOKEN` (+ `--url` / `BUS_URL`) | Las credenciales explícitas siempre ganan; `.acs.toml` sigue aportando proyecto y canal. Junto con `--profile` es un error, no una elección silenciosa. Sin URL se conectan a `http://localhost:8787/mcp`. |
+| 2 | `--profile` / `BUS_PROFILE` | Elección por invocación; nunca reescribe los valores del proyecto. Cuando se da un id de conversación del host (`--host-session` / `BUS_HOST_SESSION`, como hacen los hooks), el perfil en el que se quedó el proxy de esa conversación cuenta como esta elección. |
 | 3 | `.acs.toml` en la raíz del proyecto | Se encuentra desde cualquier subdirectorio; un worktree enlazado hereda el fichero del worktree principal. |
 | 4 | `default = "…"` en `profiles.toml` | Valor por defecto del usuario. |
+
+`--url` / `BUS_URL` sustituye el endpoint sea cual sea la fuente que elige la
+credencial, perfil incluido: un `BUS_URL` exportado que se quedó olvidado
+manda el token del perfil a esa URL, así que quítalo al pasarte a perfiles.
 
 Un perfil que no existe localmente es un **error**, lo nombre quien lo nombre:
 un repositorio puede sugerir un perfil, nunca definirlo, y `.acs.toml` se
@@ -514,19 +687,21 @@ A partir de ahí la envías como bearer token. Autentica como tu agente, en esa
   `X-Crew-Session` nombre otra ventana se rechaza, así que una sesión probada
   nunca se amplía a la de otro;
 - **no se entrega a quien tenga el token del agente**: registrar una
-  etiqueta viva se *rechaza* (`409`); la única vuelta a una ventana es su
-  propia credencial, vía `resume_session`, que emite secreto nuevo,
-  incrementa `epoch` y deja identidad e historia intactas. Una etiqueta cuya
-  credencial venció o fue revocada sí puede registrarse otra vez, como
-  ventana nueva con el nombre antiguo;
+  etiqueta viva se *rechaza* (un error de tool que empieza por
+  `conflict: session '…' is already registered and still live`); la única
+  vuelta a una ventana es su propia credencial, vía `resume_session`, que
+  emite secreto nuevo, incrementa `epoch` y deja identidad e historia
+  intactas. Una etiqueta cuya credencial venció o fue revocada sí puede
+  registrarse otra vez, como ventana nueva con el nombre antiguo;
 - **vence a lo que sustituye**: manda el epoch en `X-Crew-Epoch` y un proceso
   al que han reemplazado se entera (`409`) en vez de escribir como la ventana
   que lo sustituyó.
 
 `renew_session` alarga la credencial que ya tienes sin tocar su secreto ni su
 epoch. `revoke_session` la cierra, o cierra otra ventana de tu propio agente
-por etiqueta. `whoami` devuelve `session_identity` cuando la etiqueta está
-probada y `null` cuando solo es una cabecera.
+por etiqueta. `whoami` incluye `session_identity` (id de sesión, epoch,
+registro y caducidad) cuando la etiqueta está probada por una credencial de
+sesión, y omite el campo cuando la etiqueta solo es una cabecera.
 
 Nada de esto es obligatorio: un token de agente con cabecera de sesión sigue
 funcionando en todos los tools y con un `curl` suelto, igual que antes.
@@ -587,12 +762,21 @@ emitir credenciales se queda simplemente con la conexión por etiqueta.
 `_meta.threadId` que Codex adjunta a cada llamada, y si no el propio proceso.
 Con un id de conversación la etiqueta de sesión es **estable**: una
 conversación reanudada vuelve a la misma sesión y una bifurcada recibe otra;
-sin él, la sesión dura lo que el proceso. Si dos conversaciones llegaran a
-compartir un proceso, el proxy rechaza la segunda en vez de mezclarlas.
+sin él, la sesión dura lo que el proceso. Cuando la conversación se identificó
+por el `_meta` de la petición (`threadId`, o `sessionId`), un segundo id de
+conversación en el mismo proceso se rechaza en vez de mezclarse. Cuando la
+fijó `--host-session` / `BUS_HOST_SESSION` o `CLAUDE_CODE_SESSION_ID`, ese
+binding manda y los ids que llegan en las peticiones se ignoran, así que
+configura el host para que arranque un proxy por conversación.
 
-El contexto de arranque viaja en el campo `instructions` del `initialize`, que
-todo cliente MCP entrega al modelo: no hacen falta hooks. Donde el host **sí**
-tiene hooks de ciclo de vida, estos ejecutan
+El campo `instructions` del resultado de `initialize` le dice al modelo quién
+es y dónde está esta ventana (agente, equipo, dirección de sesión, proyecto,
+rol, canal), más las convenciones del propio bus; todo cliente MCP lo entrega,
+así que esto no necesita hooks. Los mensajes directos sin leer, los claims
+abiertos y el digest del equipo los añade un hook de inicio de sesión donde el
+host lo tiene; en los demás, el modelo llama él mismo a `whoami` y
+`team_digest`. Donde el host **sí** tiene hooks de ciclo de vida, estos
+ejecutan
 `ai-crew-sync context hook --binding <id de conversación> --event <evento>`:
 el helper lee el registro privado que escribió el proxy (directorio 0700,
 fichero 0600), actúa como **esa** ventana con su propia credencial e imprime
@@ -609,32 +793,38 @@ salir. Nada se empuja
 a un turno inactivo: los mensajes entrantes se leen con `read_messages` o se
 esperan con `wait_for_updates`, igual que con una conexión directa.
 
-### Sesiones: una persona, varios repos
+### Sesiones: un agente, varias ventanas
 
-Un token identifica a una **persona**, y una persona suele tener varias
-sesiones de código abiertas a la vez — normalmente una por repo. Añade la
-cabecera `X-Crew-Session` para que cada una tenga su propio contexto de
-trabajo:
+Un token identifica a un **agente** (uno por herramienta de código y
+persona), y un agente suele tener varias ventanas abiertas a la vez. Con el
+plugin o con `mcp proxy`, cada conversación ya tiene su propia sesión (una
+etiqueta opaca `s-…`, ver
+[Una sesión por conversación](#una-sesión-por-conversación-el-proxy-stdio))
+y no hay nada que configurar. Un cliente HTTP directo que no puede arrancar
+el binario elige su sesión a mano con la cabecera `X-Crew-Session`:
 
 ```json
 {
   "mcpServers": {
     "ai-crew-sync": {
       "type": "http",
-      "url": "https://bus.tu-empresa.com/mcp",
+      "url": "https://crew.example.com/mcp",
       "headers": {
         "Authorization": "Bearer ${TEAM_BUS_TOKEN}",
-        "X-Crew-Session": "market-data"
+        "X-Crew-Session": "${BUS_SESSION:-}"
       }
     }
   }
 }
 ```
 
-La etiqueta es libre, hasta 64 bytes, y se normaliza como un nombre de canal
-(sin espacios sobrantes y en minúsculas, para que `Market-Data` y
-`market-data` sean una sola sesión y no dos que no se ven entre sí). El nombre
-del repo es la elección natural.
+La etiqueta tiene hasta 64 bytes de ASCII, sin `/` (separa agente de sesión en
+una dirección), sin caracteres de control y sin `$`, `{` ni `}`: un
+`${BUS_SESSION}` literal se rechaza, así que usa `${BUS_SESSION:-}` y una
+variable sin definir no envía nada. Se normaliza como un nombre de canal (sin
+espacios sobrantes y en minúsculas, para que `Market-Data` y `market-data`
+sean una sola sesión y no dos que no se ven entre sí). El nombre del repo es
+la elección natural.
 
 Una sesión **no** es identidad. Llega en una cabecera y no en el token, así
 que nunca puede hacerte hablar por otro; solo separa tu presencia, tus claims
@@ -643,8 +833,9 @@ compartida, que es exactamente como se comportaba el bus antes de que las
 sesiones existieran.
 
 El cliente de consola acepta `--session` (o `BUS_SESSION`), y
-`ai-crew-sync mcp-config --session market-data` mete la cabecera en el bloque
-generado.
+`ai-crew-sync mcp-config --url https://crew.example.com/mcp --token acs_…
+--session market-data` mete la cabecera en un bloque de HTTP directo (token
+incluido); para una sesión por conversación, usa `proxy-config` en su lugar.
 
 `list_agents` pasa a dar una entrada por sesión abierta bajo el nombre de cada
 compañero, así que el tablero dice quién está en qué repo en vez de enseñar un
@@ -688,9 +879,10 @@ descubrimiento devuelve ambas y quien llama elige una; nunca se enruta nada a
 una sesión dijo de sí misma: no son identidad (eso es el token), no son un
 permiso, y varias ventanas pueden compartirlas. También fijan el canal por
 defecto: una sesión que declaró `project = "market-data"` publica en
-`#market-data` cuando no nombra canal, sea cual sea su etiqueta de sesión; una
-etiqueta opaca que no coincide con ningún canal no recibe ninguno, en vez de
-uno sorprendente. Omite una etiqueta para conservarla, envía `""` para
+`#market-data` cuando no nombra canal, sea cual sea su etiqueta de sesión,
+siempre que tenga una: la sesión compartida (sin etiqueta) nunca recibe canal
+por defecto. Una etiqueta opaca que no coincide con ningún canal no recibe
+ninguno, en vez de uno sorprendente. Omite una etiqueta para conservarla, envía `""` para
 borrarla. `whoami` devuelve ambas y `list_agents` las muestra bajo cada sesión.
 
 Consola: `ai-crew-sync client sessions --project market-data --role review
@@ -724,11 +916,11 @@ incluida otra sesión tuya, y así se lee: la tarea vuelve a ser `open`,
 dejó caducar. `list_tasks {"status": "open"}` la incluye; renovarlo se rechaza,
 reclámala de nuevo.
 
-Los DM pueden dirigirse a una **sesión**, no solo a una persona:
+Los DM pueden dirigirse a una **sesión**, no solo a un agente:
 
 | `to` | Llega a |
 |---|---|
-| `dani` | la persona — todas las sesiones que tenga abiertas |
+| `dani` | el agente — todas las sesiones que tenga abiertas |
 | `dani/api` | solo a su contexto de trabajo `api` |
 
 Esto es lo que hace útil una sesión coordinadora. Una ventana `general` puede
@@ -760,13 +952,18 @@ qué sesiones están vivas de verdad.
 
 ### El canal de la sesión
 
-Llama a un canal como una sesión y pasa a ser su canal por defecto: sin
-`channel` ni `to`, `post_message` va ahí, `team_digest` lo resume, y
-`wait_for_updates` deja de despertarse con el ruido de los canales de otros
-repos. Los DM, tareas, locks y notas te despiertan siempre — silenciarlos
-escondería trabajo, no ruido. `all_channels: true` vuelve a abarcar todo el
-equipo en cualquiera de las dos llamadas, y un `channel` explícito siempre
-manda.
+El canal por defecto de una sesión es el canal que se llama como su `project`
+declarado y, si no, el que se llama como su etiqueta de sesión (la sesión
+compartida no tiene). Sin `channel` ni `to`, `post_message` va ahí,
+`team_digest` lo resume, y `wait_for_updates` deja de despertarse con el ruido
+de los canales de otros repos. A través de `mcp proxy`, el ajuste `channel`
+propio de una ventana (`.acs.toml`, `--channel` o `configure_session`)
+sustituye el canal por defecto solo para `post_message`; `team_digest` y
+`wait_for_updates` siguen enfocados en el canal por defecto del servidor, así
+que pon `channel` igual al proyecto o no lo pongas. Los DM, tareas, locks y
+notas te despiertan siempre — silenciarlos escondería trabajo, no ruido.
+`all_channels: true` vuelve a abarcar todo el equipo en cualquiera de las dos
+llamadas, y un `channel` explícito siempre manda.
 
 Se resuelve por nombre cada vez: no hay binding que configurar ni nada que
 mantener sincronizado. Un equipo que no llame a sus canales como sus repos
@@ -798,24 +995,27 @@ cambios que rompen. Un equipo al que interrumpes por todo deja de leer los
 anuncios, y entonces también se pierde el que importaba. En un mensaje directo
 el flag se rechaza: ese ya llega sin filtrar.
 
-
-
-
 ## Actualizar
 
 El bus, el CLI y el plugin de Claude Code se mueven por separado. Nada los
 coordina por ti, así que actualiza primero el servidor: es la única pieza
 dueña del esquema.
 
-**El servidor.** Las migraciones son aditivas por norma, así que un binario
-nuevo lee una base que escribió uno viejo y al revés. Eso es lo que hace
-seguro un reinicio rodante y superable una vuelta atrás.
+**El servidor.** Las migraciones añaden al esquema en vez de reescribirlo, así
+que un reinicio rodante es seguro y la release anterior normalmente puede
+funcionar contra un esquema más nuevo — pero solo con las migraciones al
+arrancar desactivadas. Un binario que migra solo (lo que viene por defecto,
+`BUS_AUTO_MIGRATE=true`) se niega a arrancar contra una base que tiene
+migraciones que no conoce ("migration N was previously applied but is missing
+in the resolved migrations"). Para volver atrás, pon
+`BUS_AUTO_MIGRATE=false` (en el entorno del stack, o en
+`/etc/ai-crew-sync/ai-crew-sync.env` para el servicio empaquetado) antes de
+arrancar la versión anterior.
 
 ```bash
 export BUS_VERSION=0.7.0
-make deploy                                    # Swarm; o:
-docker compose -f Docker/docker-compose.yml pull && \
-  docker compose -f Docker/docker-compose.yml up -d
+make deploy                                    # Swarm; o, desde la raíz del repositorio:
+docker compose --project-directory . -f Docker/docker-compose.yml pull && make up
 ```
 
 El contenedor migra al arrancar, y el servicio empaquetado también — los dos
@@ -827,10 +1027,10 @@ sudo dpkg -i ai-crew-sync_amd64.deb            # o: sudo rpm -U ai-crew-sync.x86
 sudo systemctl restart ai-crew-sync
 ```
 
-Si lo has desactivado y migras a propósito, hazlo como **root**:
-`DATABASE_URL` vive en `/etc/ai-crew-sync/ai-crew-sync.env`, que systemd carga
-para la unidad y que solo puede leer root, así que `sudo -u ai-crew-sync`
-arranca el binario sin ella.
+Si lo has desactivado y migras a propósito, carga tú el fichero de entorno:
+`DATABASE_URL` vive en `/etc/ai-crew-sync/ai-crew-sync.env`
+(`root:ai-crew-sync`, `0640`), que systemd carga para la unidad y que ninguna
+shell carga por ti.
 
 ```bash
 sudo systemctl stop ai-crew-sync
@@ -850,7 +1050,13 @@ brew upgrade joaquinbejar/tap/ai-crew-sync     # o cargo install ai-crew-sync
 ai-crew-sync --version
 ```
 
-**El plugin de Claude Code.** Los marketplaces de terceros tienen la
+**El plugin de Claude Code.** Desde la 0.7.0 su servidor MCP es
+`ai-crew-sync mcp proxy` y sus hooks autenticados ejecutan
+`ai-crew-sync context hook`, así que el plugin ejecuta el binario que haya en
+el PATH: actualiza el binario junto con el plugin. Si vienes de un plugin
+0.6.x (HTTP directo), instala primero el binario y añade un perfil local
+(`ai-crew-sync context profile add …`), o sigue exportando
+`BUS_URL`/`BUS_TOKEN`. Los marketplaces de terceros tienen la
 autoactualización **desactivada** por defecto, así que refréscalo tú y recarga:
 
 ```
@@ -878,10 +1084,12 @@ El mismo binario habla con el bus desde la terminal, como un agente más — út
 para humanos, scripts y CI:
 
 ```bash
-export BUS_URL=https://bus.tu-empresa.com/mcp
+# Con un perfil local (ver Perfiles locales) no hace falta exportar nada; si no:
+export BUS_URL=https://crew.example.com/mcp
 export BUS_TOKEN=acs_...
 
 ai-crew-sync client whoami
+ai-crew-sync client tools                         # qué ofrece el bus a este agente
 ai-crew-sync client send --channel deploys --body "staging lleva la 1.4.2"
 ai-crew-sync client send --to marta --body "mira el PR 421"
 ai-crew-sync client read --scope inbox
@@ -904,19 +1112,32 @@ ai-crew-sync client note set why-no-redis --scope api --value "..." --tags infra
 ai-crew-sync client call get_task --args '{"key":"refactor-auth"}'   # escape hatch
 ```
 
-Todos los subcomandos aceptan `--json` para salida cruda (pipeable a `jq`).
+También: `search`, `channels`, `channel-create`, `tasks` (`--status`,
+`--mine`), `task show|next|renew|release`, `notes`, `note get|rm|search`,
+`lock list` y `beat`; `ai-crew-sync client <comando> --help` lista los
+flags. Todos los subcomandos aceptan `--json` para salida cruda (pipeable a
+`jq`).
 
-## Publicación asíncrona (opt-in, por conversación)
+Las herramientas de conversación (en los equipos que las tienen) no tienen
+subcomando propio; se llega a ellas con `client call`, por ejemplo
+`ai-crew-sync client call read_conversation --args '{"conversation_id":"…"}'`.
+El cliente de consola presenta el token de agente, así que se le rechaza un
+asiento que ya ocupa una ventana registrada.
+
+## Publicación asíncrona (equipos enrutados fuera de Postgres)
 
 Lo normal es síncrono: el cuerpo de un mensaje de conversación, sus
 destinatarios y sus receipts hacen commit en una transacción de Postgres, así
 que `stored: true` significa que esa transacción hizo commit y no hay nada
 que reconciliar. Nada de lo de abajo ralentiza ni cambia eso.
 
-Una conversación puede optar por un **outbox**, que es la forma que introduce
-cualquier almacén externo: aceptación y persistencia pasan a ser dos eventos,
-y el segundo puede fallar, agotar su tiempo, o salir bien sin que quien llamó
-se entere.
+Un hilo usa en su lugar un **outbox** cuando su equipo está enrutado a otro
+backend en el momento en que se crea el hilo (`team capability --backend
+jetstream`), o después de que `conversations migrate --apply` lo lleve allí;
+un hilo que vuelve a Postgres recupera el modo síncrono en el cambio. El
+outbox es la forma que introduce cualquier almacén externo: aceptación y
+persistencia pasan a ser dos eventos, y el segundo puede fallar, agotar su
+tiempo, o salir bien sin que quien llamó se entere.
 
 ```
 stored                el backend confirmó, con un locator canónico
@@ -931,16 +1152,18 @@ escriba nada, se reintentan con backoff hasta ocho veces, y tienen tope de
 tamaño. El trabajo de red ocurre fuera de toda transacción: una publicación
 que tarda un minuto cuesta un lease, no un lock.
 
-Una finalización incierta (la escritura llegó y la confirmación se perdió) se
-resuelve preguntando al backend qué tiene de verdad para esa clave, no
-adivinando. Los reintentos presentan la misma clave, así que una escritura
-física duplicada acaba en un único locator canónico y no en dos mensajes.
+Una finalización incierta (puede que la escritura llegara y la confirmación
+se perdiera) se resuelve presentando otra vez el mismo sobre bajo la misma
+clave de publicación, nunca adivinando y nunca con un sondeo vacío. Los
+reintentos también presentan la misma clave, así que una escritura física
+duplicada acaba en un único locator canónico y no en dos mensajes. Una
+publicación que quedó en `failed` es terminal: la reconciliación nunca la
+revierte.
 
 Postgres es el backend por defecto, y el único que usa una instalación que
-no toque nada. La frontera existe para poder construir y probar el manejo de
-fallos antes de tener algo externo a lo que culpar; volver una conversación
-a modo síncrono se rechaza mientras quede trabajo pendiente, porque si no el
-hilo se queda con un hueco que nadie cierra.
+no toque nada. Cambiar la ruta de un equipo, en cualquiera de los dos
+sentidos, se rechaza mientras alguno de sus mensajes siga pendiente de
+publicar, porque si no el hilo se queda con un hueco que nadie cierra.
 
 ## JetStream: enrutar los cuerpos de conversación de un equipo
 
@@ -952,12 +1175,21 @@ mergear o actualizar no mueve los datos de nadie.
 
 Lo que hay, probado contra un broker real en la suite:
 
-- Un **stream por equipo**, en disco y acotado, con el nombre derivado del id
-  del equipo: renombrar un equipo no mueve nada y ningún slug llega al
-  broker. Retención por límites y `DiscardNew`: un stream lleno rechaza
-  escrituras nuevas en vez de tirar historia por lo bajo.
+- **Dos streams por equipo**, en disco y acotados, con el nombre derivado del
+  id del equipo, así que renombrar un equipo no mueve nada y ningún slug llega
+  al broker: los cuerpos (`ACS_T_<id del equipo>`: retención por límites y
+  `DiscardNew`, así que un stream lleno rechaza escrituras nuevas en vez de
+  tirar historia por lo bajo) y las referencias de inbox
+  (`ACS_I_<id del equipo>`: se eliminan con el acuse, se descartan las más
+  antiguas primero cuando está lleno y a los siete días, y se pueden
+  reconstruir desde Postgres).
 - **Aprovisionar es una acción de operador con su propia credencial.** La
   credencial de runtime publica y lee, y no puede crear ni borrar streams.
+  Enrutar no comprueba que los streams existan: un equipo enrutado a JetStream
+  sin ellos sigue aceptando envíos, que se quedan en `pending_publication` (sus
+  cuerpos se siguen sirviendo desde la copia local), y una réplica que ejecuta
+  el worker de publicación anota en el log el stream que falta en cada pasada.
+  Aprovisiona primero.
 - **NATS es interno.** Ningún subject, stream o consumer es jamás un
   argumento de cliente, y ACS comprueba él mismo cada ACL.
 - **`stored` sigue significando confirmado.** El adaptador espera el PubAck;
@@ -972,11 +1204,13 @@ Lo que hay, probado contra un broker real en la suite:
 
 El `max_message_size` del stream no basta: el `max_payload` del **servidor**
 vale 1 MiB por defecto, y un cuerpo de 1 MiB más sus cabeceras de sobre son
-unos 1.048.800 bytes. Un despliegue que suba solo el límite del stream
-rechaza exactamente los mensajes que el contrato permite. `nats-server` solo
-acepta `max_payload` en su fichero de configuración (no existe el flag;
-`--max_payload` hace que la imagen fijada `nats:2.12-alpine` no arranque),
-así que el broker se arranca con un fichero:
+unos 1.048.800 bytes, que se rechazan por un par de cientos de bytes. Un
+despliegue que suba solo el límite del stream rechaza exactamente los mensajes
+que el contrato permite.
+
+`nats-server` solo acepta `max_payload` en su fichero de configuración (no
+existe el flag; `--max_payload` hace que la imagen fijada `nats:2.12-alpine`
+no arranque), así que el broker se arranca con un fichero:
 
 ```text
 # nats.conf
@@ -990,20 +1224,27 @@ jetstream {
 nats-server -c nats.conf
 ```
 
-`Docker/nats-test.conf` es el fixture que ejecuta `make test`, y el servicio
-`nats` de `Docker/docker-compose.yml` escribe ese mismo fichero antes de
-arrancar. Con él, un cuerpo en el techo del contrato no lo rechaza ninguno de
-los dos límites. Un cuerpo por encima del límite del broker falla **fatal** en
-vez de reintentarse para siempre, igual que un stream lleno o una autorización
-denegada; un timeout o una conexión caída siguen siendo reintentables.
+`Docker/nats-test.conf` es el fixture que ejecuta `make test`; el servicio
+`nats` de `Docker/docker-compose.yml` escribe su propia configuración con el
+mismo `max_payload: 2MB` antes de arrancar (más `store_dir: /data` y
+`max_file_store: 8GB`, el presupuesto contra el que se reservan las cuotas de
+los streams). Con él, un cuerpo en el techo del contrato no lo rechaza ninguno
+de los dos límites. Un cuerpo por encima del límite del broker falla **fatal**
+en vez de reintentarse para siempre, igual que un stream lleno o una
+autorización denegada; un timeout o una conexión caída siguen siendo
+reintentables.
 
-El fixture de integración es **obligatorio**: `make test` levanta un NATS
-2.12 real con JetStream, y si falta, la suite falla de forma visible. Un test
-de broker que se salta a sí mismo no prueba nada y parece un pase.
+La suite de integración exige un broker real: `make test` levanta un NATS 2.12
+con JetStream, y una ejecución sin `TEST_NATS_URL` falla de forma visible en
+vez de saltarse los tests. Un test de broker que se salta a sí mismo no prueba
+nada y parece un pase.
 
 ### Enrutar un equipo, y lo que enrutar NO hace
 
-Dos pasos independientes, en este orden, y ninguno implica al otro:
+Tres pasos independientes, en este orden. Ninguno implica el siguiente, los
+dos primeros no cambian nada por sí solos, y enrutar no los comprueba. Todos
+son comandos de operador junto a Postgres, y el equipo tiene que tener las
+conversaciones activadas (`team capability --conversations on`):
 
 ```bash
 # 1. Los streams. Acción de operador con la credencial de APROVISIONAMIENTO:
@@ -1013,23 +1254,29 @@ Dos pasos independientes, en este orden, y ninguno implica al otro:
 #    referencias de inbox 256 MiB / 100.000). Dimensiónalas para el broker
 #    que tienes.
 ai-crew-sync team stream --team acme --nats-url nats://broker:4222 \
-    --max-bytes 512MiB --inbox-max-bytes 32MiB
+    --nats-credentials ./provision.creds --max-bytes 512MiB --inbox-max-bytes 32MiB
 # Repetirlo conserva los límites de un stream que ya existe y lo dice;
 # cambiarlos es explícito, y se rechaza por debajo de lo que el stream ya
 # guarda:
 ai-crew-sync team stream --team acme --nats-url nats://broker:4222 \
-    --max-bytes 1GiB --update-quotas
+    --nats-credentials ./provision.creds --max-bytes 1GiB --update-quotas
 
-# 2. La ruta. Desde ahora, las conversaciones NUEVAS de este equipo guardan
-#    sus cuerpos en el broker.
-ai-crew-sync team capability --team acme --backend jetstream
-
-# Y el servidor tiene que poder llegar. En el stack de compose eso es
-# NATS_REPLICAS=1 y BUS_NATS_URL=nats://nats:4222, que arranca el broker que
-# el stack ya lleva (a cero réplicas hasta que lo pidas).
+# 2. El servidor tiene que llegar al broker, con la credencial de RUNTIME. En
+#    el stack de compose eso es NATS_REPLICAS=1 y BUS_NATS_URL=nats://nats:4222,
+#    que arranca el broker que el stack ya lleva (a cero réplicas hasta que lo
+#    pidas):
 ai-crew-sync serve --nats-url nats://broker:4222 \
                    --nats-credentials /etc/ai-crew-sync/runtime.creds
+
+# 3. La ruta. Desde ahora, las conversaciones NUEVAS de este equipo guardan
+#    sus cuerpos en el broker.
+ai-crew-sync team capability --team acme --backend jetstream
 ```
+
+`team stream … --remove` borra los dos streams y todos los cuerpos y
+referencias que guardan; se rechaza mientras el equipo siga enrutando
+conversaciones nuevas a JetStream o alguna de sus conversaciones siga teniendo
+allí sus cuerpos.
 
 **Enrutar no migra nada por sí solo.** Una conversación guarda el backend en
 el que nació, y cada mensaje guarda dónde está *su* cuerpo; volver a
@@ -1040,17 +1287,29 @@ Mover un hilo existente es una operación aparte y supervisada:
 
 ```bash
 ai-crew-sync conversations migrate --team acme --to jetstream \
-    --conversation <id> --nats-url nats://broker:4222          # simulacro
+    --conversation <id> --nats-url nats://broker:4222          # simulacro: solo informa
+ai-crew-sync conversations migrate --team acme --to jetstream \
+    --conversation <id> --nats-url nats://broker:4222 --apply  # el movimiento
 ```
 
-Copia todos los cuerpos, pausa las escrituras **de ese único hilo** mientras
-se lleva la cola, vuelve a leer cada cuerpo desde el destino y compara
-checksums, y solo entonces hace el cambio, en una transacción. Un fallo no
-cambia nada y levanta la pausa; una ejecución interrumpida se reanuda sin
-copiar dos veces. Ids, autoría, pertenencias y cada receipt observado quedan
-intactos, y jamás se inventa un acuse. La vuelta atrás es el mismo comando
-con `--to postgres`, y los cuerpos de origen siguen ahí hasta que ejecutes
-`conversations cleanup` a propósito.
+`--conversation` se puede repetir; si lo omites se mueve el equipo entero, que
+rara vez es lo que quieres en una primera ejecución. `--nats-credentials` va
+con un broker que exija autenticación.
+
+Pausa las escrituras **de ese único hilo** (las lecturas siguen funcionando, y
+el resto del bus no se toca), copia todos los cuerpos, vuelve a leer cada uno
+desde el destino y compara checksums, y solo entonces hace el cambio, en una
+transacción que además levanta la pausa. Un fallo no cambia nada y levanta la
+pausa; si esa limpieza también falla, el hilo se queda pausado bajo su
+movimiento abierto hasta que vuelvas a ejecutar el mismo comando, que lo
+reanuda sin copiar nada dos veces. Ids, autoría, pertenencias y cada receipt
+observado quedan intactos, y jamás se inventa un acuse. La vuelta atrás es el
+mismo comando con `--to postgres` (la URL del broker sigue haciendo falta: los
+cuerpos se leen del broker). Los cuerpos de origen siguen ahí hasta que
+ejecutes `conversations cleanup --team acme --apply`; sin `--apply` solo
+informa. Borra las copias en Postgres de los movimientos a JetStream que
+terminaron hace más de `--rollback-window-hours` (168 por defecto); nunca
+borra nada en el broker.
 
 **`docs/operations/jetstream.md`** tiene la topología de producción, las
 credenciales, las cuotas y el dimensionado, las alertas, los simulacros de
@@ -1059,8 +1318,11 @@ conviene saber: un cuerpo en el broker no está en ningún índice de Postgres,
 así que esta versión no lo busca.
 
 Un equipo enrutado a JetStream en un servidor arrancado sin `--nats-url` no
-cae de vuelta a Postgres en silencio — eso partiría la historia. Al leer
-esos hilos se dice qué pasa y qué hacer.
+cae de vuelta a Postgres en silencio — eso partiría la historia. Los cuerpos
+que siguen guardados en local se siguen sirviendo; un cuerpo que solo vive en
+el broker se lee como un marcador vacío con `unavailable` diciendo que su
+backend no se puede alcanzar ahora mismo. La causa (este servidor no tiene
+`--nats-url`) va al log del servidor para el operador, no a quien lee.
 
 ### Qué se le cuenta a quien lee mientras un cuerpo está en vuelo
 
@@ -1074,7 +1336,7 @@ cuál de las dos cosas es. Cada mensaje lleva un `publication`:
 | `failed` | No se va a publicar. El mensaje conserva su hueco, y su cuerpo se sigue sirviendo desde la copia que nunca salió de Postgres: lo que falta es durabilidad en el backend, no el texto. |
 | `tombstoned` | El backend ya no tiene el cuerpo (retención, o un operador). El mensaje conserva su secuencia, sus destinatarios y sus receipts; `unavailable` dice por qué. |
 
-Un cuerpo que el backend no puede servir no tumba la página: el mensaje
+Un cuerpo que el backend actual no puede servir no tumba la página: el mensaje
 mantiene su sitio y cuenta qué le pasó. Todo mensaje lleva `unavailable`:
 `null` cuando `body` es el texto real, y una frase de motivo cuando no lo es:
 un backend inalcanzable ahora mismo, un cuerpo que nunca se almacenó, o uno
@@ -1091,15 +1353,21 @@ publicación en vuelo deja de leer en la llamada siguiente.
 
 ### Drenar, y drenar desde otro sitio
 
-El proceso que atiende peticiones drena también el outbox por defecto. Un
-intento que termina sin respuesta se anota como **incierto** (ni almacenado
-ni fallido: cualquiera de las dos sería una suposición), y la reconciliación
-presenta el mismo sobre con la misma clave de idempotencia: dentro de la
-ventana del broker eso devuelve la secuencia original, y fuera de ella el
-cuerpo aterriza entonces. Un único mensaje lógico en ambos casos.
+Toda réplica de `serve` arrancada con `--nats-url` ejecuta el worker de
+publicación por defecto (`--publication-worker` / `BUS_PUBLICATION_WORKER`);
+sin broker no se arranca nada. Además de drenar el outbox, resuelve las
+publicaciones inciertas (cada 30 s), publica las referencias de inbox, y
+descarta la copia local de un cuerpo solo cuando el broker confirma que guarda
+exactamente ese cuerpo. Un intento que termina sin respuesta se anota como
+**incierto** (ni almacenado ni fallido: cualquiera de las dos sería una
+suposición), y la reconciliación presenta el mismo sobre con la misma clave de
+idempotencia: dentro de la ventana de deduplicación del broker eso devuelve la
+secuencia original, y fuera de ella el cuerpo aterriza entonces. Un único
+mensaje lógico en ambos casos.
 
-Para tener réplicas dedicadas a drenar, arranca las que solo atienden
-peticiones con `--publication-worker false`.
+Un drenador dedicado es una réplica normal de `serve` con `--nats-url` y la
+credencial de runtime. Arranca las réplicas que atienden peticiones con
+`--publication-worker false`, y deja al menos una réplica con él activado.
 
 ## Un ejemplo completo: diseño, implementación, revisión
 
@@ -1130,11 +1398,14 @@ inbox sigue sin leer, su presencia caduca sola. Reabrir la misma conversación
 reanuda la misma sesión; bifurcarla da una nueva.
 
 Lo que esto no hace: despertar una ventana inactiva. Nada se empuja a un
-modelo que no está en un turno; una ventana lee con `read_messages` o espera
-con `wait_for_updates` mientras trabaja, y el hook `Stop` mantiene el turno
-abierto lo justo para contestar una pregunta bloqueante. Cambiar de
-credencial tampoco borra nada: el transcript es del host, y cada mensaje y
-cada receipt se quedan bajo la identidad que los hizo.
+modelo que no está en un turno. Una ventana lee los mensajes directos con
+`read_messages` y espera por ellos con `wait_for_updates`; lee los hilos con
+`read_conversation` (o `fetch_conversation_inbox`) y espera por ellos con
+`wait_for_conversation_updates`, siempre durante un turno. El hook `Stop`
+mantiene el turno abierto solo para una pregunta bloqueante por mensaje
+directo, no para un mensaje de un hilo. Cambiar de credencial tampoco borra
+nada: el transcript es del host, y cada mensaje y cada receipt se quedan bajo
+la identidad que los hizo.
 
 `docs/acceptance/host-integration.md` recoge los hechos verificados de cada
 host, las topologías no soportadas y un guion manual para clientes reales,
@@ -1157,27 +1428,43 @@ ai-crew-sync team capability --team acme --conversations on
 ```
 create_conversation {"title": "el estado vacío", "private": true,
                      "invite": ["dani/design", "dani/review"]}
+join_conversation   {"conversation_id": "…"}           # lo ejecuta cada ventana invitada
 send_conversation_message {"conversation_id": "…", "body": "…", "request_id": "<uuid>"}
-→ {"seq": 2, "stored": true, "recipients": ["dani/design", "dani/review"], …}
+→ {"seq": 1, "stored": true, "recipients": ["dani/design", "dani/review"], …}
+ack_message {"message_id": "…"}                                         # dani/review
+ack_message {"message_id": "…", "resolved": true, "note": "hecho"}      # dani/design
 get_message_receipts {"message_id": "…"}
 → {"total": 2, "acknowledged": 2, "resolved": 1, "receipts": [...]}
 ```
 
-**Cinco observaciones, nunca deducidas unas de otras**: `stored` (la base de
-datos hizo commit), `delivered` (un transporte lo entregó), `presented` (un
-host confirmó que llegó al modelo), `acknowledged` (el destinatario dijo que
-lo leyó), `resolved` (dijo que actuó). Una marca ausente significa *no
-observado*, no "no": `presented_at` es null allí donde el host no puede
-confirmar la inyección, y eso se queda honesto en vez de optimista. Leer un
-hilo no confirma nada, un cursor no es una persona, y resolver no completa
+**Cinco observaciones, nunca deducidas unas de otras**: `stored` (el backend
+que guarda el cuerpo lo confirmó: en un hilo de Postgres es el propio commit;
+en un hilo creado mientras el equipo estaba enrutado a JetStream el envío
+devuelve `stored: false` y `stored_at` sigue a null hasta que el broker acusa
+recibo), `delivered` (el propio proceso del destinatario dijo, con
+`confirm_inbox_delivery`, que guarda la referencia de forma duradera),
+`presented` (reservado: ningún host soportado puede confirmar que un mensaje
+llegó al modelo, así que en esta versión nada lo registra y `presented_at` es
+siempre null), `acknowledged` (el destinatario dijo que lo leyó, con
+`ack_message`), `resolved` (el destinatario dijo que actuó, `ack_message` con
+`resolved: true`). Una marca ausente significa *no observado*, no "no". Leer
+un hilo no confirma nada, un cursor no es una persona, y resolver no completa
 una tarea ni mergea nada.
 
-**La pertenencia es por ventana** (`agente/sesión`), y una invitación no es
+**La pertenencia es por ventana** (`agent/session`), y una invitación no es
 un alta: cada ventana acepta con `join_conversation`, así que a nadie se le
-recluta en los receipts de otro. Un miembro nuevo ve el hilo desde que entró,
-salvo que quien invita le conceda toda la historia a propósito. Quien entra
-después **nunca aparece en el denominador de un mensaje anterior**, y
-expulsar a alguien conserva lo que ya dijo y confirmó.
+recluta en los receipts de otro; un mensaje enviado antes de que una ventana
+entre no la cuenta como destinataria. Un miembro invitado más tarde
+(`invite_to_conversation`) lee desde el momento en que se le invitó, no desde
+que entra; `history_from_start: true` concede la historia anterior, nunca más
+de lo que puede leer quien invita y nunca en una readmisión tras una
+expulsión. Las ventanas invitadas con el `invite` de `create_conversation` ven
+el hilo desde su inicio. `leave_conversation`, `remove_conversation_member`
+(propietarios y moderadores) y `archive_conversation` (cierra el hilo a
+mensajes nuevos; la historia se sigue pudiendo leer) completan las
+herramientas de pertenencia, y `list_conversations` lista los hilos que puedes
+leer. Quien entra después **nunca aparece en el denominador de un mensaje
+anterior**, y expulsar a alguien conserva lo que ya dijo y confirmó.
 
 **La visibilidad se concede, no se deduce.** Un hilo `private` lo ven solo
 sus miembros; uno de proyecto lo ve quien tenga una concesión explícita sobre
@@ -1191,10 +1478,14 @@ asiento a otra ventana *de tu propio agente*, y solo cuando esa ventana
 acepta; se conservan autoría, límite de historia y receipts antiguos, y nada
 se confirma en tu nombre. `recover_conversation_history` es la excepción
 documentada de que la privacidad dentro de un equipo no es aislamiento frente
-al agente que estuvo en el hilo: exige tu token de agente, que todas las
-ventanas de ese agente estén cerradas, revocadas o caducadas (estar offline no
-basta), y es de solo lectura, no concede pertenencia, salta las membresías de
-las que te expulsaron y no inventa ningún receipt.
+al agente que estuvo en el hilo: exige tu token de agente y que todas las
+sesiones de ese agente estén revocadas (`revoke_session`, que puede nombrar
+por etiqueta otra ventana de tu propio agente, o revocando su token padre) o
+caducadas. Cerrar la ventana del host no termina su sesión: sigue viva hasta
+que caduca su credencial, hasta 24 horas con la vida por defecto. Es de solo
+lectura, no concede pertenencia, cubre solo los asientos que se aceptaron y de
+los que no te expulsaron, en un hilo de proyecto sigue exigiendo la concesión
+vigente de quien llama, y no inventa ningún receipt.
 
 Los reintentos son seguros: `send_conversation_message` recibe un
 `request_id` UUID que generas tú, y repetirlo devuelve el mensaje original en
@@ -1203,10 +1494,13 @@ de quedarse callado con el primero.
 
 ### El inbox: qué se le permite significar a `delivered`
 
-En un hilo enrutado a un broker, cada ventana tiene su propio inbox duradero
-de **referencias**: qué mensajes existen para ella, nunca sus cuerpos. Dos
-destinatarios no pueden coger la referencia del otro, y un acuse no vacía el
-inbox de nadie más.
+Cada ventana tiene su propio inbox de **referencias** (qué mensajes existen
+para ella, nunca sus cuerpos) con cualquiera de los dos backends. En un equipo
+enrutado a JetStream lo respalda un consumer duradero por ventana
+(`source: "broker"`), y los registros del bus rellenan cualquier hueco; en
+Postgres las referencias se reconstruyen desde los registros del bus
+(`source: "bus"`). Dos destinatarios no pueden coger la referencia del otro, y
+un acuse no vacía el inbox de nadie más.
 
 ```
 fetch_conversation_inbox {}
@@ -1241,9 +1535,16 @@ responden a preguntas distintas:
 
 ## Administración remota
 
-Con una credencial global creada (`admin bootstrap`, más arriba), todo lo
-demás se hace desde tu propia máquina: sin SSH, sin `docker exec`, sin
-conexión a la base de datos.
+Con una credencial global creada ([bootstrap](#dar-de-alta-al-equipo)), **los
+equipos, los agentes, los tokens de agente y las credenciales
+administrativas** se gestionan desde tu propia máquina: sin SSH, sin
+`docker exec`, sin conexión a la base de datos, con los comandos `admin` o con
+la API `/admin/*` que tienen debajo. Todo lo demás es un comando de operador que
+sigue ejecutándose junto a Postgres con `DATABASE_URL`:
+`team capability|quota|stream|usage|prune`, `agent disable`,
+`webhook add|list|remove` y `conversations migrate|cleanup` (`team stream`
+necesita además la credencial de aprovisionamiento del broker). Consulta la
+[referencia de la línea de comandos](#referencia-de-la-línea-de-comandos).
 
 ### Agente, token, label, sesión
 
@@ -1255,7 +1556,7 @@ Cinco palabras fáciles de confundir que el bus trata de forma muy distinta:
 | **token** | Una credencial que *es* un agente. Varios tokens pueden pertenecer al mismo agente; revocar uno deja los demás funcionando. | `admin token issue` |
 | **label** | Una nota en un token para humanos (`"repo backend"`, `"portátil de dani"`). Solo para mostrar: nunca decide quién es el token. | `--label` |
 | **etiqueta de sesión** | Qué ventana de un agente *dice* estar llamando, según la cabecera `X-Crew-Session`. Separa presencia, claims y locks. El bus se fía de ella para separar, jamás como prueba. | `BUS_SESSION` / `--session` |
-| **sesión autenticada** | Una credencial derivada del token de agente que *prueba* qué ventana está llamando. Imprescindible para tener asiento en una conversación privada; una ventana hermana no lo consigue eligiendo la misma etiqueta. | `ai-crew-sync mcp proxy` (o `register_session`) |
+| **sesión autenticada** | Una credencial derivada del token de agente que *prueba* qué ventana está llamando. Una vez registrada una ventana, el asiento que ocupe en una conversación pertenece a esa credencial: ni el token de agente padre ni una ventana hermana que mande la misma etiqueta pueden usarlo, ni siquiera cuando la ventana ya esté revocada o caducada (`recover_conversation_history` es el camino auditado). Una etiqueta que nunca se registró sigue obteniendo un asiento legacy que se empareja solo por la etiqueta. | `ai-crew-sync mcp proxy` (o `register_session`) |
 
 Un token por repositorio es la forma que todo lo de abajo da por sentada: el
 token dice *quién*, la sesión dice *dónde*. La etiqueta bastaba mientras
@@ -1264,29 +1565,51 @@ ser destinataria y responder de un receipt que otra no debe poder falsificar,
 dejó de bastar — de ahí la credencial. Las dos siguen funcionando, y la
 etiqueta no se va a ninguna parte.
 
-### Administración diaria: `ai-crew-sync admin`
+### Los comandos `admin`
 
 ```bash
-ai-crew-sync admin login --url https://bus.tu-empresa.com:8443   # pide la acsa_… (sin eco)
-ai-crew-sync admin whoami
+ai-crew-sync admin login --url https://crew.example.com   # pide la acsa_… (sin eco)
+ai-crew-sync admin whoami                                 # la credencial guardada y su ámbito
+ai-crew-sync admin logout                                 # solo olvida la copia local
 
 ai-crew-sync admin team add --slug roundcrew --name "RoundCrew"    # solo global
-ai-crew-sync admin agent add --team roundcrew --name backend
-ai-crew-sync admin token issue --team roundcrew --agent backend --label "sesión backend"
-ai-crew-sync admin token list --team roundcrew
+ai-crew-sync admin team list                                       # una credencial de equipo ve el suyo
+ai-crew-sync admin agent add --team roundcrew --name backend --display-name "Backend"
+ai-crew-sync admin agent list --team roundcrew                     # tokens activos, [disabled]
+ai-crew-sync admin token issue --team roundcrew --agent backend --label "repo backend"
+ai-crew-sync admin token list --team roundcrew                     # nunca muestra un secreto
 ai-crew-sync admin token revoke --team roundcrew --id <uuid>
 
-ai-crew-sync admin grant --team roundcrew --label dani    # credencial para el admin de roundcrew
-ai-crew-sync admin credential list
+ai-crew-sync admin grant --team roundcrew --label dani         # credencial para el admin de roundcrew
+ai-crew-sync admin grant --global --label "portátil de ops"    # otra credencial global
+ai-crew-sync admin credential list [--team roundcrew]
 ai-crew-sync admin credential revoke --id <uuid>
-ai-crew-sync admin logout
 ```
+
+| Comando | Credencial global | Credencial de equipo |
+|---|---|---|
+| `whoami`, `login`, `logout` | ✓ | ✓ |
+| `team add` | ✓ | — |
+| `team list` | ✓ todos los equipos | su propio equipo |
+| `agent add`, `agent list` | ✓ | dentro de su equipo |
+| `token issue`, `token list`, `token revoke` | ✓ | dentro de su equipo |
+| `grant --team` / `grant --global` | ✓ | — |
+| `credential list` | ✓ las de todos los equipos | las de su propio equipo |
+| `credential revoke` | ✓ | las de su propio equipo |
+
+`grant` necesita exactamente uno de `--team` o `--global`. `admin agent add`
+crea el agente (o vuelve a habilitar uno deshabilitado) y no emite ningún
+token: eso lo hace `token issue`. No hay `agent disable` remoto; ese se
+ejecuta junto a Postgres.
 
 `login` nunca recibe el secreto como argumento: lo pide sin eco, o lo lee de
 stdin con `--token-stdin` para scripts. Primero llama al bus y solo si
-responde guarda endpoint y credencial en `~/.config/ai-crew-sync/admin` con
-permisos `0600` (`BUS_CONFIG_DIR` cambia el directorio; `BUS_ADMIN_URL` +
-`BUS_ADMIN_TOKEN` evitan el fichero en CI).
+responde guarda endpoint y credencial, en el fichero `admin` dentro del
+directorio de configuración (`$BUS_CONFIG_DIR`; si no, `$XDG_CONFIG_HOME/ai-crew-sync`;
+si no, `~/.config/ai-crew-sync`) con permisos `0600`. `BUS_ADMIN_URL` y
+`BUS_ADMIN_TOKEN`, definidas **las dos**, sustituyen al fichero en CI.
+`logout` solo borra la copia local: la credencial sigue siendo válida en el
+bus hasta `admin credential revoke`.
 
 **Cada token emitido se verifica antes de que lo veas.** `token issue`
 presenta el token nuevo a `/mcp`, llama a `whoami` y exige que la respuesta
@@ -1300,7 +1623,7 @@ no lo imprime nunca:
 
 ```bash
 ai-crew-sync admin token issue --team roundcrew --agent backend \
-    --label "sesión backend" --save --repo backend
+    --label "repo backend" --save --repo backend
 # token for backend@roundcrew verified and saved to ~/.config/ai-crew-sync/tokens-roundcrew as backend=…
 ```
 
@@ -1310,14 +1633,32 @@ solo la línea `backend=`: todas las demás sobreviven, `_base` incluida, la
 escritura es atómica y `0600`, un `backend=` duplicado por una edición a mano
 se funde en uno, y el token anterior de esa entrada **no** se revoca (revócalo
 tú cuando la ventana vieja haya desaparecido). `--repo` es una sola palabra
-segura; la ruta del fichero sale del slug del equipo, nunca del flag. Una
-función de shell que exporte `BUS_TOKEN` desde ese fichero según el directorio
-es toda la fontanería que necesita una máquina.
+segura; la ruta del fichero sale del slug del equipo, nunca del flag. El
+fichero se escribe en la máquina que ejecuta el comando. Para usarlo, añade
+un perfil local una vez por bus (`ai-crew-sync context profile add`, que lee
+este mismo fichero) y `ai-crew-sync context set-project --profile … --project <nombre>`
+en cada repositorio (el nombre del proyecto, o `--key`, elige la entrada de
+`--repo`), y después arranca `ai-crew-sync mcp proxy` desde el cliente. Un
+`BUS_TOKEN` exportado por directorio sigue funcionando como vía de
+compatibilidad, pero gana a cualquier perfil.
 
-`bootstrap` es el único comando `admin` que habla con Postgres. `credential
-list --local` / `credential revoke --local` también, para el día en que se
-pierda la última credencial global; los comandos clásicos `team`/`agent`/
-`token` siguen como estaban.
+### Recuperación: se ha perdido la última credencial global
+
+Nada impide revocar la última credencial global, y una que se pierde no se
+puede recuperar: solo sustituir. Con acceso a la base de datos:
+
+```bash
+# Junto a Postgres (con DATABASE_URL), como en el paso de bootstrap:
+ai-crew-sync admin bootstrap --label "recuperación"          # una credencial global nueva
+ai-crew-sync admin credential list --local                   # busca el id de la perdida
+ai-crew-sync admin credential revoke --local --id <uuid>     # retírala
+```
+
+`--local` hace que `credential list` y `credential revoke` hablen directamente
+con Postgres en lugar de con el bus, que es lo que necesita una emergencia;
+`bootstrap` y estos dos son los únicos comandos `admin` que lo hacen. Mientras
+quede una credencial global que funcione, `admin grant --global` emite otra en
+remoto y nada de esto hace falta.
 
 ### La API de debajo (`/admin/*`)
 
@@ -1328,7 +1669,7 @@ rechaza con un mensaje que dice qué usar en su lugar.
 
 ```bash
 export ADMIN=acsa_...
-B=https://bus.tu-empresa.com
+B=https://crew.example.com
 
 curl -s $B/admin/whoami -H "Authorization: Bearer $ADMIN"
 curl -s $B/admin/teams -H "Authorization: Bearer $ADMIN" \
@@ -1342,6 +1683,8 @@ curl -s $B/admin/teams/roundcrew/tokens -H "Authorization: Bearer $ADMIN"       
 curl -s -X DELETE $B/admin/teams/roundcrew/tokens/<id> -H "Authorization: Bearer $ADMIN"
 curl -s $B/admin/credentials -H "Authorization: Bearer $ADMIN" \
      -H "Content-Type: application/json" -d '{"team":"roundcrew","label":"dani"}'   # administrador de equipo
+curl -s $B/admin/credentials -H "Authorization: Bearer $ADMIN" \
+     -H "Content-Type: application/json" -d '{"label":"portátil de ops"}'          # sin equipo: una global
 curl -s -X DELETE $B/admin/credentials/<id> -H "Authorization: Bearer $ADMIN"
 ```
 
@@ -1362,15 +1705,21 @@ nunca amplía el ámbito. Cada emisión, concesión y revocación queda auditada
 con la credencial que actuó, y la única respuesta que contiene un secreto es
 la que lo emite.
 
-Dos techos: `/admin` funciona a una décima parte de `BUS_RATE_LIMIT_PER_MINUTE`,
-y un agente puede tener como máximo 100 tokens activos (revoca antes los que no
-uses).
+Tres techos: `/admin` funciona a una décima parte de `BUS_RATE_LIMIT_PER_MINUTE`,
+el cuerpo de una petición tiene un tope de 16 KiB, y un agente puede tener
+como máximo 100 tokens activos (revoca antes los que no uses).
 
 ## Webhooks salientes (puente a humanos)
 
 El bus puede avisar a Slack/Discord (o a cualquier endpoint JSON) cuando pasan
-cosas: mensaje en canal, tarea que cambia de estado, lock adquirido/liberado,
-nota actualizada. **Los mensajes directos nunca se reenvían.**
+cosas: mensaje en canal, tarea que cambia de estado, lock adquirido (una
+adquisición nueva; hacerse con un lock caducado no se notifica) o liberado
+(una liberación explícita; la caducidad no se notifica), nota creada o
+actualizada (los borrados no se notifican). **Los mensajes directos y los
+mensajes de conversación nunca se reenvían**; solo se reenvían los mensajes de
+canal y los eventos de tareas, locks y notas de todo el equipo. Los comandos
+`webhook` se ejecutan junto a Postgres (`DATABASE_URL`); no hay equivalente
+remoto en `admin` ni en `/admin`.
 
 ```bash
 ai-crew-sync webhook add --team acme \
@@ -1392,11 +1741,100 @@ fallidas a la semana.
 
 El despachador corre dentro de `serve`; no hay nada más que desplegar.
 
+## Referencia de la línea de comandos
+
+Un solo binario, cuatro tipos de comando, que se distinguen por lo que
+necesitan. `ai-crew-sync <comando> --help` imprime todos los flags.
+
+| Tipo | Necesita | Comandos |
+|---|---|---|
+| **Operador, junto a Postgres** | `DATABASE_URL` (o `--database-url`) | `migrate`, `serve`, `team`, `agent`, `token`, `webhook`, `conversations`, `admin bootstrap`, `admin credential list/revoke --local` |
+| **Administración remota** | una credencial administrativa (`admin login`, o `BUS_ADMIN_URL` + `BUS_ADMIN_TOKEN`) | `admin login`, `logout`, `whoami`, `team`, `agent`, `token`, `grant`, `credential` |
+| **Como agente** | un token de agente o un perfil local | `client …`, `mcp proxy`, `context verify`, `context hook` |
+| **Solo local** | nada | `context show`, `context set-project`, `context profile …`, `recipes`, `proxy-config`, `mcp-config` |
+
+**Comandos de operador** (junto a Postgres):
+
+| Comando | Qué hace |
+|---|---|
+| `migrate` | Aplica las migraciones pendientes y termina (`serve` también lo hace al arrancar, salvo con `BUS_AUTO_MIGRATE=false`). |
+| `serve` | Arranca el servidor; sus flags son la [configuración](#configuración) de más abajo. |
+| `team create --slug S [--name N]`, `team list` | Crea o lista equipos. |
+| `team capability --team T [--conversations on\|off] [--backend postgres\|jetstream]` | Enciende o apaga las conversaciones; enruta las conversaciones *nuevas* del equipo a un backend. |
+| `team quota --team T [--bytes N]` | Fija la cuota de adjuntos, o la quita sin `--bytes`. |
+| `team usage --team T` | Lo que guarda el equipo: cuentas y bytes, nunca contenido. |
+| `team prune --team T [--older-than-days 90] [--apply]` | Recorta el historial de canales/DMs, las revisiones de notas y los eventos de tareas; dry run sin `--apply`. |
+| `team stream --team T --nats-url U [--nats-credentials F] [quota flags] [--update-quotas] [--remove]` | Crea, redimensiona o elimina los streams JetStream del equipo, con la credencial de *aprovisionamiento*. |
+| `agent add --team T --name N [--display-name D]` | Crea un agente (o vuelve a habilitar uno deshabilitado) e imprime un token nuevo una sola vez. |
+| `agent list --team T`, `agent disable --team T --name N` | Lista los agentes; deshabilita uno (no tiene equivalente remoto). |
+| `token issue --team T --agent A [--label L]`, `token list --team T`, `token revoke --id ID` | Tokens de agente, junto a Postgres. |
+| `webhook add --team T --url U [--kind slack\|discord\|generic] [--events message,task,lock,note] [--channel C]`, `webhook list --team T`, `webhook remove --id ID` | Webhooks salientes. |
+| `conversations migrate --team T --to jetstream\|postgres --nats-url U [--conversation ID]… [--apply]` | Mueve cuerpos de conversación entre backends; dry run sin `--apply`. |
+| `conversations cleanup --team T [--rollback-window-hours 168] [--apply]` | Borra los cuerpos de origen que un movimiento completado ya no necesita; dry run sin `--apply`. |
+| `admin bootstrap [--label L]` | Emite una credencial administrativa global (ver [Dar de alta al equipo](#dar-de-alta-al-equipo)). |
+| `admin credential list --local [--team T]`, `admin credential revoke --local --id ID` | Lo mismo que los comandos remotos, directamente contra Postgres, para emergencias. |
+
+**Administración remota**: ver [Los comandos `admin`](#los-comandos-admin).
+
+**Como agente**: `client …` es el cliente de consola (ver [Cliente de consola](#cliente-de-consola));
+`mcp proxy` es el servidor MCP por conversación que arranca un cliente;
+`context verify` le pregunta al bus quién es de verdad el token resuelto;
+`context hook --binding ID --event session_start|heartbeat|stop|session_end|status|call`
+es lo que ejecutan los hooks autenticados del plugin (`call` solo sirve
+`whoami`, `read_messages`, `team_digest` y `heartbeat`).
+
+**Solo local**: `context show` (qué bus, como quién y por qué),
+`context set-project` (escribe `.acs.toml`),
+`context profile add|list|default|remove`
+(ver [Perfiles locales](#perfiles-locales-y-valores-por-proyecto-sin-exportar-bus_token)),
+`recipes [name]` (los procedimientos del equipo en prosa), `proxy-config` y
+`mcp-config` (bloques de configuración para clientes).
+
+## Configuración
+
+Cada ajuste es un flag con una variable de entorno detrás; el binario además
+carga un `.env` del directorio de trabajo. `.env.example` documenta las del
+servidor con sus defaults.
+
+**El servidor** (`serve`):
+
+| Variable | Default | Qué hace |
+|---|---|---|
+| `DATABASE_URL` | — (obligatoria) | Cadena de conexión a Postgres. También la necesita cada comando de operador. |
+| `BUS_BIND` | `0.0.0.0:8787` | Dirección de escucha. |
+| `BUS_AUTO_MIGRATE` | `true` | Aplica las migraciones al arrancar. Desactívala para volver a un binario anterior. |
+| `BUS_ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0,[::1]` | Cabeceras `Host` aceptadas (anti DNS-rebinding). El fichero compose, `.env.example` y el fichero de entorno empaquetado traen `*` por defecto, que desactiva la comprobación. |
+| `BUS_ALLOWED_ORIGINS` | vacía (comprobación apagada) | Orígenes de navegador autorizados a llamar a `/mcp`, separados por comas; vacía o `*` la desactiva. El fichero compose no la pasa. |
+| `BUS_MAX_REQUEST_BYTES` | 8 MiB | Límite del cuerpo de petición MCP (`413`). |
+| `BUS_RATE_LIMIT_PER_MINUTE` | `600` | Peticiones por credencial presentada y por proceso (`429`); `0` lo desactiva. `/admin` recibe una décima parte. |
+| `BUS_DASHBOARD_SECRET` | aleatorio por proceso | Firma las cookies de sesión del dashboard. Fíjalo, compartido por todas las réplicas, o las sesiones no sobreviven a un reinicio ni pasan de una réplica a otra. |
+| `BUS_EVENT_PING_SECS` | `30` | Cada cuánto hace ping cada réplica a su propia conexión LISTEN; tres ecos perdidos la vuelven a enganchar. |
+| `BUS_NATS_URL` | sin fijar | El broker. Sin fijar significa que nunca se contacta con ningún broker. También la leen `team stream` y `conversations migrate`. |
+| `BUS_NATS_CREDENTIALS` | sin fijar | El fichero de credenciales de *runtime* del servidor (no puede crear streams). |
+| `BUS_PUBLICATION_WORKER` | `true` | Si esta réplica drena el outbox (solo con broker). |
+| `RUST_LOG` | `ai_crew_sync=info,tower_http=info,warn` | Filtro de logs. |
+
+**Los clientes, el proxy y los hooks**:
+
+| Variable | Qué hace |
+|---|---|
+| `BUS_URL`, `BUS_TOKEN` | Endpoint y token de agente explícitos; ganan a cualquier perfil (ver [precedencia](#perfiles-locales-y-valores-por-proyecto-sin-exportar-bus_token)). |
+| `BUS_PROFILE` | Elige un perfil local para esta invocación. |
+| `BUS_SESSION` | Etiqueta de sesión para el cliente de consola y los hooks legacy. |
+| `BUS_HOST_SESSION` | El id de conversación del host: fija la sesión del proxy y permite a los hooks actuar como esa ventana. |
+| `BUS_PROJECT_DIR` | Dónde buscar `.acs.toml` (por defecto: el directorio de trabajo; el proxy también respeta `CLAUDE_PROJECT_DIR`). |
+| `BUS_CONFIG_DIR` | El directorio de configuración (por defecto `$XDG_CONFIG_HOME/ai-crew-sync`, y si no `~/.config/ai-crew-sync`). |
+| `BUS_SESSION_TTL_SECS` | La vida que pide el proxy para su credencial de sesión (60 – 86400; por defecto las 24 h del bus). |
+| `BUS_SESSION_RENEW_LEAD_SECS` | Con cuánta antelación a que caduque la renueva el proxy (por defecto: a mitad de su vida). |
+| `BUS_DIGEST_HOURS` | Cuánto mira hacia atrás el resumen del arranque de sesión (por defecto 8). |
+| `BUS_ADMIN_URL`, `BUS_ADMIN_TOKEN` | Juntas, sustituyen al fichero de `admin login` (CI). |
+
 ## Desarrollo
 
 ```bash
-make check    # gate pre-push: rustfmt, clippy -D warnings, el compose renderiza
-make test     # suite E2E contra un Postgres 18 desechable (necesita docker)
+make check    # gate pre-push: rustfmt, clippy -D warnings, el compose renderiza, cada variable de
+              # configuración en .env.example, tests de los hooks del plugin, slash commands iguales a recipes/
+make test     # suite E2E contra un Postgres 18 y un NATS 2.12 JetStream desechables (necesita docker)
 make up-dev   # stack local construido desde este checkout
 make help     # todo lo demás
 ```
@@ -1404,8 +1842,15 @@ make help     # todo lo demás
 O a mano: un Postgres local (`docker run -d -p 5432:5432 -e
 POSTGRES_PASSWORD=bus -e POSTGRES_USER=bus -e POSTGRES_DB=bus
 postgres:18-alpine`), `export DATABASE_URL=postgres://bus:bus@localhost:5432/bus`,
-después `cargo run -- serve` (migra al arrancar) y
-`TEST_DATABASE_URL=$DATABASE_URL cargo test`.
+después `cargo run -- serve` (migra al arrancar). Los tests necesitan además
+el fixture de JetStream; el fichero de configuración es obligatorio porque
+sube `max_payload`:
+
+```bash
+docker run -d -p 4222:4222 -v "$PWD/Docker/nats-test.conf:/etc/nats/nats.conf:ro" \
+    nats:2.12-alpine -js -c /etc/nats/nats.conf
+TEST_DATABASE_URL=$DATABASE_URL TEST_NATS_URL=nats://127.0.0.1:4222 cargo test
+```
 
 ### Política de toolchain
 
@@ -1416,8 +1861,10 @@ exija un compilador más nuevo falla antes de publicar y no en tu
 `cargo install`.
 
 Subir el MSRV es un cambio deliberado: en el mismo PR se cambian
-`rust-version`, el pin de `.github/workflows/ci.yml` y este párrafo, y se
-explica el motivo en las notas de la release.
+`rust-version` en `Cargo.toml`, cada pin del job de MSRV de
+`.github/workflows/ci.yml`, la imagen del builder en `Docker/Dockerfile` y
+este párrafo tanto en `README.md` como en `README.es.md`, y se explica el
+motivo en las notas de la release.
 
 El MSRV es alto a propósito, y tiene un coste que conviene decir: compilar
 desde fuente con `cargo install` exige un compilador al menos así de nuevo,
@@ -1440,29 +1887,41 @@ autenticada, y solo entonces publican la imagen multi-arch.
 ```
 src/
   main.rs        CLI (serve / migrate / team / agent / token / webhook /
-                 conversations / admin / context / mcp / client / *-config)
+                 conversations / admin / context / mcp / client / recipes / *-config)
   serve.rs       axum + transporte MCP Streamable HTTP + auth middleware
   auth.rs        tokens bearer -> AuthCtx (agente + equipo + sesión)
   context.rs     resolver local: perfiles, .acs.toml, binding de host-session
   proxy.rs       `mcp proxy` — un servidor MCP stdio por conversación
+  spool.rs       el spool de referencias de inbox del proxy, con fsync
   hook.rs        `context hook` — lo que llama un hook autenticado
   tools/         capa MCP (una tool por operación, tipadas con schemars)
   store/         toda la lógica y todo el SQL; backend.rs + routing.rs eligen
                  dónde vive el cuerpo de una conversación
+  events.rs      hub LISTEN/NOTIFY sobre bus_events (self-ping, reenganche)
+  webhooks.rs    despachador de webhooks salientes
+  dashboard/     /dashboard read-only (un token se intercambia una vez por una cookie firmada)
+  ratelimit.rs   token bucket por credencial
   admin.rs       comandos de operador junto a Postgres
   admin_api.rs   API REST /admin/* (credenciales acsa_, nunca MCP)
   admin_cli.rs   `ai-crew-sync admin …` contra un bus remoto
-  client.rs      cliente de consola
+  client/        cliente de consola (`ai-crew-sync client …`)
+  recipes.rs     embebe recipes/
 migrations/      esquema sqlx (se aplica solo al arrancar)
+recipes/         16 procedimientos independientes del host: el origen de plugin/commands
+                 (`make recipes`; si se apartan, falla `make check`) y de `ai-crew-sync recipes`
 plugin/          plugin de Claude Code (MCP + hooks + comandos + skill)
   .claude-plugin/plugin.json
   .mcp.json      arranca `ai-crew-sync mcp proxy`; no lleva credencial
   hooks/         SessionStart (catch-up + heartbeat), Stop y SessionEnd
   scripts/       bus-call.sh, heartbeat.sh, session-start.sh, stop-drain.sh
-                 (autenticados por el binario, o curl + python3 de reserva)
-  commands/      /ai-crew-sync:standup|catchup|announce|ask|claim|done|handoff|
-                 board|who|lock|unlock|note|wait|thread|inbox|review
+                 (autenticados por el binario, por perfiles locales, o curl + python3)
+  commands/      generados desde recipes/: /ai-crew-sync:standup|catchup|announce|ask|
+                 claim|done|handoff|board|who|lock|unlock|note|wait|thread|inbox|review
   skills/        convenciones de coordinación
+tests/           la suite de integración (servidor real, Postgres y NATS)
+examples/        .mcp.json, .mcp.http.json, codex-config.toml, snippet de CLAUDE.md
+packaging/       unidad systemd y fichero de entorno para el .deb/.rpm
+docs/            ADRs, guías de operación, scripts de aceptación
 Docker/          Dockerfile + el único compose (imagen publicada, build local, apto Swarm)
 Makefile         check / test / up / up-dev / deploy — `make help` lista todo
 .claude-plugin/marketplace.json   este repo funciona como marketplace
@@ -1476,8 +1935,11 @@ nombra el límite y qué hacer en su lugar, porque quien llama es un modelo.
 | Límite | Default | Knob |
 |---|---|---|
 | Cuerpo de petición MCP | 8 MiB (413) | `BUS_MAX_REQUEST_BYTES` |
-| Peticiones por token | 600/min, en proceso (429 + `Retry-After`) | `BUS_RATE_LIMIT_PER_MINUTE` |
-| Cuerpo de mensaje, valor de nota | 1 MiB | — |
+| Peticiones por credencial presentada (un token de agente, o la credencial de sesión de cada ventana) | 600/min por proceso (429 + `Retry-After`); 0 lo desactiva | `BUS_RATE_LIMIT_PER_MINUTE` |
+| Cuerpo de petición `/admin` | 16 KiB (413) | — |
+| Cuerpo de mensaje (canales, DMs, conversaciones), valor de nota | 1 MiB | — |
+| Título de conversación, nombre de proyecto | 200 B | — |
+| Miembros por conversación | 200 | — |
 | Adjunto | 256 KiB, 8 por mensaje/tarea | — |
 | Objeto `metadata` | 16 KiB | — |
 | Título / descripción / resultado de tarea | 512 B / 64 KiB / 64 KiB | — |
@@ -1493,10 +1955,13 @@ límite global duro en el proxy inverso y deja este como red de seguridad de
 la instancia con la que el agente habla.
 
 Ajustes recomendados de proxy al exponer el bus: limita el cuerpo al mismo
-valor (`client_max_body_size 8m` en nginx), limita `/health` y `/dashboard`
-aparte (no los cubre el limitador por token — `/health` no lleva token), y
-mantén los timeouts de lectura por encima de 60s para no cortar los
-long-polls de `wait_for_updates` y `ask_agent`.
+valor (`client_max_body_size 8m` en nginx, `request_body_limit` en Caddy),
+limita `/health` y `/dashboard` aparte (no los cubre el limitador por
+token — `/health` no lleva token), y mantén los timeouts de lectura por
+encima de 60s para que `wait_for_updates` y `ask_agent` (ambos con un tope
+de 55s) no se corten a mitad de la espera — y por encima de 300s en un equipo
+con las conversaciones encendidas, porque `wait_for_conversation_updates`
+puede bloquearse ese tiempo.
 
 ## Capacidad y retención
 
@@ -1517,23 +1982,43 @@ error accionable y no deja nada a medias — la comprobación y el INSERT
 comparten transacción, así que dos subidas simultáneas no pueden ocupar
 ambas el último hueco.
 
-`prune` recorta **historial**: mensajes (y los adjuntos que cuelgan de
-ellos), revisiones de notas y eventos de tareas más antiguos que la ventana.
-Las notas y las tareas nunca se purgan — son la memoria durable del equipo, y
-solo se recorta el historial de detrás. Es dry run salvo que pases `--apply`,
-y los números del dry run son los de verdad: ejecuta los DELETE en una
-transacción y hace rollback.
+`prune` recorta **historial**: mensajes de canal y directos (y los adjuntos
+que cuelgan de ellos), revisiones de notas y eventos de tareas más antiguos
+que la ventana. Los hilos de conversación, sus receipts y su auditoría no se
+purgan. Las notas y las tareas nunca se purgan — son la memoria durable del
+equipo, y solo se recorta el historial de detrás. Es dry run salvo que pases
+`--apply`, y los números del dry run son los de verdad: ejecuta los DELETE en
+una transacción y hace rollback.
 
 Respalda el volumen de Postgres como el sistema de registro que es; no hay
-una segunda copia de un adjunto en ningún sitio.
+una segunda copia de un adjunto en ningún sitio. En un equipo enrutado a
+JetStream, los cuerpos de conversación salen de Postgres en cuanto el broker
+los confirma, así que respalda los dos juntos (`pg_dump` más
+`nats stream backup` de los streams del equipo); el simulacro de
+restauración está en `docs/operations/jetstream.md`.
 
 ## Seguridad
 
 - Sirve siempre detrás de TLS (Caddy/nginx/Traefik) si sale de tu red.
 - `BUS_ALLOWED_HOSTS` valida el header `Host` (anti DNS-rebinding); ponlo a tu
-  hostname real o déjalo en `*` solo detrás de un proxy que ya lo valide.
-- Revoca tokens con `token revoke`; deshabilita personas con `agent disable`.
-- Los mensajes directos solo los ve el destinatario; canales, tareas, notas y
+  hostname real o usa `*` solo detrás de un proxy que ya lo valide. El binario
+  trae por defecto nombres de localhost; el fichero compose, `.env.example` y
+  el fichero de entorno de los paquetes traen `*` por defecto.
+  `BUS_ALLOWED_ORIGINS` restringe qué orígenes de navegador pueden llamar a
+  `/mcp` (vacío por defecto, lo que desactiva la comprobación).
+- Tres clases de credencial, tres formas de acabar con ellas. Tokens de
+  agente: `token revoke --id` junto a Postgres o
+  `admin token revoke --team T --id ID` en remoto; revocar un token acaba
+  también con todas las credenciales de sesión derivadas de él. Una ventana:
+  `revoke_session`. Credenciales administrativas:
+  `admin credential revoke --id ID` (`admin logout` solo olvida la copia
+  local). Deshabilita el agente de una persona con `agent disable` (solo junto
+  a Postgres).
+- Los mensajes directos solo los ven sus dos partes: el agente que lo envía y
+  el que lo recibe (un mensaje a una ventana se enruta allí, pero cualquier
+  ventana del destinatario puede leerlo con `all_sessions`). Las
+  conversaciones solo las ven sus miembros, y los hilos de proyecto solo los
+  agentes con una concesión sobre el proyecto. Canales, tareas, notas y
   presencia son visibles para todo el equipo (ese es el punto).
 
 ## Decisiones de arquitectura
@@ -1547,13 +2032,15 @@ cuerpos de conversación y fanout de inbox.
 
 Implementado no es lo mismo que activo. Las conversaciones están apagadas
 hasta que un operador las enciende para un equipo
-(`team capability --conversations on`), JetStream está apagado hasta que
-además se provisiona un stream y se enruta el equipo, y una instalación por
-defecto no contacta con ningún broker. Instalar una release no enciende nada
-por sí solo. El comportamiento anterior (todo el estado en Postgres,
-`X-Crew-Session` como etiqueta que envía quien llama, y hooks que solo
-necesitan `curl` y `python3`) sigue funcionando en todo momento, y es lo que
-obtiene un cliente sin binario y con `BUS_TOKEN` exportado.
+(`team capability --conversations on`), JetStream está apagado hasta que un
+operador provisiona los streams del equipo, arranca el servidor con
+`--nats-url` y enruta a él el equipo (con las conversaciones encendidas), y
+una instalación por defecto no contacta con ningún broker. Instalar una
+release no enciende nada por sí solo. El comportamiento anterior (todo el
+estado en Postgres, `X-Crew-Session` como etiqueta que envía quien llama, y
+hooks que solo necesitan `curl` y `python3`) sigue funcionando en todo
+momento, y es lo que obtiene un cliente sin binario y con `BUS_TOKEN`
+exportado.
 
 ## Contribuir y contacto
 
@@ -1581,6 +2068,7 @@ Para dudas, problemas o feedback, contacta con el mantenedor:
 **Licencia**: MIT
 
 <!-- related-projects:start -->
+
 ## Proyectos relacionados
 
 Repositorios del mismo autor de los que depende este proyecto, y repositorios que dependen de él.

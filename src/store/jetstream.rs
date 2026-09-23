@@ -691,8 +691,8 @@ impl JetStreamBackend {
             .map_err(|e| {
                 BusError::invalid(format!(
                     "this team's inbox stream is not provisioned or is unreachable ({e}). \
-                     Run `ai-crew-sync team stream --provision`; references are still in \
-                     Postgres meanwhile."
+                     Run `ai-crew-sync team stream --team <team> --nats-url <url>`; \
+                     references are still in Postgres meanwhile."
                 ))
             })?;
         let durable = format!("IN_{recipient_key}");
