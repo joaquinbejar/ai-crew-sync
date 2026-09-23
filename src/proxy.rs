@@ -477,18 +477,46 @@ fn settled_ids(reply: Option<&Value>, sent: &[String]) -> std::collections::Hash
     settled
 }
 
+/// What a failed call to the bus means, in words the model can use.
+///
+/// The bus writes its errors for the model, so an MCP error from it is its
+/// own message — never `ServiceError`'s rendering of it (`"Mcp error:
+/// -32602: …"`), which names a JSON-RPC code nobody downstream can act on.
+/// Anything else is this proxy losing the bus: said once, without the
+/// transport's internals (URLs, OS errors), which go to the log.
+fn remote_error_text(e: &ServiceError) -> String {
+    match e {
+        ServiceError::McpError(data) => data.message.to_string(),
+        other => {
+            tracing::warn!(error = %other, "the call to the bus failed in transport");
+            "the connection to the bus failed before an answer came back".to_owned()
+        }
+    }
+}
+
 async fn call_remote(remote: &Remote, name: &str, args: Value) -> anyhow::Result<Value> {
     let arguments: rmcp::model::JsonObject =
         serde_json::from_value(args).context("arguments must be an object")?;
     let result = remote
         .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments))
         .await
-        .map_err(|e| match verdict(&e) {
-            Some(v) => anyhow::Error::new(v).context(format!("{name} failed: {e}")),
-            None => anyhow::anyhow!("{name} failed: {e}"),
+        .map_err(|e| {
+            // The verdict is read from the error's shape and carried in the
+            // chain; the text is only what a reader of the chain will see.
+            let text = format!("{name}: {}", remote_error_text(&e));
+            match verdict(&e) {
+                Some(v) => anyhow::Error::new(v).context(text),
+                None => anyhow::anyhow!(text),
+            }
         })?;
     if result.is_error == Some(true) {
-        anyhow::bail!("{name} returned an error: {:?}", result.content);
+        // The tool's own words, not the Rust `Debug` of its content blocks.
+        let said: Vec<String> = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect();
+        anyhow::bail!("{name}: {}", said.join(" "));
     }
     Ok(result.structured_content.unwrap_or(Value::Null))
 }
@@ -1289,8 +1317,23 @@ impl Proxy {
                         ),
                         None,
                     )
+                } else if let ServiceError::McpError(data) = e {
+                    // The bus wrote this for the model: same code, same
+                    // words, same data, exactly as a direct call gets it.
+                    data
                 } else {
-                    ErrorData::internal_error(format!("{name}: {e}"), None)
+                    // This proxy lost the bus. One classification, and the
+                    // fact the caller needs to act safely: whether the call
+                    // ran is unknown. The transport's detail goes to the log.
+                    tracing::warn!(error = %e, tool = %name, "a forwarded call failed in transport");
+                    ErrorData::internal_error(
+                        format!(
+                            "{name} could not reach the bus: the connection failed before an \
+                             answer came back, so the call may or may not have run. Check \
+                             before repeating anything that is not safe to repeat."
+                        ),
+                        None,
+                    )
                 }
             }),
             _ = ct.cancelled() => Err(ErrorData::invalid_request(
