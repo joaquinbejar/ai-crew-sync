@@ -9244,6 +9244,115 @@ async fn an_abort_that_cannot_finish_leaves_its_move_resumable() {
     h.shutdown().await;
 }
 
+/// An abort takes the thread's row before anything else, the order a send
+/// and the cutover take, so an abort and a cutover of the same run by two
+/// processes queue instead of deadlocking; and it only gives up on a run
+/// that is still open (#180 review).
+#[tokio::test]
+async fn an_abort_takes_the_thread_first_and_leaves_a_settled_run_alone() {
+    use ai_crew_sync::store::migrate;
+
+    let h = require_db!("t_abort_lock_order");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "moving thread", "private": true}),
+    )
+    .await;
+    let cuuid: Uuid = convo["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (migration,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'copying') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+
+    // Someone holds the thread, as a send or a cutover does.
+    let mut holder = h.pool.begin().await.unwrap();
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(cuuid)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    let pool = h.pool.clone();
+    let aborting =
+        tokio::spawn(async move { migrate::abort(&pool, migration, "the copy failed").await });
+    let mut parked = false;
+    for _ in 0..400 {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(holder_pid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        if waiting {
+            parked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(parked, "the abort never waited on the thread");
+
+    // Parked on the thread, the abort holds nothing a cutover would need
+    // after it: the run's row is free.
+    let mut probe = h.pool.begin().await.unwrap();
+    let free =
+        sqlx::query("SELECT id FROM conversation_migrations WHERE id = $1 FOR UPDATE NOWAIT")
+            .bind(migration)
+            .fetch_one(&mut *probe)
+            .await;
+    probe.rollback().await.unwrap();
+    holder.rollback().await.unwrap();
+    aborting.await.unwrap().unwrap();
+    assert!(
+        free.is_ok(),
+        "the abort took the run before the thread: {:?}",
+        free.err()
+    );
+    assert!(!migrate::is_paused(&h.pool, cuuid).await.unwrap());
+
+    // A run another process already cut over is not failed after the fact.
+    let (settled,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'cut_over') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    migrate::abort(&h.pool, settled, "a late failure")
+        .await
+        .unwrap();
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM conversation_migrations WHERE id = $1")
+            .bind(settled)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "cut_over", "a settled run was rewritten as failed");
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
 /// The worker path's last attempt. A backend that keeps the body and never
 /// confirms it must not end as `failed`: "we did not hear back" and "it is
 /// not there" are different facts, and only one of them is a gap.

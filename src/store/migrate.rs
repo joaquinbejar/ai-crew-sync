@@ -498,8 +498,14 @@ async fn copy_and_verify(
     }
 
     // The cutover. One transaction: the messages' authority, the thread's
-    // routing, and the pause.
+    // routing, and the pause. The thread's row is taken first, in the same
+    // order as a send and as `abort`, so a cutover and an abort of the same
+    // run by two processes queue instead of deadlocking.
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE conversation_messages m
             SET backend = $3,
@@ -569,18 +575,38 @@ async fn copy_and_verify(
 /// open, so the same command resumes it.
 pub async fn abort(pool: &PgPool, migration_id: Uuid, why: &str) -> BusResult<()> {
     let mut tx = pool.begin().await?;
-    let row: Option<(Uuid, String)> = sqlx::query_as(
+    let run: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT conversation_id, direction FROM conversation_migrations WHERE id = $1",
+    )
+    .bind(migration_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((conversation_id, direction)) = run else {
+        return Ok(());
+    };
+    // The thread's row first, the order every writer of a conversation
+    // takes (a send, the pause, the cutover): taking the run and the
+    // messages before it could deadlock against a cutover of the same run
+    // by another process.
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    // Only a run still open is given up on: one that was cut over, or
+    // already failed, by another process has nothing left to undo.
+    let failed: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE conversation_migrations SET state = 'failed', finished_at = now(),
                 last_error = $2
-          WHERE id = $1 RETURNING conversation_id, direction",
+          WHERE id = $1 AND state IN ('planned', 'copying', 'verified')
+          RETURNING id",
     )
     .bind(migration_id)
     .bind(why)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((conversation_id, direction)) = row else {
+    if failed.is_none() {
         return Ok(());
-    };
+    }
     // A reverse move writes each body into its row as it copies. Nothing
     // was cut over, so those rows are still JetStream-authoritative and the
     // half-written local copy must not be served as if it were the body.
