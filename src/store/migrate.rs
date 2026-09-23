@@ -608,15 +608,20 @@ pub async fn abort(pool: &PgPool, migration_id: Uuid, why: &str) -> BusResult<()
         return Ok(());
     }
     // A reverse move writes each body into its row as it copies. Nothing
-    // was cut over, so those rows are still JetStream-authoritative and the
-    // half-written local copy must not be served as if it were the body.
+    // was cut over, so those rows are still JetStream-authoritative, and a
+    // copy that never verified must not be served as if it were the body.
+    // A verified one read back identical to what the broker held, so it is
+    // kept: a move to Postgres is what an operator runs when the broker is
+    // going bad, and that copy may be the last one. The body sweep releases
+    // it once the broker confirms the same digest, and only then (#173).
     if direction == "to_postgres" {
         sqlx::query(
             "UPDATE conversation_messages m
                 SET body = ''
                FROM conversation_migration_items i
               WHERE i.migration_id = $1 AND m.id = i.message_id
-                AND m.backend <> 'postgres'",
+                AND m.backend <> 'postgres'
+                AND i.state <> 'verified'",
         )
         .bind(migration_id)
         .execute(&mut *tx)

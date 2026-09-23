@@ -9375,6 +9375,106 @@ async fn an_abort_takes_the_thread_first_and_leaves_a_settled_run_alone() {
     h.shutdown().await;
 }
 
+/// A reverse move that is given up on keeps the copies that verified. It
+/// used to blank every body it had written back, verified or not, without
+/// asking the broker, and a move to Postgres is what runs when the broker
+/// is going bad: a verified copy can be the last one (#183 review).
+#[tokio::test]
+async fn a_reverse_abort_keeps_the_copies_that_verified() {
+    use ai_crew_sync::store::migrate;
+
+    let h = require_db!("t_reverse_abort");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "coming home", "private": true}),
+    )
+    .await;
+    let cuuid: Uuid = convo["id"].as_str().unwrap().parse().unwrap();
+    let mut ids = Vec::new();
+    for body in ["verified on the way back", "written but never verified"] {
+        let sent = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": convo["id"], "body": body, "request_id": request_id()}),
+        )
+        .await;
+        ids.push(
+            sent["message_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        );
+    }
+
+    // Both still broker-authoritative, both written back into their rows by
+    // a move to Postgres that stopped before the cutover: one verified,
+    // one not.
+    sqlx::query("UPDATE conversation_messages SET backend = 'jetstream' WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (migration,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_postgres', 'copying') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    for (id, state) in [(ids[0], "verified"), (ids[1], "copied")] {
+        sqlx::query(
+            "INSERT INTO conversation_migration_items (migration_id, message_id, checksum, bytes, state)
+             VALUES ($1, $2, 'sum', 1, $3)",
+        )
+        .bind(migration)
+        .bind(id)
+        .bind(state)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+
+    migrate::abort(&h.pool, migration, "the broker went away")
+        .await
+        .unwrap();
+    let body_of = |id: Uuid| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT body FROM conversation_messages WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        body_of(ids[0]).await,
+        "verified on the way back",
+        "a verified copy was thrown away"
+    );
+    assert_eq!(
+        body_of(ids[1]).await,
+        "",
+        "an unverified copy must not be served as the body"
+    );
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
 /// The worker path's last attempt. A backend that keeps the body and never
 /// confirms it must not end as `failed`: "we did not hear back" and "it is
 /// not there" are different facts, and only one of them is a gap.
