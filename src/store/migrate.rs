@@ -283,7 +283,16 @@ pub async fn run(
         Err(e) => {
             // Nothing was cut over, so nothing is half-moved: the bodies are
             // still authoritative where they were, and the thread reopens.
-            abort(pool, migration_id, &e.to_string()).await?;
+            // If the abort itself fails, the run stays open under its pause
+            // and the same command resumes it; the operator still needs the
+            // move's own error, not the abort's.
+            if let Err(abort_error) = abort(pool, migration_id, &e.to_string()).await {
+                tracing::error!(
+                    error = %abort_error,
+                    migration = %migration_id,
+                    "could not abort a failed move; it stays open and paused until resumed"
+                );
+            }
             Err(e)
         }
     }
@@ -551,7 +560,15 @@ async fn copy_and_verify(
 }
 
 /// Give up on a move, lift the pause and leave the thread exactly as it was.
+///
+/// The run's state, the written-back bodies and the pause move together in
+/// one transaction. Written one by one, a crash between the first and the
+/// last left the run `failed` and the thread paused with no run behind the
+/// pause: every send refused, and the documented retry blocked by `plan`
+/// because no move owned it (#180). Rolled back instead, the run stays
+/// open, so the same command resumes it.
 pub async fn abort(pool: &PgPool, migration_id: Uuid, why: &str) -> BusResult<()> {
+    let mut tx = pool.begin().await?;
     let row: Option<(Uuid, String)> = sqlx::query_as(
         "UPDATE conversation_migrations SET state = 'failed', finished_at = now(),
                 last_error = $2
@@ -559,7 +576,7 @@ pub async fn abort(pool: &PgPool, migration_id: Uuid, why: &str) -> BusResult<()
     )
     .bind(migration_id)
     .bind(why)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some((conversation_id, direction)) = row else {
         return Ok(());
@@ -576,7 +593,7 @@ pub async fn abort(pool: &PgPool, migration_id: Uuid, why: &str) -> BusResult<()
                 AND m.backend <> 'postgres'",
         )
         .bind(migration_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
     // Only if this run still owns the pause: another run may have taken the
@@ -591,9 +608,21 @@ pub async fn abort(pool: &PgPool, migration_id: Uuid, why: &str) -> BusResult<()
                    AND g.state IN ('planned', 'copying', 'verified'))",
     )
     .bind(conversation_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
+}
+
+/// Whether a conversation's writes are paused right now: what an operator
+/// is told after a move fails, instead of assuming the abort reopened it.
+pub async fn is_paused(pool: &PgPool, conversation_id: Uuid) -> BusResult<bool> {
+    let (paused,): (bool,) =
+        sqlx::query_as("SELECT write_paused_at IS NOT NULL FROM conversations WHERE id = $1")
+            .bind(conversation_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(paused)
 }
 
 /// Drop source bodies a completed move no longer needs.

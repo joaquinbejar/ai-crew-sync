@@ -383,9 +383,17 @@ pub async fn conversations_migrate(
             ),
             Err(e) => {
                 println!("FAILED: {e}");
-                println!(
-                    "      Nothing was cut over for this thread and its writes are open again. Fix the cause and run the same command: what is already verified is not copied twice."
-                );
+                // Said from the thread's real state: an abort that could not
+                // finish leaves the move open and the thread paused.
+                if matches!(migrate::is_paused(pool, p.conversation_id).await, Ok(false)) {
+                    println!(
+                        "      Nothing was cut over for this thread and its writes are open again. Fix the cause and run the same command: what is already verified is not copied twice."
+                    );
+                } else {
+                    println!(
+                        "      Nothing was cut over, but this thread is still paused under its open move. Fix the cause and run the same command: it resumes that move, copies nothing twice and reopens the thread."
+                    );
+                }
             }
         }
     }

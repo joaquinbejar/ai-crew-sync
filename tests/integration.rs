@@ -8948,6 +8948,126 @@ async fn a_conversation_moves_between_backends_and_back_without_losing_anything(
     h.shutdown().await;
 }
 
+/// A move whose abort cannot finish stays open and resumable. `abort` used
+/// to mark the run failed, blank the written-back bodies and lift the pause
+/// as three separate writes, so a failure after the first left the thread
+/// paused with no run behind the pause: every send refused, and the same
+/// command refused too because no move owned the pause (#180).
+#[tokio::test]
+async fn an_abort_that_cannot_finish_leaves_its_move_resumable() {
+    use ai_crew_sync::store::migrate::{self, Direction};
+
+    let h = require_db!("t_abort_atomic");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "moving thread", "private": true}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let cuuid: Uuid = cid.parse().unwrap();
+
+    // A move in flight: the thread paused under an open run, as `run`
+    // leaves it while it copies.
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (migration,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'copying') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let refused = call_expect_error(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "during the move", "request_id": request_id()}),
+    )
+    .await;
+    assert!(refused.contains("paused"), "{refused}");
+
+    // The abort fails on its last step, the one that reopens the thread.
+    sqlx::query(
+        "CREATE FUNCTION refuse_reopen() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_reopen BEFORE UPDATE OF write_paused_at ON conversations
+         FOR EACH ROW WHEN (OLD.write_paused_at IS NOT NULL AND NEW.write_paused_at IS NULL)
+         EXECUTE FUNCTION refuse_reopen()",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert!(
+        migrate::abort(&h.pool, migration, "the copy failed")
+            .await
+            .is_err()
+    );
+
+    // Nothing of it stuck: the run still owns the pause, and the same
+    // command resumes it instead of refusing the thread.
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM conversation_migrations WHERE id = $1")
+            .bind(migration)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "copying",
+        "the run was failed without its pause lifted"
+    );
+    assert!(migrate::is_paused(&h.pool, cuuid).await.unwrap());
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert!(plans[0].blocked.is_none(), "{:?}", plans[0].blocked);
+    assert!(plans[0].resuming, "an open run is resumed, not refused");
+
+    // With the fault gone, the abort completes all of it at once.
+    sqlx::query("DROP TRIGGER refuse_reopen ON conversations")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    migrate::abort(&h.pool, migration, "the copy failed")
+        .await
+        .unwrap();
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM conversation_migrations WHERE id = $1")
+            .bind(migration)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed");
+    assert!(!migrate::is_paused(&h.pool, cuuid).await.unwrap());
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert!(plans[0].blocked.is_none(), "{:?}", plans[0].blocked);
+    assert!(!plans[0].resuming);
+    call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "after the abort", "request_id": request_id()}),
+    )
+    .await;
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
 /// The worker path's last attempt. A backend that keeps the body and never
 /// confirms it must not end as `failed`: "we did not hear back" and "it is
 /// not there" are different facts, and only one of them is a gap.
