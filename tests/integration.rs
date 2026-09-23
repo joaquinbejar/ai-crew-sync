@@ -13908,3 +13908,201 @@ async fn an_unconfirmable_body_does_not_hold_up_the_sweep() {
     }
     h.shutdown().await;
 }
+
+/// A broker that cannot be read is reported to the MODEL in the inbox's
+/// `note`, and that note is LLM-facing text like the `unavailable` reason
+/// #171 cleaned: one class of problem, no broker internals, and nothing that
+/// asks an agent to run an operator command it has no access to (#175).
+#[tokio::test]
+async fn the_inbox_note_carries_no_broker_internals() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db_broker!("t_inbox_note");
+    let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    JetStreamBackend::provision_inbox(&config, team)
+        .await
+        .unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    let owner = connect_with_session(&h.base, &owner_token, "impl").await;
+    let dani_agent = connect(&h.base, &dani_token).await;
+    let cred = call(
+        &dani_agent,
+        "register_session",
+        json!({"session": "review"}),
+    )
+    .await;
+    let review = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "inbox note", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(
+        &review,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "still owed", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+
+    // The broker loses the team's streams. The inbox must still answer from
+    // Postgres — that part already works — and say so in a way a model can use.
+    JetStreamBackend::deprovision(&config, team).await.unwrap();
+
+    let batch = call(&review, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(
+        batch["references"].as_array().unwrap().len(),
+        1,
+        "the reference is still owed, from Postgres"
+    );
+    let note = batch["note"]
+        .as_str()
+        .expect("a broker failure is explained");
+    assert_clean_broker_note(note);
+
+    for c in [owner, dani_agent, review] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// The other failure branch: the bodies stream is there, so the backend
+/// opens, and the read of the inbox stream is what fails. Same contract for
+/// the note (#175).
+#[tokio::test]
+async fn the_inbox_note_is_clean_when_the_consumer_cannot_be_read() {
+    use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db_broker!("t_inbox_note_consumer");
+    let owner_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    sqlx::query("UPDATE teams SET default_backend = 'jetstream' WHERE id = $1")
+        .bind(team)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
+    // Bodies only: `connect` succeeds and the inbox read is what fails,
+    // which is the state a half-finished provisioning leaves behind.
+    JetStreamBackend::provision(&config, team).await.unwrap();
+    let backend = JetStreamBackend::connect(&config, team).await.unwrap();
+
+    let owner = connect_with_session(&h.base, &owner_token, "impl").await;
+    let dani_agent = connect(&h.base, &dani_token).await;
+    let cred = call(
+        &dani_agent,
+        "register_session",
+        json!({"session": "review"}),
+    )
+    .await;
+    let review = connect(&h.base, cred["session_token"].as_str().unwrap()).await;
+    let cid = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "no inbox stream", "private": true, "invite": ["dani/review"]}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(
+        &review,
+        "join_conversation",
+        json!({"conversation_id": cid}),
+    )
+    .await;
+    call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "owed as well", "request_id": request_id()}),
+    )
+    .await;
+    assert_eq!(
+        outbox::run_once(&h.pool, &backend, "worker").await.unwrap(),
+        Some(outbox::Settled::Stored)
+    );
+
+    let batch = call(&review, "fetch_conversation_inbox", json!({})).await;
+    assert_eq!(
+        batch["from_broker"], 0,
+        "the broker supplied nothing: {batch}"
+    );
+    assert_eq!(
+        batch["references"].as_array().unwrap().len(),
+        1,
+        "and the reference still arrives from Postgres: {batch}"
+    );
+    let note = batch["note"]
+        .as_str()
+        .expect("a broker failure is explained");
+    assert_clean_broker_note(note);
+    assert!(
+        !note.contains("inbox:") && !note.contains("consumer"),
+        "no broker vocabulary either: {note}"
+    );
+
+    let _ = JetStreamBackend::deprovision(&config, team).await;
+    for c in [owner, dani_agent, review] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// What an inbox note may say when the broker fails: one class of problem,
+/// what the agent should do, and nothing an operator would need.
+fn assert_clean_broker_note(note: &str) {
+    for internal in [
+        "error code",
+        "code 404",
+        "jetstream error",
+        "10059",
+        "request error",
+        "ACS_T_",
+        "ACS_I_",
+        "credential",
+    ] {
+        assert!(
+            !note.contains(internal),
+            "the inbox note leaks broker internals ({internal:?}): {note}"
+        );
+    }
+    assert!(
+        !note.contains("team stream"),
+        "the inbox note tells an agent to run an operator command: {note}"
+    );
+    assert!(
+        !note.starts_with("invalid input"),
+        "a valid call is not invalid input: {note}"
+    );
+    assert!(
+        note.contains("could not be read") && note.contains("complete"),
+        "the note says what happened and that the list is whole: {note}"
+    );
+}

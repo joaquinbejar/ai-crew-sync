@@ -675,8 +675,15 @@ pub struct InboxBatch {
     pub from_broker: i64,
     /// True when the batch filled: call again.
     pub more: bool,
-    /// Present when something is worth saying about where these came from —
-    /// an unreachable broker, a missing consumer, a team on Postgres.
+    /// Present when something is worth saying about where these references
+    /// came from: an unreachable broker, a missing consumer, a team whose
+    /// conversations live on Postgres.
+    ///
+    /// Written for you, not for an operator. It never carries backend
+    /// detail — no stream names, no error codes, no credentials — and never
+    /// asks you to run something only an operator can; that detail is in
+    /// the server log. A note is not an error and not a reason to retry:
+    /// the references beside it are the complete list either way.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub note: Option<String>,
 }

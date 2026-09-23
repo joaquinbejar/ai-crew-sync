@@ -206,6 +206,23 @@ pub async fn publish_pending(
     Ok(published)
 }
 
+/// What to tell the *model* when this team's broker cannot be read.
+///
+/// The broker's own error is written for an operator: it names the stream,
+/// the team id and the NATS status codes, and it says to provision streams
+/// the agent has no way to run. None of that belongs in a tool result, and
+/// an agent cannot act on any of it — the answer beside it is complete
+/// either way, because Postgres is the authority. So the detail goes to the
+/// log, where an operator looks for it, and the caller gets one sentence it
+/// can act on.
+fn broker_unreadable_note(error: &BusError) -> String {
+    tracing::warn!(%error, "the broker could not be read; answering from the bus's records");
+    "The broker could not be read, so these references come from the bus's own records, \
+     which are the authority: this list is complete. There is nothing for you to do about \
+     it and nothing to retry here; an operator has the detail."
+        .to_owned()
+}
+
 /// Hand the caller up to `limit` references. Nothing is acknowledged and no
 /// receipt is written here: that is [`confirm`], after the caller says it
 /// holds them durably.
@@ -255,10 +272,7 @@ pub async fn fetch(
                 Err(e) => {
                     // A missing stream or consumer is not an empty inbox.
                     // Say so, and fall through to Postgres, which has it all.
-                    note = Some(format!(
-                        "the broker could not be read ({e}); these references come from the \
-                         bus's own records, which are the authority"
-                    ));
+                    note = Some(broker_unreadable_note(&e));
                 }
             }
         }
@@ -270,7 +284,7 @@ pub async fn fetch(
                     .to_owned(),
             );
         }
-        Err(e) => note = Some(e.to_string()),
+        Err(e) => note = Some(broker_unreadable_note(&e)),
     }
 
     // Top up from Postgres: an expired reference, a deleted consumer or one
