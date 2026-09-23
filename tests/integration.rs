@@ -7703,7 +7703,7 @@ async fn the_reconciler_leaves_a_failed_publication_failed() {
 /// saying it "stays pending" (#181).
 #[tokio::test]
 async fn the_reconciler_puts_back_a_slot_the_backend_does_not_hold() {
-    use ai_crew_sync::store::backend::PostgresBackend;
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
     use ai_crew_sync::store::outbox;
 
     let h = require_db!("t_reconcile_unlease");
@@ -7715,6 +7715,28 @@ async fn the_reconciler_puts_back_a_slot_the_backend_does_not_hold() {
             .fetch_one(&h.pool)
             .await
             .unwrap();
+
+    // A backend that cannot be asked at all: the pass fails, and the slot
+    // it took is put back before the error is returned.
+    let unreachable = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fail_reconcile: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        outbox::resolve_uncertain(&h.pool, &unreachable, team)
+            .await
+            .is_err()
+    );
+    let (state, holder): (String, Option<String>) =
+        sqlx::query_as("SELECT state, leased_by FROM conversation_outbox WHERE message_id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "pending", "left held by {holder:?} after an error");
 
     let plain = PostgresBackend::new(h.pool.clone());
     assert_eq!(
