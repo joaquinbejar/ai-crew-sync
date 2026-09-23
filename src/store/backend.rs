@@ -152,6 +152,9 @@ pub struct Faults {
     pub lose_confirmation: bool,
     /// Pause inside publish, to widen the window a lease can expire in.
     pub delay: Option<Duration>,
+    /// Fail every reconcile with an error, as a backend that cannot be
+    /// asked at all.
+    pub fail_reconcile: bool,
 }
 
 impl PostgresBackend {
@@ -264,6 +267,9 @@ impl MessagingBackend for PostgresBackend {
     }
 
     async fn reconcile(&self, envelope: &Envelope) -> BusResult<Option<Locator>> {
+        if self.faults.fail_reconcile {
+            return Err(BusError::invalid("the backend could not be asked"));
+        }
         // No write: the row is already here, so "did it land" is a lookup.
         let row: Option<(Uuid,)> = sqlx::query_as(
             "SELECT m.id FROM conversation_messages m

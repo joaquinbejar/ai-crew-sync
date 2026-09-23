@@ -139,7 +139,10 @@ pub async fn lease(pool: &PgPool, worker: &str) -> BusResult<Option<Lease>> {
 }
 
 /// Take one specific slot, for reconciliation. The ordinary `lease` picks
-/// what is due; this one is told which.
+/// what is due; this one is told which. Only a slot still in flight: a
+/// `failed` one is settled and terminal, and leasing it handed it back to
+/// the ordinary path, which republished it once the lease ran out (#181).
+/// Unlike `lease`, it does not count an attempt.
 async fn lease_one(pool: &PgPool, worker: &str, message_id: Uuid) -> BusResult<Option<Lease>> {
     #[allow(clippy::type_complexity)]
     let row: Option<(Uuid, Uuid, Uuid, String, String, Uuid, i64, i32)> = sqlx::query_as(
@@ -150,6 +153,7 @@ async fn lease_one(pool: &PgPool, worker: &str, message_id: Uuid) -> BusResult<O
                 generation = o.generation + 1,
                 updated_at = now()
           WHERE o.message_id = $2
+            AND o.state IN ('pending', 'leased')
             AND (o.lease_expires_at IS NULL OR o.lease_expires_at < now())
           RETURNING o.message_id, o.conversation_id, o.team_id, o.backend, o.payload,
                     o.publish_key, o.generation, o.attempts",
@@ -423,6 +427,24 @@ async fn release(pool: &PgPool, lease: &Lease, why: &str) -> BusResult<()> {
     Ok(())
 }
 
+/// Put back a slot the reconciler took, as it was: pending, no holder, no
+/// lease. Attempts are untouched, because `lease_one` counted none (which
+/// is why this is not `release`). Fenced like every settlement, so a slot
+/// someone else holds by now is left alone.
+async fn unlease(pool: &PgPool, lease: &Lease) -> BusResult<()> {
+    sqlx::query(
+        "UPDATE conversation_outbox
+            SET state = 'pending', leased_by = NULL, lease_expires_at = NULL,
+                updated_at = now()
+          WHERE message_id = $1 AND generation = $2",
+    )
+    .bind(lease.message_id)
+    .bind(lease.generation)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// What is outstanding, for an operator and for the pause/drain controls.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct Status {
@@ -548,7 +570,8 @@ pub async fn resolve_uncertain<B: MessagingBackend>(
         "SELECT o.message_id, o.backend
            FROM conversation_outbox o
            JOIN conversation_messages m ON m.id = o.message_id
-          WHERE o.team_id = $1 AND m.uncertain_at IS NOT NULL",
+          WHERE o.team_id = $1 AND m.uncertain_at IS NOT NULL
+            AND o.state <> 'failed'",
     )
     .bind(team_id)
     .fetch_all(pool)
@@ -567,20 +590,38 @@ pub async fn resolve_uncertain<B: MessagingBackend>(
         let Some(lease) = lease_one(pool, "reconciler", message_id).await? else {
             continue;
         };
-        if let Some(locator) = backend.reconcile(&envelope_of(&lease)).await?
-            && settle(
-                pool,
-                &lease,
-                crate::store::backend::Published::Confirmed(locator),
-            )
-            .await?
-                == Settled::Stored
-        {
-            resolved += 1;
+        match backend.reconcile(&envelope_of(&lease)).await {
+            Ok(Some(locator)) => {
+                if settle(
+                    pool,
+                    &lease,
+                    crate::store::backend::Published::Confirmed(locator),
+                )
+                .await?
+                    == Settled::Stored
+                {
+                    resolved += 1;
+                }
+            }
+            // Nothing found: the write did not land, so the slot goes back
+            // to pending and the normal retry path takes it at once. Still
+            // uncertain until then, and still reported as such. Left leased,
+            // it sat out a whole lease under the reconciler's name.
+            Ok(None) => unlease(pool, &lease).await?,
+            Err(e) => {
+                // The reconcile error is the one worth reporting. If the
+                // slot cannot be put back either, it comes back on its own
+                // when the lease runs out.
+                if let Err(unlease_error) = unlease(pool, &lease).await {
+                    tracing::warn!(
+                        error = %unlease_error,
+                        slot = %lease.message_id,
+                        "could not put back a slot after a failed reconcile"
+                    );
+                }
+                return Err(e);
+            }
         }
-        // Nothing found: the write did not land, so the slot stays pending
-        // and the normal retry path takes it. Still uncertain until then,
-        // and still reported as such.
     }
     sqlx::query(
         "UPDATE conversation_messages m SET uncertain_at = NULL

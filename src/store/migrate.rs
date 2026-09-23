@@ -283,7 +283,16 @@ pub async fn run(
         Err(e) => {
             // Nothing was cut over, so nothing is half-moved: the bodies are
             // still authoritative where they were, and the thread reopens.
-            abort(pool, migration_id, &e.to_string()).await?;
+            // If the abort itself fails, the run stays open under its pause
+            // and the same command resumes it; the operator still needs the
+            // move's own error, not the abort's.
+            if let Err(abort_error) = abort(pool, migration_id, &e.to_string()).await {
+                tracing::error!(
+                    error = %abort_error,
+                    migration = %migration_id,
+                    "could not abort a failed move; it stays open and paused until resumed"
+                );
+            }
             Err(e)
         }
     }
@@ -489,8 +498,14 @@ async fn copy_and_verify(
     }
 
     // The cutover. One transaction: the messages' authority, the thread's
-    // routing, and the pause.
+    // routing, and the pause. The thread's row is taken first, in the same
+    // order as a send and as `abort`, so a cutover and an abort of the same
+    // run by two processes queue instead of deadlocking.
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE conversation_messages m
             SET backend = $3,
@@ -551,32 +566,65 @@ async fn copy_and_verify(
 }
 
 /// Give up on a move, lift the pause and leave the thread exactly as it was.
+///
+/// The run's state, the written-back bodies and the pause move together in
+/// one transaction. Written one by one, a crash between the first and the
+/// last left the run `failed` and the thread paused with no run behind the
+/// pause: every send refused, and the documented retry blocked by `plan`
+/// because no move owned it (#180). Rolled back instead, the run stays
+/// open, so the same command resumes it.
 pub async fn abort(pool: &PgPool, migration_id: Uuid, why: &str) -> BusResult<()> {
-    let row: Option<(Uuid, String)> = sqlx::query_as(
+    let mut tx = pool.begin().await?;
+    let run: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT conversation_id, direction FROM conversation_migrations WHERE id = $1",
+    )
+    .bind(migration_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((conversation_id, direction)) = run else {
+        return Ok(());
+    };
+    // The thread's row first, the order every writer of a conversation
+    // takes (a send, the pause, the cutover): taking the run and the
+    // messages before it could deadlock against a cutover of the same run
+    // by another process.
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    // Only a run still open is given up on: one that was cut over, or
+    // already failed, by another process has nothing left to undo.
+    let failed: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE conversation_migrations SET state = 'failed', finished_at = now(),
                 last_error = $2
-          WHERE id = $1 RETURNING conversation_id, direction",
+          WHERE id = $1 AND state IN ('planned', 'copying', 'verified')
+          RETURNING id",
     )
     .bind(migration_id)
     .bind(why)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    let Some((conversation_id, direction)) = row else {
+    if failed.is_none() {
         return Ok(());
-    };
+    }
     // A reverse move writes each body into its row as it copies. Nothing
-    // was cut over, so those rows are still JetStream-authoritative and the
-    // half-written local copy must not be served as if it were the body.
+    // was cut over, so those rows are still JetStream-authoritative, and a
+    // copy that never verified must not be served as if it were the body.
+    // A verified one read back identical to what the broker held, so it is
+    // kept: a move to Postgres is what an operator runs when the broker is
+    // going bad, and that copy may be the last one. The body sweep releases
+    // it once the broker confirms the same digest, and only then (#173).
     if direction == "to_postgres" {
         sqlx::query(
             "UPDATE conversation_messages m
                 SET body = ''
                FROM conversation_migration_items i
               WHERE i.migration_id = $1 AND m.id = i.message_id
-                AND m.backend <> 'postgres'",
+                AND m.backend <> 'postgres'
+                AND i.state <> 'verified'",
         )
         .bind(migration_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
     // Only if this run still owns the pause: another run may have taken the
@@ -591,9 +639,21 @@ pub async fn abort(pool: &PgPool, migration_id: Uuid, why: &str) -> BusResult<()
                    AND g.state IN ('planned', 'copying', 'verified'))",
     )
     .bind(conversation_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
+}
+
+/// Whether a conversation's writes are paused right now: what an operator
+/// is told after a move fails, instead of assuming the abort reopened it.
+pub async fn is_paused(pool: &PgPool, conversation_id: Uuid) -> BusResult<bool> {
+    let (paused,): (bool,) =
+        sqlx::query_as("SELECT write_paused_at IS NOT NULL FROM conversations WHERE id = $1")
+            .bind(conversation_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(paused)
 }
 
 /// Drop source bodies a completed move no longer needs.

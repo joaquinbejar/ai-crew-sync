@@ -7587,6 +7587,252 @@ async fn the_outbox_survives_failures_between_acceptance_and_confirmation() {
     h.shutdown().await;
 }
 
+/// A message on an asynchronously published thread whose first publication
+/// ended without an answer: its slot is back to pending and the message is
+/// marked uncertain, as `mark_uncertain` leaves it.
+async fn an_uncertain_publication(h: &Harness, team: &str) -> (Client, Uuid) {
+    use ai_crew_sync::store::outbox;
+
+    let token = seed_agent(&h.pool, team, "joaquin").await;
+    enable_conversations(&h.pool, team).await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "async thread", "private": true}),
+    )
+    .await;
+    let cuuid: Uuid = convo["id"].as_str().unwrap().parse().unwrap();
+    outbox::set_publication(&h.pool, cuuid, true).await.unwrap();
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": convo["id"], "body": "published later",
+               "request_id": request_id()}),
+    )
+    .await;
+    let mid: Uuid = sent["message_id"].as_str().unwrap().parse().unwrap();
+    let lease = outbox::lease(&h.pool, "worker-dead")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.message_id, mid);
+    outbox::mark_uncertain(&h.pool, &lease, "the process died")
+        .await
+        .unwrap();
+    (owner, mid)
+}
+
+/// A publication that settled `failed` stays failed. The reconciler used to
+/// pick every slot whose message was marked uncertain, and a message that
+/// became uncertain and then failed keeps the mark: each pass re-leased the
+/// terminal slot, and once that lease ran out the ordinary worker published
+/// it again (#181).
+#[tokio::test]
+async fn the_reconciler_leaves_a_failed_publication_failed() {
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
+    use ai_crew_sync::store::outbox::{self, Settled};
+
+    let h = require_db!("t_reconcile_failed");
+    let (owner, mid) = an_uncertain_publication(&h, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    // The retry is refused for good: the slot and the message are failed.
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let doomed = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fatal: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        outbox::run_once(&h.pool, &doomed, "worker-b")
+            .await
+            .unwrap(),
+        Some(Settled::Failed)
+    );
+
+    // A reconcile pass leaves it exactly as it is.
+    let plain = PostgresBackend::new(h.pool.clone());
+    assert_eq!(
+        outbox::resolve_uncertain(&h.pool, &plain, team)
+            .await
+            .unwrap(),
+        0
+    );
+    let (state, holder): (String, Option<String>) =
+        sqlx::query_as("SELECT state, leased_by FROM conversation_outbox WHERE message_id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed", "a settled failure was taken again");
+    assert!(holder.is_none(), "held by {holder:?}");
+
+    // And no worker is ever handed it, whatever lease it might carry.
+    sqlx::query(
+        "UPDATE conversation_outbox SET lease_expires_at = now() - interval '1 second'
+          WHERE lease_expires_at IS NOT NULL",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert!(
+        outbox::lease(&h.pool, "worker-c").await.unwrap().is_none(),
+        "a failed publication was handed out to be published again"
+    );
+    let (published,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(published, "failed");
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// A slot the reconciler takes and the backend does not hold goes straight
+/// back to pending, for the ordinary retry to take at once. It used to stay
+/// leased under the reconciler's name for a whole lease, with the comment
+/// saying it "stays pending" (#181).
+#[tokio::test]
+async fn the_reconciler_puts_back_a_slot_the_backend_does_not_hold() {
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db!("t_reconcile_unlease");
+    let (owner, mid) = an_uncertain_publication(&h, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let (attempts_before,): (i32,) =
+        sqlx::query_as("SELECT attempts FROM conversation_outbox WHERE message_id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+
+    // A backend that cannot be asked at all: the pass fails, and the slot
+    // it took is put back before the error is returned.
+    let unreachable = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fail_reconcile: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        outbox::resolve_uncertain(&h.pool, &unreachable, team)
+            .await
+            .is_err()
+    );
+    let (state, holder): (String, Option<String>) =
+        sqlx::query_as("SELECT state, leased_by FROM conversation_outbox WHERE message_id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "pending", "left held by {holder:?} after an error");
+
+    let plain = PostgresBackend::new(h.pool.clone());
+    assert_eq!(
+        outbox::resolve_uncertain(&h.pool, &plain, team)
+            .await
+            .unwrap(),
+        0,
+        "the backend holds nothing for it"
+    );
+    let (state, holder, expires, attempts): (
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        i32,
+    ) = sqlx::query_as(
+        "SELECT state, leased_by, lease_expires_at, attempts
+           FROM conversation_outbox WHERE message_id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "pending", "left held by {holder:?}");
+    assert!(
+        holder.is_none() && expires.is_none(),
+        "{holder:?} {expires:?}"
+    );
+    assert_eq!(attempts, attempts_before, "reconciling is not an attempt");
+    let (uncertain,): (bool,) =
+        sqlx::query_as("SELECT uncertain_at IS NOT NULL FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(uncertain, "still unknown until a publish answers");
+
+    // Only the backoff `mark_uncertain` set stands between it and a worker.
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let retried = outbox::lease(&h.pool, "worker-b").await.unwrap();
+    assert_eq!(retried.map(|l| l.message_id), Some(mid));
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// A reconcile that fails reports its own error, even when the slot it
+/// took cannot be put back either: that slot comes back on its own when its
+/// lease runs out, and the operator reads why the pass failed (#183 review).
+#[tokio::test]
+async fn a_reconcile_error_is_not_hidden_by_the_put_back() {
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db!("t_reconcile_error_kept");
+    let (owner, _mid) = an_uncertain_publication(&h, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    // Putting the slot back fails too.
+    sqlx::query(
+        "CREATE FUNCTION refuse_unlease() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_unlease BEFORE UPDATE ON conversation_outbox
+         FOR EACH ROW WHEN (OLD.leased_by = 'reconciler' AND NEW.leased_by IS NULL)
+         EXECUTE FUNCTION refuse_unlease()",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let unreachable = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fail_reconcile: true,
+            ..Default::default()
+        },
+    );
+    let err = outbox::resolve_uncertain(&h.pool, &unreachable, team)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("could not be asked"),
+        "the reconcile error was replaced: {err}"
+    );
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
 /// The team id, for the store-level calls above.
 async fn team_id(pool: &PgPool, slug: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM teams WHERE slug = $1")
@@ -8945,6 +9191,335 @@ async fn a_conversation_moves_between_backends_and_back_without_losing_anything(
     for c in [owner, dani] {
         let _ = c.cancel().await;
     }
+    h.shutdown().await;
+}
+
+/// A move whose abort cannot finish stays open and resumable. `abort` used
+/// to mark the run failed, blank the written-back bodies and lift the pause
+/// as three separate writes, so a failure after the first left the thread
+/// paused with no run behind the pause: every send refused, and the same
+/// command refused too because no move owned the pause (#180).
+#[tokio::test]
+async fn an_abort_that_cannot_finish_leaves_its_move_resumable() {
+    use ai_crew_sync::store::migrate::{self, Direction};
+
+    let h = require_db!("t_abort_atomic");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "moving thread", "private": true}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    let cuuid: Uuid = cid.parse().unwrap();
+
+    // A move in flight: the thread paused under an open run, as `run`
+    // leaves it while it copies.
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (migration,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'copying') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let refused = call_expect_error(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "during the move", "request_id": request_id()}),
+    )
+    .await;
+    assert!(refused.contains("paused"), "{refused}");
+
+    // The abort fails on its last step, the one that reopens the thread.
+    sqlx::query(
+        "CREATE FUNCTION refuse_reopen() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_reopen BEFORE UPDATE OF write_paused_at ON conversations
+         FOR EACH ROW WHEN (OLD.write_paused_at IS NOT NULL AND NEW.write_paused_at IS NULL)
+         EXECUTE FUNCTION refuse_reopen()",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert!(
+        migrate::abort(&h.pool, migration, "the copy failed")
+            .await
+            .is_err()
+    );
+
+    // Nothing of it stuck: the run still owns the pause, and the same
+    // command resumes it instead of refusing the thread.
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM conversation_migrations WHERE id = $1")
+            .bind(migration)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "copying",
+        "the run was failed without its pause lifted"
+    );
+    assert!(migrate::is_paused(&h.pool, cuuid).await.unwrap());
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert!(plans[0].blocked.is_none(), "{:?}", plans[0].blocked);
+    assert!(plans[0].resuming, "an open run is resumed, not refused");
+
+    // With the fault gone, the abort completes all of it at once.
+    sqlx::query("DROP TRIGGER refuse_reopen ON conversations")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    migrate::abort(&h.pool, migration, "the copy failed")
+        .await
+        .unwrap();
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM conversation_migrations WHERE id = $1")
+            .bind(migration)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed");
+    assert!(!migrate::is_paused(&h.pool, cuuid).await.unwrap());
+    let plans = migrate::plan(&h.pool, team, Direction::ToJetStream, &[cuuid])
+        .await
+        .unwrap();
+    assert!(plans[0].blocked.is_none(), "{:?}", plans[0].blocked);
+    assert!(!plans[0].resuming);
+    call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": cid, "body": "after the abort", "request_id": request_id()}),
+    )
+    .await;
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// An abort takes the thread's row before anything else, the order a send
+/// and the cutover take, so an abort and a cutover of the same run by two
+/// processes queue instead of deadlocking; and it only gives up on a run
+/// that is still open (#180 review).
+#[tokio::test]
+async fn an_abort_takes_the_thread_first_and_leaves_a_settled_run_alone() {
+    use ai_crew_sync::store::migrate;
+
+    let h = require_db!("t_abort_lock_order");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "moving thread", "private": true}),
+    )
+    .await;
+    let cuuid: Uuid = convo["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (migration,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'copying') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+
+    // Someone holds the thread, as a send or a cutover does.
+    let mut holder = h.pool.begin().await.unwrap();
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(cuuid)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    let pool = h.pool.clone();
+    let aborting =
+        tokio::spawn(async move { migrate::abort(&pool, migration, "the copy failed").await });
+    let mut parked = false;
+    for _ in 0..400 {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(holder_pid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        if waiting {
+            parked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(parked, "the abort never waited on the thread");
+
+    // Parked on the thread, the abort holds nothing a cutover would need
+    // after it: the run's row is free.
+    let mut probe = h.pool.begin().await.unwrap();
+    let free =
+        sqlx::query("SELECT id FROM conversation_migrations WHERE id = $1 FOR UPDATE NOWAIT")
+            .bind(migration)
+            .fetch_one(&mut *probe)
+            .await;
+    probe.rollback().await.unwrap();
+    holder.rollback().await.unwrap();
+    aborting.await.unwrap().unwrap();
+    assert!(
+        free.is_ok(),
+        "the abort took the run before the thread: {:?}",
+        free.err()
+    );
+    assert!(!migrate::is_paused(&h.pool, cuuid).await.unwrap());
+
+    // A run another process already cut over is not failed after the fact.
+    let (settled,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_jetstream', 'cut_over') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    migrate::abort(&h.pool, settled, "a late failure")
+        .await
+        .unwrap();
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM conversation_migrations WHERE id = $1")
+            .bind(settled)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "cut_over", "a settled run was rewritten as failed");
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// A reverse move that is given up on keeps the copies that verified. It
+/// used to blank every body it had written back, verified or not, without
+/// asking the broker, and a move to Postgres is what runs when the broker
+/// is going bad: a verified copy can be the last one (#183 review).
+#[tokio::test]
+async fn a_reverse_abort_keeps_the_copies_that_verified() {
+    use ai_crew_sync::store::migrate;
+
+    let h = require_db!("t_reverse_abort");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    enable_conversations(&h.pool, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "coming home", "private": true}),
+    )
+    .await;
+    let cuuid: Uuid = convo["id"].as_str().unwrap().parse().unwrap();
+    let mut ids = Vec::new();
+    for body in ["verified on the way back", "written but never verified"] {
+        let sent = call(
+            &owner,
+            "send_conversation_message",
+            json!({"conversation_id": convo["id"], "body": body, "request_id": request_id()}),
+        )
+        .await;
+        ids.push(
+            sent["message_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        );
+    }
+
+    // Both still broker-authoritative, both written back into their rows by
+    // a move to Postgres that stopped before the cutover: one verified,
+    // one not.
+    sqlx::query("UPDATE conversation_messages SET backend = 'jetstream' WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE conversations SET write_paused_at = now() WHERE id = $1")
+        .bind(cuuid)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (migration,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO conversation_migrations (team_id, conversation_id, direction, state)
+         VALUES ($1, $2, 'to_postgres', 'copying') RETURNING id",
+    )
+    .bind(team)
+    .bind(cuuid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    for (id, state) in [(ids[0], "verified"), (ids[1], "copied")] {
+        sqlx::query(
+            "INSERT INTO conversation_migration_items (migration_id, message_id, checksum, bytes, state)
+             VALUES ($1, $2, 'sum', 1, $3)",
+        )
+        .bind(migration)
+        .bind(id)
+        .bind(state)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+
+    migrate::abort(&h.pool, migration, "the broker went away")
+        .await
+        .unwrap();
+    let body_of = |id: Uuid| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT body FROM conversation_messages WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        body_of(ids[0]).await,
+        "verified on the way back",
+        "a verified copy was thrown away"
+    );
+    assert_eq!(
+        body_of(ids[1]).await,
+        "",
+        "an unverified copy must not be served as the body"
+    );
+
+    let _ = owner.cancel().await;
     h.shutdown().await;
 }
 
