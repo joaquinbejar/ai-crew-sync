@@ -609,7 +609,16 @@ pub async fn resolve_uncertain<B: MessagingBackend>(
             // it sat out a whole lease under the reconciler's name.
             Ok(None) => unlease(pool, &lease).await?,
             Err(e) => {
-                unlease(pool, &lease).await?;
+                // The reconcile error is the one worth reporting. If the
+                // slot cannot be put back either, it comes back on its own
+                // when the lease runs out.
+                if let Err(unlease_error) = unlease(pool, &lease).await {
+                    tracing::warn!(
+                        error = %unlease_error,
+                        slot = %lease.message_id,
+                        "could not put back a slot after a failed reconcile"
+                    );
+                }
                 return Err(e);
             }
         }

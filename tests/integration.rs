@@ -7785,6 +7785,54 @@ async fn the_reconciler_puts_back_a_slot_the_backend_does_not_hold() {
     h.shutdown().await;
 }
 
+/// A reconcile that fails reports its own error, even when the slot it
+/// took cannot be put back either: that slot comes back on its own when its
+/// lease runs out, and the operator reads why the pass failed (#183 review).
+#[tokio::test]
+async fn a_reconcile_error_is_not_hidden_by_the_put_back() {
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db!("t_reconcile_error_kept");
+    let (owner, _mid) = an_uncertain_publication(&h, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    // Putting the slot back fails too.
+    sqlx::query(
+        "CREATE FUNCTION refuse_unlease() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_unlease BEFORE UPDATE ON conversation_outbox
+         FOR EACH ROW WHEN (OLD.leased_by = 'reconciler' AND NEW.leased_by IS NULL)
+         EXECUTE FUNCTION refuse_unlease()",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let unreachable = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fail_reconcile: true,
+            ..Default::default()
+        },
+    );
+    let err = outbox::resolve_uncertain(&h.pool, &unreachable, team)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("could not be asked"),
+        "the reconcile error was replaced: {err}"
+    );
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
 /// The team id, for the store-level calls above.
 async fn team_id(pool: &PgPool, slug: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM teams WHERE slug = $1")
