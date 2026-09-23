@@ -13991,10 +13991,12 @@ async fn the_inbox_note_carries_no_broker_internals() {
 }
 
 /// The other failure branch: the bodies stream is there, so the backend
-/// opens, and the read of the inbox stream is what fails. Same contract for
-/// the note (#175).
+/// opens, and reading the team's inbox stream is what fails. Same contract
+/// for the note (#175). Every failure inside `fetch_references` lands here,
+/// and this is the one a test can reach: the durable consumer's name is
+/// derived from hex, so no caller input can make opening or reading it fail.
 #[tokio::test]
-async fn the_inbox_note_is_clean_when_the_consumer_cannot_be_read() {
+async fn the_inbox_note_is_clean_when_the_inbox_stream_is_gone() {
     use ai_crew_sync::store::jetstream::{Config, JetStreamBackend};
     use ai_crew_sync::store::outbox;
 
@@ -14009,8 +14011,10 @@ async fn the_inbox_note_is_clean_when_the_consumer_cannot_be_read() {
         .await
         .unwrap();
     let config = Config::new(nats_url()).with_limits(1_000, 16 * 1024 * 1024);
-    // Bodies only: `connect` succeeds and the inbox read is what fails,
-    // which is the state a half-finished provisioning leaves behind.
+    // Bodies only: `connect` succeeds and reading the inbox is what fails,
+    // which is the state a half-finished provisioning leaves behind. The
+    // operator text it produces names a CLI command, which is exactly what
+    // must not reach the model.
     JetStreamBackend::provision(&config, team).await.unwrap();
     let backend = JetStreamBackend::connect(&config, team).await.unwrap();
 
@@ -14102,7 +14106,11 @@ fn assert_clean_broker_note(note: &str) {
         "a valid call is not invalid input: {note}"
     );
     assert!(
-        note.contains("could not be read") && note.contains("complete"),
-        "the note says what happened and that the list is whole: {note}"
+        note.contains("could not be read") && note.contains("page is complete"),
+        "the note says what happened and that the page is whole: {note}"
+    );
+    assert!(
+        !note.contains("team stream --provision"),
+        "and never an operator command: {note}"
     );
 }

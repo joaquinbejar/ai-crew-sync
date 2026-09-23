@@ -218,8 +218,9 @@ pub async fn publish_pending(
 fn broker_unreadable_note(error: &BusError) -> String {
     tracing::warn!(%error, "the broker could not be read; answering from the bus's records");
     "The broker could not be read, so these references come from the bus's own records, \
-     which are the authority: this list is complete. There is nothing for you to do about \
-     it and nothing to retry here; an operator has the detail."
+     which are the authority: this page is complete and nothing is missing from it. There \
+     is nothing for you to do about it and nothing to retry for it; an operator has the \
+     detail. Pagination is unaffected: if `more` is true, call again for the next page."
         .to_owned()
 }
 
@@ -277,10 +278,12 @@ pub async fn fetch(
             }
         }
         Ok(AnyBackend::Postgres(_)) => {
+            // Also model-facing, so also without backend names: what the
+            // caller can act on is that nothing arrives unasked here.
             note = Some(
-                "this team's conversations are on Postgres, where readers are woken by \
-                 wait_for_conversation_updates. These references come from the bus's own \
-                 records."
+                "These references come from the bus's own records, which are the authority \
+                 for this team. Nothing is pushed to you: wait_for_conversation_updates is \
+                 how you hear about new ones without polling."
                     .to_owned(),
             );
         }
