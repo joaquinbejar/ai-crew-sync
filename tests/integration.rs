@@ -7587,6 +7587,182 @@ async fn the_outbox_survives_failures_between_acceptance_and_confirmation() {
     h.shutdown().await;
 }
 
+/// A message on an asynchronously published thread whose first publication
+/// ended without an answer: its slot is back to pending and the message is
+/// marked uncertain, as `mark_uncertain` leaves it.
+async fn an_uncertain_publication(h: &Harness, team: &str) -> (Client, Uuid) {
+    use ai_crew_sync::store::outbox;
+
+    let token = seed_agent(&h.pool, team, "joaquin").await;
+    enable_conversations(&h.pool, team).await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "async thread", "private": true}),
+    )
+    .await;
+    let cuuid: Uuid = convo["id"].as_str().unwrap().parse().unwrap();
+    outbox::set_publication(&h.pool, cuuid, true).await.unwrap();
+    let sent = call(
+        &owner,
+        "send_conversation_message",
+        json!({"conversation_id": convo["id"], "body": "published later",
+               "request_id": request_id()}),
+    )
+    .await;
+    let mid: Uuid = sent["message_id"].as_str().unwrap().parse().unwrap();
+    let lease = outbox::lease(&h.pool, "worker-dead")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.message_id, mid);
+    outbox::mark_uncertain(&h.pool, &lease, "the process died")
+        .await
+        .unwrap();
+    (owner, mid)
+}
+
+/// A publication that settled `failed` stays failed. The reconciler used to
+/// pick every slot whose message was marked uncertain, and a message that
+/// became uncertain and then failed keeps the mark: each pass re-leased the
+/// terminal slot, and once that lease ran out the ordinary worker published
+/// it again (#181).
+#[tokio::test]
+async fn the_reconciler_leaves_a_failed_publication_failed() {
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
+    use ai_crew_sync::store::outbox::{self, Settled};
+
+    let h = require_db!("t_reconcile_failed");
+    let (owner, mid) = an_uncertain_publication(&h, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+
+    // The retry is refused for good: the slot and the message are failed.
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let doomed = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fatal: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        outbox::run_once(&h.pool, &doomed, "worker-b")
+            .await
+            .unwrap(),
+        Some(Settled::Failed)
+    );
+
+    // A reconcile pass leaves it exactly as it is.
+    let plain = PostgresBackend::new(h.pool.clone());
+    assert_eq!(
+        outbox::resolve_uncertain(&h.pool, &plain, team)
+            .await
+            .unwrap(),
+        0
+    );
+    let (state, holder): (String, Option<String>) =
+        sqlx::query_as("SELECT state, leased_by FROM conversation_outbox WHERE message_id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed", "a settled failure was taken again");
+    assert!(holder.is_none(), "held by {holder:?}");
+
+    // And no worker is ever handed it, whatever lease it might carry.
+    sqlx::query(
+        "UPDATE conversation_outbox SET lease_expires_at = now() - interval '1 second'
+          WHERE lease_expires_at IS NOT NULL",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert!(
+        outbox::lease(&h.pool, "worker-c").await.unwrap().is_none(),
+        "a failed publication was handed out to be published again"
+    );
+    let (published,): (String,) =
+        sqlx::query_as("SELECT publication_state FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(published, "failed");
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
+/// A slot the reconciler takes and the backend does not hold goes straight
+/// back to pending, for the ordinary retry to take at once. It used to stay
+/// leased under the reconciler's name for a whole lease, with the comment
+/// saying it "stays pending" (#181).
+#[tokio::test]
+async fn the_reconciler_puts_back_a_slot_the_backend_does_not_hold() {
+    use ai_crew_sync::store::backend::PostgresBackend;
+    use ai_crew_sync::store::outbox;
+
+    let h = require_db!("t_reconcile_unlease");
+    let (owner, mid) = an_uncertain_publication(&h, "acme").await;
+    let team = team_id(&h.pool, "acme").await;
+    let (attempts_before,): (i32,) =
+        sqlx::query_as("SELECT attempts FROM conversation_outbox WHERE message_id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+
+    let plain = PostgresBackend::new(h.pool.clone());
+    assert_eq!(
+        outbox::resolve_uncertain(&h.pool, &plain, team)
+            .await
+            .unwrap(),
+        0,
+        "the backend holds nothing for it"
+    );
+    let (state, holder, expires, attempts): (
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        i32,
+    ) = sqlx::query_as(
+        "SELECT state, leased_by, lease_expires_at, attempts
+           FROM conversation_outbox WHERE message_id = $1",
+    )
+    .bind(mid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "pending", "left held by {holder:?}");
+    assert!(
+        holder.is_none() && expires.is_none(),
+        "{holder:?} {expires:?}"
+    );
+    assert_eq!(attempts, attempts_before, "reconciling is not an attempt");
+    let (uncertain,): (bool,) =
+        sqlx::query_as("SELECT uncertain_at IS NOT NULL FROM conversation_messages WHERE id = $1")
+            .bind(mid)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(uncertain, "still unknown until a publish answers");
+
+    // Only the backoff `mark_uncertain` set stands between it and a worker.
+    sqlx::query("UPDATE conversation_outbox SET next_attempt_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let retried = outbox::lease(&h.pool, "worker-b").await.unwrap();
+    assert_eq!(retried.map(|l| l.message_id), Some(mid));
+
+    let _ = owner.cancel().await;
+    h.shutdown().await;
+}
+
 /// The team id, for the store-level calls above.
 async fn team_id(pool: &PgPool, slug: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM teams WHERE slug = $1")
