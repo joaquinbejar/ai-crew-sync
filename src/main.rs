@@ -1412,10 +1412,10 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                                 key: key.clone(),
                             },
                         );
-                        // Only when asked. A default answers for every
-                        // directory without a .acs.toml and for every host
-                        // that starts the proxy without BUS_TOKEN, so adding
-                        // a profile must never hand out that identity on its
+                        // Only when asked. A default answers wherever no
+                        // BUS_TOKEN, no --profile / BUS_PROFILE and no
+                        // .acs.toml naming a profile applies, so adding a
+                        // profile must never hand out that identity on its
                         // own (#193).
                         if default {
                             p.default = Some(name.clone());
@@ -1429,8 +1429,9 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                     );
                     match default_after {
                         Some(d) if d == name => println!(
-                            "'{name}' is now the user default: every directory without a {} and every \
-                             client started without BUS_TOKEN acts as {agent}@{team}",
+                            "'{name}' is now the user default: wherever no BUS_TOKEN, no --profile / \
+                             BUS_PROFILE and no {} naming a profile applies, clients act as \
+                             {agent}@{team}",
                             context::PROJECT_FILE
                         ),
                         Some(d) => println!("the user default stays '{d}'"),

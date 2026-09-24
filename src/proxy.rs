@@ -738,8 +738,8 @@ async fn establish(
     // directory either: say so where the host shows the server's output.
     if resolved.source == context::Source::UserDefault {
         tracing::warn!(
-            "no .acs.toml, BUS_TOKEN or BUS_PROFILE here: this window uses the user default \
-             profile '{}'. `ai-crew-sync context profile default --clear` removes it; a \
+            "no BUS_TOKEN, no BUS_PROFILE and no .acs.toml naming a profile here: this window \
+             uses the user default profile '{}'. `ai-crew-sync context profile default --clear` removes it; a \
              project's .acs.toml selects its own",
             resolved.profile.as_deref().unwrap_or("?")
         );
