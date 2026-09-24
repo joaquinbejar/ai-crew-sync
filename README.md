@@ -195,7 +195,7 @@ make deploy                       # preflight, then docker stack deploy
 without `BUS_PUBLIC_HOST`; it also refuses when the proxy network
 (`TRAEFIK_NETWORK`, default `edge`) does not exist on the swarm. `make
 deploy-check` runs the variable checks alone and never contacts the cluster.
-Pin a full version such as `0.7.2`: each release also publishes a moving
+Pin a full version such as `0.7.3`: each release also publishes a moving
 `0.7` tag, and the preflight does not catch it.
 
 Behind a Traefik v3 proxy (`--providers.swarm`) that already terminates TLS,
@@ -1010,7 +1010,7 @@ applied but is missing in the resolved migrations"). To roll back, set
 the older version.
 
 ```bash
-export BUS_VERSION=0.7.2
+export BUS_VERSION=0.7.3
 make deploy                                    # Swarm; or, from the repository root:
 docker compose --project-directory . -f Docker/docker-compose.yml pull && make up
 ```
