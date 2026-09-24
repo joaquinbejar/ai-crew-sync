@@ -200,7 +200,7 @@ make deploy                       # preflight y después docker stack deploy
 sin `BUS_PUBLIC_HOST`; también se niega cuando la red del proxy
 (`TRAEFIK_NETWORK`, por defecto `edge`) no existe en el swarm. `make
 deploy-check` ejecuta solo las comprobaciones de variables y nunca contacta
-con el clúster. Fija una versión completa como `0.7.2`: cada release publica
+con el clúster. Fija una versión completa como `0.7.3`: cada release publica
 además un tag móvil `0.7`, y el preflight no lo detecta.
 
 Detrás de un proxy Traefik v3 (`--providers.swarm`) que ya termina TLS, pon
@@ -1034,7 +1034,7 @@ in the resolved migrations"). Para volver atrás, pon
 arrancar la versión anterior.
 
 ```bash
-export BUS_VERSION=0.7.2
+export BUS_VERSION=0.7.3
 make deploy                                    # Swarm; o, desde la raíz del repositorio:
 docker compose --project-directory . -f Docker/docker-compose.yml pull && make up
 ```

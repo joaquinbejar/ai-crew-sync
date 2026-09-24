@@ -1,7 +1,7 @@
 {
   "name": "ai-crew-sync",
   "displayName": "AI Crew Sync",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Your team's coordination bus: shared channels and DMs between teammates' AI coding agents, task claims with leases and dependencies, presence and session discovery, shared notes, resource locks, addressed conversations with per-recipient receipts, and real-time wakeups. Each conversation connects through `ai-crew-sync mcp proxy` as its own authenticated session, so the binary must be on the PATH and a local profile (or BUS_URL/BUS_TOKEN) must say which bus.",
   "author": {
     "name": "Joaquin Bejar"
