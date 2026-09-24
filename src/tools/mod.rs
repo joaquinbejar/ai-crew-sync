@@ -341,17 +341,17 @@ impl ServerHandler for Bus {
             Err(_) => false,
         };
         if enabled {
-            return Ok(rmcp::model::ListToolsResult::with_all_items(all));
+            return Ok(catalogue(all));
         }
         let optional: std::collections::HashSet<String> = Self::conversations_router()
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        Ok(rmcp::model::ListToolsResult::with_all_items(
+        Ok(catalogue(
             all.into_iter()
                 .filter(|t| !optional.contains(t.name.as_ref()))
-                .collect::<Vec<_>>(),
+                .collect(),
         ))
     }
 
@@ -366,4 +366,17 @@ impl ServerHandler for Bus {
             ))
             .await
     }
+}
+
+/// A tool catalogue as a `tools/list` result, with the SEP-2549 cache hints.
+///
+/// Protocol `2026-07-28` makes `ttlMs` and `cacheScope` required on list
+/// results, and a client on that revision rejects a list without them (it
+/// then shows the server connected with no tools at all). The catalogue
+/// depends on the caller (its team's capabilities; in the proxy, whether the
+/// window is connected yet), so it is private and never fresh: `ttlMs` 0.
+pub fn catalogue(tools: Vec<rmcp::model::Tool>) -> rmcp::model::ListToolsResult {
+    rmcp::model::ListToolsResult::with_all_items(tools)
+        .with_ttl_ms(0)
+        .with_cache_scope(rmcp::model::CacheScope::Private)
 }
