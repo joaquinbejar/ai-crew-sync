@@ -308,6 +308,102 @@ fn main_worktree_of(dot_git_file: &Path) -> Option<PathBuf> {
     common_dir.parent().map(Path::to_path_buf)
 }
 
+/// What [`keep_project_file_local`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LocalOutcome {
+    /// The entry was appended to this exclude file.
+    Added(PathBuf),
+    /// This exclude file already had it.
+    AlreadyExcluded(PathBuf),
+    /// Not inside a git repository: nothing to exclude.
+    NotARepository,
+}
+
+/// The git directory shared by every worktree of the repository holding
+/// `start`: `.git` itself, or the `commondir` a linked worktree points at.
+fn git_common_dir(start: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        let dot_git = d.join(".git");
+        if dot_git.is_dir() {
+            return Some(dot_git);
+        }
+        if dot_git.is_file() {
+            let text = std::fs::read_to_string(&dot_git).ok()?;
+            let gitdir = text.trim().strip_prefix("gitdir:")?.trim();
+            let gitdir = if Path::new(gitdir).is_absolute() {
+                PathBuf::from(gitdir)
+            } else {
+                d.join(gitdir)
+            };
+            return match std::fs::read_to_string(gitdir.join("commondir")) {
+                Ok(common) => gitdir.join(common.trim()).canonicalize().ok(),
+                // A submodule's gitdir is its own common directory.
+                Err(_) => Some(gitdir),
+            };
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Keep the project file out of git: list it in the repository's
+/// `info/exclude` (shared by linked worktrees). It names profiles from each
+/// person's own `profiles.toml`, so a committed copy only works for a team
+/// whose members all use the same profile names; local is the default.
+/// Idempotent. An exclude never hides a file git already tracks; see
+/// [`project_file_is_tracked`].
+pub fn keep_project_file_local(root: &Path) -> anyhow::Result<LocalOutcome> {
+    let Some(common) = git_common_dir(root) else {
+        return Ok(LocalOutcome::NotARepository);
+    };
+    let exclude = common.join("info").join("exclude");
+    let text = match std::fs::read_to_string(&exclude) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", exclude.display())),
+    };
+    let listed = text.lines().any(|l| {
+        let l = l.trim();
+        l == PROJECT_FILE || l == format!("/{PROJECT_FILE}") || l == format!("**/{PROJECT_FILE}")
+    });
+    if listed {
+        return Ok(LocalOutcome::AlreadyExcluded(exclude));
+    }
+    if let Some(parent) = exclude.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut add = String::new();
+    if !text.is_empty() && !text.ends_with('\n') {
+        add.push('\n');
+    }
+    add.push_str(PROJECT_FILE);
+    add.push('\n');
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)
+        .and_then(|mut f| f.write_all(add.as_bytes()))
+        .with_context(|| format!("writing {}", exclude.display()))?;
+    Ok(LocalOutcome::Added(exclude))
+}
+
+/// Whether git already tracks the project file at `root`, which an exclude
+/// cannot undo. `None` when git is not available to ask.
+pub fn project_file_is_tracked(root: &Path) -> Option<bool> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--error-unmatch", "--", PROJECT_FILE])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()
+        .map(|s| s.success())
+}
+
 pub fn write_project_file(root: &Path, cfg: &ProjectConfig) -> anyhow::Result<PathBuf> {
     let path = root.join(PROJECT_FILE);
     let text = toml::to_string_pretty(cfg).context("serialising project defaults")?;

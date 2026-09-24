@@ -124,7 +124,9 @@ To move off it:
    `ai-crew-sync admin token issue --save --repo <name>` per repository. The
    token files are the same `tokens-<team>` files the wrapper read.
 2. `ai-crew-sync context set-project --profile <name> --project <name>` in
-   each repository, and commit `.acs.toml`. It holds no secret.
+   each repository. It lists `.acs.toml` in `.git/info/exclude`: the file
+   names profiles from your own `profiles.toml`, so it stays local unless the
+   whole team uses the same profile names.
 3. Point the client at `ai-crew-sync mcp proxy` instead of the HTTP endpoint.
 4. Stop exporting `BUS_TOKEN`. Leave it exported and it still wins, which is
    the compatibility path, not a mistake.

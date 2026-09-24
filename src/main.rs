@@ -1335,11 +1335,36 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
             let path =
                 context::with_config_lock(&cfg_dir, || context::write_project_file(&dir, &cfg))?;
             println!(
-                "project defaults written to {} (profile '{}', project '{}'). Commit it: it holds no secret.",
+                "project defaults written to {} (profile '{}', project '{}')",
                 path.display(),
                 cfg.profile.as_deref().unwrap_or_default(),
                 cfg.project.as_deref().unwrap_or("-")
             );
+            // It names profiles from this machine's profiles.toml, so it is
+            // local unless a team decides otherwise (#197).
+            match context::keep_project_file_local(&dir)? {
+                context::LocalOutcome::Added(exclude) => println!(
+                    "kept local: added {} to {} (it names your local profiles; commit it only \
+                     if every teammate has profiles with the same names)",
+                    context::PROJECT_FILE,
+                    exclude.display()
+                ),
+                context::LocalOutcome::AlreadyExcluded(exclude) => println!(
+                    "kept local: {} is already listed in {}",
+                    context::PROJECT_FILE,
+                    exclude.display()
+                ),
+                context::LocalOutcome::NotARepository => {
+                    println!("not inside a git repository: nothing to exclude")
+                }
+            }
+            if context::project_file_is_tracked(&dir) == Some(true) {
+                eprintln!(
+                    "warning: git already tracks {f}, and an exclude does not hide a tracked \
+                     file. Keep it local with `git rm --cached {f}` and commit that removal",
+                    f = context::PROJECT_FILE
+                );
+            }
         }
         ContextCmd::Hook {
             binding,
