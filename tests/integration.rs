@@ -269,6 +269,46 @@ async fn connect_with_session(base: &str, token: &str, session: &str) -> Client 
         .expect("mcp handshake")
 }
 
+/// Connect the way a `2026-07-28` host does: `server/discover` and
+/// per-request metadata instead of the `initialize` handshake, so every
+/// result is held to that revision's required fields.
+async fn connect_modern<T, E, A>(transport: T) -> Client
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use rmcp::{ClientLifecycleMode, ClientServiceExt};
+    ClientConfig::default()
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .expect("server/discover")
+}
+
+/// What protocol `2026-07-28` requires of a `tools/list` and a `tools/call`
+/// result, checked on a client that negotiated it (#192).
+async fn assert_mcp_2026_07_28_results(client: &Client, tools: &[&str]) {
+    let list = client.list_tools(None).await.unwrap();
+    assert_eq!(list.ttl_ms, Some(0), "the catalogue is never fresh");
+    assert_eq!(list.cache_scope, Some(rmcp::model::CacheScope::Private));
+    assert!(list.tools.iter().any(|t| t.name == "whoami"));
+    for name in tools {
+        let result = client
+            .call_tool(CallToolRequestParams::new(name.to_string()))
+            .await
+            .unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        assert_eq!(
+            result.result_type,
+            Some(rmcp::model::ResultType::COMPLETE),
+            "{name}: {result:?}"
+        );
+    }
+}
+
 /// Call a tool and return its structured output.
 async fn call(client: &Client, name: &str, args: Value) -> Value {
     let args: serde_json::Map<String, Value> = serde_json::from_value(args).unwrap();
@@ -595,6 +635,21 @@ async fn tools_are_advertised_with_schemas() {
     }
     let _ = client2.cancel().await;
     let _ = client.cancel().await;
+}
+
+/// The same fields on the server's own replies, for a client that reaches
+/// `/mcp` directly on protocol `2026-07-28` (#192).
+#[tokio::test]
+async fn the_server_serves_the_fields_mcp_2026_07_28_requires() {
+    let h = require_db!("t_mcp_2026");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(format!("{}/mcp", h.base));
+    config.auth_header = Some(token);
+    config.allow_stateless = true;
+    let client = connect_modern(StreamableHttpClientTransport::from_config(config)).await;
+    assert_mcp_2026_07_28_results(&client, &["whoami"]).await;
+    let _ = client.cancel().await;
+    h.shutdown().await;
 }
 
 #[tokio::test]
@@ -5499,9 +5554,22 @@ async fn spawn_proxy(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> Client {
+    ClientConfig::default()
+        .serve(proxy_transport(config_dir, project_dir, args, env))
+        .await
+        .expect("proxy initialize")
+}
+
+/// The proxy binary as a stdio transport, not yet connected.
+fn proxy_transport(
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> rmcp::transport::TokioChildProcess {
     use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
     let bin = env!("CARGO_BIN_EXE_ai-crew-sync");
-    let transport = TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
+    TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
         cmd.env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", std::env::var("HOME").unwrap_or_default())
@@ -5515,11 +5583,7 @@ async fn spawn_proxy(
             cmd.env(k, v);
         }
     }))
-    .expect("spawn proxy");
-    ClientConfig::default()
-        .serve(transport)
-        .await
-        .expect("proxy initialize")
+    .expect("spawn proxy")
 }
 
 #[tokio::test]
@@ -5651,6 +5715,27 @@ async fn proxy_gives_each_conversation_its_own_session_and_forwards_as_the_profi
     for c in [a, b, direct] {
         let _ = c.cancel().await;
     }
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// A host on protocol `2026-07-28` rejects a list without `ttlMs` and
+/// `cacheScope`, and a call result without `resultType`; Claude Code 2.1.281
+/// then shows the proxy connected with no tools (#192). The forwarded result
+/// is the one at risk: it is deserialized from the bus's own reply, where
+/// the field can be absent.
+#[tokio::test]
+async fn the_proxy_serves_the_fields_mcp_2026_07_28_requires() {
+    let h = require_db!("t_proxy_mcp_2026");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let proxy = connect_modern(proxy_transport(&dir, &repo, &[], &[])).await;
+    // whoami is forwarded to the bus; session_status is answered locally.
+    assert_mcp_2026_07_28_results(&proxy, &["whoami", "session_status"]).await;
+    let _ = proxy.cancel().await;
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
 }

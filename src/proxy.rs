@@ -1484,7 +1484,17 @@ impl Proxy {
                 None,
             )),
         };
-        outcome
+        // The bus answers this proxy's client on its own negotiated
+        // revision, so a deserialized result may carry no `resultType`.
+        // Protocol `2026-07-28` requires it on every result the host
+        // reads, and absent-means-complete holds only for earlier
+        // revisions: a call the bus finished is marked complete here.
+        outcome.map(|mut result| {
+            result
+                .result_type
+                .get_or_insert(rmcp::model::ResultType::COMPLETE);
+            result
+        })
     }
 
     /// Record that the bus refused this window's credential, so
@@ -1933,7 +1943,7 @@ impl ServerHandler for Proxy {
         if let Some(c) = &self.state.read().await.connected {
             tools.extend(c.tools.iter().cloned());
         }
-        Ok(ListToolsResult::with_all_items(tools))
+        Ok(crate::tools::catalogue(tools))
     }
 
     async fn call_tool(
