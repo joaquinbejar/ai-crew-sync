@@ -586,10 +586,12 @@ pub struct SentMessage {
     /// True when the backend that holds this body had confirmed it when this
     /// reply was written. On a thread stored in Postgres that is the send's
     /// own commit, so it is always true. On a thread published through an
-    /// outbox (a team routed to JetStream) the send is accepted first and
-    /// the backend confirms moments later, so a fresh send says `false` with
-    /// `publication: "pending_publication"`: the message IS recorded and
-    /// will not be lost, do NOT send it again. Watch it settle with
+    /// outbox (a team routed to JetStream) the send is accepted and recorded
+    /// first and the backend's answer comes later, so a fresh send says
+    /// `false` with `publication: "pending_publication"`. That state is not
+    /// final: it settles as `stored`, or as `failed` if the backend refuses
+    /// the body for good. While it is pending, do NOT send the message again.
+    /// Watch it settle with
     /// `get_conversation_message` or `get_message_receipts` (`stored_at`),
     /// or repeat the call with the same `request_id`, which returns the same
     /// message with its current state.

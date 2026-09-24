@@ -362,7 +362,9 @@ impl Bus {
                        enters this message's denominator. On a team whose conversations are \
                        published to a broker a fresh send returns `stored: false` with \
                        `publication: \"pending_publication\"`: the message is recorded and \
-                       will be stored moments later, so do NOT send it again. Pass a fresh \
+                       awaiting the backend's confirmation, and it later settles as \
+                       `stored` or, if the backend refuses it for good, `failed`. Do NOT \
+                       send it again while it is pending. Pass a fresh \
                        `request_id` UUID; repeating one returns the original message with its \
                        current state, so a retry can neither double-post nor lose anything."
     )]

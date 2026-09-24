@@ -1294,9 +1294,13 @@ pub struct SendInput {
 
 /// Send into a conversation.
 ///
-/// Body, sequence, recipient snapshot, receipts and audit commit together:
-/// `stored` is true because *this transaction committed*, not because anyone
-/// has seen anything. A repeat of the same `request_id` returns the original
+/// Body, sequence, recipient snapshot, receipts and audit commit together.
+/// `stored` reports the backend's confirmation of the body, never that anyone
+/// has seen anything, and `publication` says where it stands: on a Postgres
+/// thread this commit *is* the persistence, so both say stored; on an outbox
+/// thread the commit records the message and its slot, and the reply says
+/// `pending_publication` until the worker settles it as `stored` or `failed`.
+/// A repeat of the same `request_id` returns the original
 /// message rather than making a second one, and the same key with a
 /// different body is refused instead of silently keeping the first.
 pub async fn send(
