@@ -39,7 +39,31 @@ if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
             exit 0
             ;;
         *'"no-credential"'*)
-            # This window WAS authenticated and its state is now unusable.
+            # A resumed conversation starts a new proxy while this hook runs:
+            # the old one stamped the binding closed when it exited, and the
+            # new one clears that once it has resumed the session, about a
+            # second later. Give it a bounded moment before calling the
+            # credential gone (#199).
+            # A whole number of seconds from 0 to 10, or the default 6: the
+            # hook must answer well inside its SessionStart timeout.
+            wait_secs="${BUS_RESUME_WAIT_SECS:-6}"
+            case "$wait_secs" in
+                ''|*[!0-9]*) wait_secs=6 ;;
+            esac
+            [ "$wait_secs" -gt 10 ] && wait_secs=10
+            waited=0
+            while [ "$waited" -lt "$wait_secs" ]; do
+                sleep 1
+                waited=$((waited + 1))
+                case "$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)" in
+                    *'"authenticated"'*)
+                        ai-crew-sync context hook --binding "$HOST_SESSION" --event session_start \
+                            --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true
+                        exit 0
+                        ;;
+                esac
+            done
+            # This window WAS authenticated and its state is still unusable.
             # Falling through would inject a digest read with the parent token
             # under a guessed label, which is the unproven identity this whole
             # path exists to avoid. Say so instead, and stay quiet on the bus.

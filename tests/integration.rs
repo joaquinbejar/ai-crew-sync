@@ -6560,6 +6560,109 @@ async fn five_conversations_share_a_repo_and_stay_separate() {
     h.shutdown().await;
 }
 
+/// A resumed conversation starts a new proxy while SessionStart runs: the
+/// old proxy stamped the binding closed on exit and the new one clears it a
+/// moment later. The hook waits for that instead of reporting the
+/// credential gone and loading no bus context (#199).
+#[tokio::test]
+async fn session_start_waits_for_a_resuming_proxy() {
+    let h = require_db!("t_resume_race");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-resumed")];
+    let status = || {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ai-crew-sync"))
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("BUS_CONFIG_DIR", &dir)
+            .args([
+                "context",
+                "hook",
+                "--binding",
+                "conv-resumed",
+                "--event",
+                "status",
+            ])
+            .output()
+            .expect("run context hook");
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    // The window before the resume, then its proxy exits.
+    let first = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let session = call(&first, "session_status", json!({})).await["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _ = first.cancel().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !status().contains("no-credential") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never closed: {}",
+            status()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // SessionStart begins while the binding is closed; the new proxy
+    // resumes the conversation a moment later.
+    let payload =
+        json!({"session_id": "conv-resumed", "cwd": repo.display().to_string()}).to_string();
+    let hook = {
+        let (dir, repo) = (dir.clone(), repo.clone());
+        tokio::spawn(async move { run_hook("session-start.sh", &dir, &repo, &payload, &[]).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let resumed = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let st = call(&resumed, "session_status", json!({})).await;
+    assert_eq!(
+        st["session"],
+        session.as_str(),
+        "the conversation resumed its window"
+    );
+
+    let out = hook.await.unwrap();
+    assert!(!out.contains("credential is gone"), "{out}");
+    let injected: Value = serde_json::from_str(out.trim()).expect("hook emitted JSON");
+    let context = injected["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(context.contains("agent 'joaquin'"), "{context}");
+    assert!(context.contains(&session), "{context}");
+
+    // A conversation that is really closed still says so, after the wait.
+    let _ = resumed.cancel().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !status().contains("no-credential") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never closed: {}",
+            status()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let payload =
+        json!({"session_id": "conv-resumed", "cwd": repo.display().to_string()}).to_string();
+    let out = run_hook_env(
+        "session-start.sh",
+        &dir,
+        &repo,
+        &payload,
+        &[],
+        &[("BUS_RESUME_WAIT_SECS", "1")],
+    )
+    .await;
+    assert!(out.contains("credential is gone"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
 // ------------------------------------------------- authenticated sessions --
 
 /// A session credential proves which window is calling: it is derived from an
