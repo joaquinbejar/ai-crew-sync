@@ -418,6 +418,29 @@ async fn connect_remote(
                 anyhow::anyhow!(text)
             }
         })?;
+    // The handshake now carries the bus's real version (a 0.7.0-or-older
+    // server identifies as `rmcp`, which says nothing). Skew is reported as
+    // a hint, never as a refusal: nothing here decides that two versions
+    // are incompatible — it only ends the search when something else fails.
+    let peer_info = remote.peer_info();
+    if let Some(si) = peer_info.as_ref().and_then(|i| i.server_info.as_ref()) {
+        let ours = env!("CARGO_PKG_VERSION");
+        if si.name == "ai-crew-sync" && si.version != ours {
+            tracing::warn!(
+                binary = ours,
+                bus = %si.version,
+                "this binary and the bus run different ai-crew-sync versions; \
+                 if tools fail to load or calls are refused, align the two \
+                 before debugging anything else"
+            );
+        } else if si.name != "ai-crew-sync" {
+            tracing::debug!(
+                server = %si.name,
+                version = %si.version,
+                "the bus did not identify an ai-crew-sync version (0.7.0 or older)"
+            );
+        }
+    }
     Ok(remote)
 }
 
@@ -701,21 +724,29 @@ async fn establish(
     Option<SessionProof>,
 )> {
     let resolved = context::resolve(inputs)?;
+    // Shadow warnings surface in the log (stderr): the host shows them with
+    // the server's output, and MCP stdout stays protocol-clean.
+    for w in &resolved.warnings {
+        tracing::warn!("{w}");
+    }
     // First connection: the agent token, with the label in a header, exactly
     // as any direct client would.
     // The same wording a forwarded 401 gets, so a window started with a
     // rotated token says what to do rather than "the bus did not accept the
-    // credential". The bus refuses it at connect or at whoami.
+    // credential". The bus refuses it at connect or at whoami. Provenance
+    // names where the failing credential came from without revealing it.
     let rejected = || {
         anyhow::anyhow!(
             "the bus rejected this window's credential — it has been revoked or \
-             rotated{}. Issue a new token (`ai-crew-sync admin token issue --save`) \
-             or select another approved profile",
+             rotated{}. The credential came from {}. Issue a new token \
+             (`ai-crew-sync admin token issue --save`) or select another \
+             approved profile",
             resolved
                 .profile
                 .as_deref()
                 .map(|p| format!(" (profile '{p}')"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            resolved.credential_provenance()
         )
     };
     let remote = match connect_remote(&resolved.mcp_url, &resolved.token, session, None).await {

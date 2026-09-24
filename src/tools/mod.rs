@@ -307,6 +307,15 @@ impl ServerHandler for Bus {
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         info.instructions = Some(INSTRUCTIONS.trim().to_string());
+        // The handshake names the real server, not the framework: rmcp's
+        // default (`rmcp 3.x`) told an upgrading operator nothing. With the
+        // bus version in `serverInfo`, any client — the proxy first — can
+        // point at version skew when something fails, instead of the search
+        // starting at the token and the TLS (#187).
+        let mut server_info = rmcp::model::Implementation::from_build_env();
+        server_info.name = "ai-crew-sync".to_owned();
+        server_info.version = env!("CARGO_PKG_VERSION").to_owned();
+        info.server_info = server_info;
         info
     }
 

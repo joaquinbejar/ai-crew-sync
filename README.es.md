@@ -647,6 +647,20 @@ imprime cuál ganó (`explicit`, `profile-flag`, `project-default` o
 credencial, perfil incluido: un `BUS_URL` exportado que se quedó olvidado
 manda el token del perfil a esa URL, así que quítalo al pasarte a perfiles.
 
+La precedencia no se mueve, pero ya no es invisible: cuando un `BUS_TOKEN` o
+`BUS_URL` exportado y olvidado le gana a un perfil instalado, cada comando
+imprime un aviso por stderr nombrando el perfil eclipsado (el proxy lo manda
+al log, manteniendo limpio el stdout del protocolo MCP). `context show` y
+`context verify` informan de dónde salió cada cosa — `BUS_TOKEN (environment)`,
+`--token (flag)`, o la entrada del fichero de tokens y el perfil que la
+seleccionó — y `verify` repite esa procedencia cuando el bus rechaza el token,
+de modo que el error nombra la fuente y no solo el síntoma. La credencial en
+sí nunca se imprime. Desde 0.7.1 el `serverInfo` del handshake lleva
+`ai-crew-sync` y la versión real del servidor (los servidores anteriores
+informan la del framework), y el proxy registra una pista de desalineación de
+versiones cuando su binario y el bus difieren: una pista para alinearlos,
+nunca un rechazo.
+
 Un perfil que no existe localmente es un **error**, lo nombre quien lo nombre:
 un repositorio puede sugerir un perfil, nunca definirlo, y `.acs.toml` se
 rechaza de plano si trae `url`, `token` o una ruta de tokens. Endpoints y
