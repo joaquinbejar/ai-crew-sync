@@ -1342,10 +1342,11 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
             );
             // It names profiles from this machine's profiles.toml, so it is
             // local unless a team decides otherwise (#197).
-            match context::keep_project_file_local(&dir)? {
+            // Under the same lock as the write above, so two set-project runs
+            // never both find the entry missing and append it twice.
+            match context::with_config_lock(&cfg_dir, || context::keep_project_file_local(&dir))? {
                 context::LocalOutcome::Added(exclude) => println!(
-                    "kept local: added {} to {} (it names your local profiles; commit it only \
-                     if every teammate has profiles with the same names)",
+                    "kept local: added {} to {} (it names profiles from your local profiles.toml)",
                     context::PROJECT_FILE,
                     exclude.display()
                 ),

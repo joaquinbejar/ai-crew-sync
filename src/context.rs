@@ -351,8 +351,9 @@ fn git_common_dir(start: &Path) -> Option<PathBuf> {
 /// `info/exclude` (shared by linked worktrees). It names profiles from each
 /// person's own `profiles.toml`, so a committed copy only works for a team
 /// whose members all use the same profile names; local is the default.
-/// Idempotent. An exclude never hides a file git already tracks; see
-/// [`project_file_is_tracked`].
+/// Idempotent when callers serialise it (`set-project` holds the
+/// configuration lock across the check and the append). An exclude never
+/// hides a file git already tracks; see [`project_file_is_tracked`].
 pub fn keep_project_file_local(root: &Path) -> anyhow::Result<LocalOutcome> {
     let Some(common) = git_common_dir(root) else {
         return Ok(LocalOutcome::NotARepository);
