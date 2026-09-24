@@ -1400,6 +1400,7 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                     let key = key
                         .map(|k| context::validate_name("token key", &k))
                         .transpose()?;
+                    let mut default_after = None;
                     let path = context::update_profiles(&cfg_dir, |p| {
                         p.profiles.insert(
                             name.clone(),
@@ -1411,15 +1412,36 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                                 key: key.clone(),
                             },
                         );
-                        if default || p.default.is_none() {
+                        // Only when asked. A default answers wherever no
+                        // BUS_TOKEN, no --profile / BUS_PROFILE and no
+                        // .acs.toml naming a profile applies, so adding a
+                        // profile must never hand out that identity on its
+                        // own (#193).
+                        if default {
                             p.default = Some(name.clone());
                         }
+                        default_after = p.default.clone();
                         Ok(())
                     })?;
                     println!(
                         "profile '{name}' saved in {} (expects {agent}@{team} at {url}, tokens in {tokens})",
                         path.display()
                     );
+                    match default_after {
+                        Some(d) if d == name => println!(
+                            "'{name}' is now the user default: wherever no BUS_TOKEN, no --profile / \
+                             BUS_PROFILE and no {} naming a profile applies, clients act as \
+                             {agent}@{team}",
+                            context::PROJECT_FILE
+                        ),
+                        Some(d) => println!("the user default stays '{d}'"),
+                        None => println!(
+                            "no user default is set, so only a project that names '{name}' in its {} \
+                             (or --profile / BUS_PROFILE) uses it. To make it apply everywhere else \
+                             too: `ai-crew-sync context profile default {name}`",
+                            context::PROJECT_FILE
+                        ),
+                    }
                     let tokens_path = cfg_dir.join(&tokens);
                     if !tokens_path.exists() {
                         println!(

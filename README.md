@@ -622,7 +622,7 @@ is fixed, and `context show` prints which one won (`explicit`,
 | 1 | `--token` / `BUS_TOKEN` (+ `--url` / `BUS_URL`) | Explicit credentials always win; `.acs.toml` still supplies project and channel. Given together with `--profile`, it is an error rather than a silent choice. Without a URL they connect to `http://localhost:8787/mcp`. |
 | 2 | `--profile` / `BUS_PROFILE` | Per-invocation choice; never rewrites project defaults. When a host conversation id is given (`--host-session` / `BUS_HOST_SESSION`, as the hooks do), the profile that conversation's proxy settled on counts as this choice. |
 | 3 | `.acs.toml` at the project root | Found from any nested directory; a linked git worktree inherits the main worktree's file. |
-| 4 | `default = "…"` in `profiles.toml` | User default. |
+| 4 | `default = "…"` in `profiles.toml` | User default. Set only by `profile default <name>` or `profile add --default`; adding a profile never sets it on its own. It answers wherever no `BUS_TOKEN`, no `--profile` / `BUS_PROFILE` and no `.acs.toml` naming a profile applies (a `.acs.toml` with only project or channel does not count), which includes hosts that start the proxy without `BUS_TOKEN` (Codex does); so it gives that identity to every window nothing else maps: the proxy logs a warning when it runs under it, and `session_status` reports it in `credential_from`. |
 
 `--url` / `BUS_URL` overrides the endpoint whichever source picks the
 credential, a profile included: a leftover exported `BUS_URL` sends the
@@ -726,7 +726,9 @@ profile and the project's `.acs.toml` (see above). Every remote tool appears
 as usual, plus two that never reach the bus:
 
 - `session_status` — verified agent and team, session id, **address**
-  (`agent/session`), project, role, channel. Never credentials.
+  (`agent/session`), project, role, channel, and `credential_from`: where
+  the credential came from (environment, profile flag, the project's
+  `.acs.toml`, or the user default). Never credentials.
 - `configure_session({role?, project?, channel?, profile?})` — this window
   only. Role and project are metadata: the session id, cursors, claims and
   locks are untouched. `profile` switches to another locally approved
