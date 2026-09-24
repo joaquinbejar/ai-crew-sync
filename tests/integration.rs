@@ -7833,6 +7833,131 @@ async fn a_reconcile_error_is_not_hidden_by_the_put_back() {
     h.shutdown().await;
 }
 
+/// A send's acknowledgement agrees with the message record and the receipts,
+/// on every path. On an outbox thread a fresh send is accepted before the
+/// backend confirms it: the reply says `stored: false` with
+/// `publication: "pending_publication"`, which is what a read says too, and a
+/// retry with the same `request_id` reports the state the message is in now,
+/// stored or failed, never the snapshot the first call got (#185).
+#[tokio::test]
+async fn a_send_acknowledgement_agrees_with_the_record_and_the_receipts() {
+    use ai_crew_sync::store::backend::{Faults, PostgresBackend};
+    use ai_crew_sync::store::outbox::{self, Settled};
+
+    let h = require_db!("t_send_ack");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dani_token = seed_agent(&h.pool, "acme", "dani").await;
+    enable_conversations(&h.pool, "acme").await;
+    let owner = connect_with_session(&h.base, &token, "impl").await;
+    let dani = connect_with_session(&h.base, &dani_token, "review").await;
+    let convo = call(
+        &owner,
+        "create_conversation",
+        json!({"title": "acks", "private": true, "invite": ["dani/review"]}),
+    )
+    .await;
+    let cid = convo["id"].as_str().unwrap().to_owned();
+    call(&dani, "join_conversation", json!({"conversation_id": cid})).await;
+
+    // What a read and the receipts say about one message.
+    let observed = |mid: String| {
+        let owner = &owner;
+        async move {
+            let msg = call(
+                owner,
+                "get_conversation_message",
+                json!({"message_id": mid}),
+            )
+            .await;
+            let m = msg.get("message").cloned().unwrap_or(msg);
+            let receipts = call(owner, "get_message_receipts", json!({"message_id": mid})).await;
+            (
+                m["publication"].as_str().unwrap_or_default().to_owned(),
+                receipts["receipts"][0]["stored_at"].is_string(),
+            )
+        }
+    };
+    let send = |rid: String, body: &'static str| {
+        let owner = &owner;
+        let cid = cid.clone();
+        async move {
+            call(
+                owner,
+                "send_conversation_message",
+                json!({"conversation_id": cid, "body": body, "request_id": rid}),
+            )
+            .await
+        }
+    };
+
+    // Synchronous: the send's commit is the persistence.
+    let sync = send(request_id(), "sync").await;
+    assert_eq!(sync["stored"], true, "{sync}");
+    assert_eq!(sync["publication"], "stored", "{sync}");
+    let (publication, stored_at) = observed(sync["message_id"].as_str().unwrap().into()).await;
+    assert_eq!((publication.as_str(), stored_at), ("stored", true));
+
+    // Through the outbox: accepted, not yet confirmed, and every surface
+    // says the same.
+    let cuuid: Uuid = cid.parse().unwrap();
+    outbox::set_publication(&h.pool, cuuid, true).await.unwrap();
+    let rid = request_id();
+    let fresh = send(rid.clone(), "published later").await;
+    assert_eq!(fresh["stored"], false, "{fresh}");
+    assert_eq!(fresh["publication"], "pending_publication", "{fresh}");
+    let mid = fresh["message_id"].as_str().unwrap().to_owned();
+    let (publication, stored_at) = observed(mid.clone()).await;
+    assert_eq!(
+        (publication.as_str(), stored_at),
+        ("pending_publication", false)
+    );
+    let again = send(rid.clone(), "published later").await;
+    assert_eq!(again["message_id"], fresh["message_id"]);
+    assert_eq!(again["seq"], fresh["seq"]);
+    assert_eq!(again["publication"], "pending_publication", "{again}");
+
+    // Once the backend confirms it, a retry says so: the state it is in
+    // now, not the one the first call was told.
+    let plain = PostgresBackend::new(h.pool.clone());
+    assert_eq!(
+        outbox::run_once(&h.pool, &plain, "worker").await.unwrap(),
+        Some(Settled::Stored)
+    );
+    let settled = send(rid, "published later").await;
+    assert_eq!(settled["message_id"], fresh["message_id"]);
+    assert_eq!(settled["stored"], true, "{settled}");
+    assert_eq!(settled["publication"], "stored", "{settled}");
+    let (publication, stored_at) = observed(mid).await;
+    assert_eq!((publication.as_str(), stored_at), ("stored", true));
+
+    // A publication that failed is reported as failed, not as pending.
+    let rid = request_id();
+    let doomed_send = send(rid.clone(), "never published").await;
+    assert_eq!(doomed_send["publication"], "pending_publication");
+    let doomed = PostgresBackend::with_faults(
+        h.pool.clone(),
+        Faults {
+            fatal: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        outbox::run_once(&h.pool, &doomed, "worker").await.unwrap(),
+        Some(Settled::Failed)
+    );
+    let failed = send(rid, "never published").await;
+    assert_eq!(failed["stored"], false, "{failed}");
+    assert_eq!(failed["publication"], "failed", "{failed}");
+    let (publication, stored_at) =
+        observed(doomed_send["message_id"].as_str().unwrap().into()).await;
+    assert_eq!((publication.as_str(), stored_at), ("failed", false));
+
+    for c in [owner, dani] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
 /// The team id, for the store-level calls above.
 async fn team_id(pool: &PgPool, slug: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM teams WHERE slug = $1")

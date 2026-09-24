@@ -1294,9 +1294,13 @@ pub struct SendInput {
 
 /// Send into a conversation.
 ///
-/// Body, sequence, recipient snapshot, receipts and audit commit together:
-/// `stored` is true because *this transaction committed*, not because anyone
-/// has seen anything. A repeat of the same `request_id` returns the original
+/// Body, sequence, recipient snapshot, receipts and audit commit together.
+/// `stored` reports the backend's confirmation of the body, never that anyone
+/// has seen anything, and `publication` says where it stands: on a Postgres
+/// thread this commit *is* the persistence, so both say stored; on an outbox
+/// thread the commit records the message and its slot, and the reply says
+/// `pending_publication` until the worker settles it as `stored` or `failed`.
+/// A repeat of the same `request_id` returns the original
 /// message rather than making a second one, and the same key with a
 /// different body is refused instead of silently keeping the first.
 pub async fn send(
@@ -1428,8 +1432,10 @@ pub async fn send(
             seq,
             // What the original actually is, not what the first call was
             // told. A retry of an accepted-but-unpublished message must not
-            // be handed a storage confirmation the first call did not get.
+            // be handed a storage confirmation the first call did not get,
+            // and one of a message published since is told it is stored.
             stored: publication_state == "stored",
+            publication: publication_state,
             recipients,
             created_at: ts(created_at),
         });
@@ -1567,8 +1573,15 @@ pub async fn send(
         seq,
         // Accepted is not stored. On the synchronous path they coincide
         // because this commit *is* the persistence; on the outbox path the
-        // caller is told the truth and can watch it settle.
+        // caller is told the truth, in the same words a read uses, and can
+        // watch it settle.
         stored: !asynchronous,
+        publication: if asynchronous {
+            "pending_publication"
+        } else {
+            "stored"
+        }
+        .to_owned(),
         recipients,
         created_at: ts(created_at.0),
     })

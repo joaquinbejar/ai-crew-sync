@@ -575,16 +575,33 @@ pub struct ConversationList {
     pub conversations: Vec<ConversationInfo>,
 }
 
-/// What a send returns. `stored` is a fact about persistence, not about
-/// anyone having read anything.
+/// What a send returns. `stored` and `publication` are facts about
+/// persistence at the moment of this reply, never about anyone having read
+/// anything.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SentMessage {
     pub message_id: String,
     pub conversation_id: String,
     pub seq: i64,
-    /// True when the authoritative backend confirmed persistence. This
-    /// transaction committed.
+    /// True when the backend that holds this body had confirmed it when this
+    /// reply was written. On a thread stored in Postgres that is the send's
+    /// own commit, so it is always true. On a thread published through an
+    /// outbox (a team routed to JetStream) the send is accepted and recorded
+    /// first and the backend's answer comes later, so a fresh send says
+    /// `false` with `publication: "pending_publication"`. That state is not
+    /// final: it settles as `stored`, or as `failed` if the backend refuses
+    /// the body for good. While it is pending, do NOT send the message again.
+    /// Watch it settle with
+    /// `get_conversation_message` or `get_message_receipts` (`stored_at`),
+    /// or repeat the call with the same `request_id`, which returns the same
+    /// message with its current state.
     pub stored: bool,
+    /// Where the body stands with its backend right now, in the same words
+    /// a read of the message uses: `stored`, `pending_publication`
+    /// (accepted, not yet confirmed) or `failed` (it will not be published;
+    /// the message keeps its place and the gap stays visible). `stored` is
+    /// true exactly when this is `"stored"`.
+    pub publication: String,
     /// Who the message was addressed to, snapshotted now. A later join never
     /// enters this list.
     pub recipients: Vec<String>,
