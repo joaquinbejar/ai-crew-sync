@@ -356,11 +356,15 @@ impl Bus {
 
     #[tool(
         description = "Post into a thread. Returns the message id, its logical sequence, \
-                       `stored` (the database committed — NOT that anyone read it) and the \
-                       exact list of windows it was addressed to, snapshotted now: someone \
-                       who joins later never enters this message's denominator. Pass a \
-                       fresh `request_id` UUID; repeating one returns the original message \
-                       so a retry cannot double-post."
+                       `stored` and `publication` (where the body stands with its backend \
+                       right now, NOT that anyone read it) and the exact list of windows it \
+                       was addressed to, snapshotted now: someone who joins later never \
+                       enters this message's denominator. On a team whose conversations are \
+                       published to a broker a fresh send returns `stored: false` with \
+                       `publication: \"pending_publication\"`: the message is recorded and \
+                       will be stored moments later, so do NOT send it again. Pass a fresh \
+                       `request_id` UUID; repeating one returns the original message with its \
+                       current state, so a retry can neither double-post nor lose anything."
     )]
     async fn send_conversation_message(
         &self,

@@ -1145,8 +1145,13 @@ pending_publication   aceptado, aún no confirmado — y se dice así
 failed                no se confirmará; el hueco se queda, explícito
 ```
 
-Un envío por ese camino devuelve `stored: false`, y los receipts no llevan
-`stored_at` hasta que el backend confirma. Los huecos se arriendan (60 s), se
+Un envío por ese camino devuelve `stored: false` con `publication:
+"pending_publication"`, la misma palabra que usa una lectura del mensaje, y
+los receipts no llevan `stored_at` hasta que el backend confirma. Esa
+respuesta significa aceptado y registrado, no perdido: enviarlo otra vez
+publicaría un duplicado. Repetir la llamada con el mismo `request_id` es
+seguro y devuelve el estado actual del mensaje, `stored` cuando el backend
+lo ha confirmado o `failed` si nunca lo hará. Los huecos se arriendan (60 s), se
 vencen por generación para que un worker que vuelve tras caducar su lease no
 escriba nada, se reintentan con backoff hasta ocho veces, y tienen tope de
 tamaño. El trabajo de red ocurre fuera de toda transacción: una publicación
@@ -1430,7 +1435,7 @@ create_conversation {"title": "el estado vacío", "private": true,
                      "invite": ["dani/design", "dani/review"]}
 join_conversation   {"conversation_id": "…"}           # lo ejecuta cada ventana invitada
 send_conversation_message {"conversation_id": "…", "body": "…", "request_id": "<uuid>"}
-→ {"seq": 1, "stored": true, "recipients": ["dani/design", "dani/review"], …}
+→ {"seq": 1, "stored": true, "publication": "stored", "recipients": ["dani/design", "dani/review"], …}
 ack_message {"message_id": "…"}                                         # dani/review
 ack_message {"message_id": "…", "resolved": true, "note": "hecho"}      # dani/design
 get_message_receipts {"message_id": "…"}
@@ -1440,8 +1445,8 @@ get_message_receipts {"message_id": "…"}
 **Cinco observaciones, nunca deducidas unas de otras**: `stored` (el backend
 que guarda el cuerpo lo confirmó: en un hilo de Postgres es el propio commit;
 en un hilo creado mientras el equipo estaba enrutado a JetStream el envío
-devuelve `stored: false` y `stored_at` sigue a null hasta que el broker acusa
-recibo), `delivered` (el propio proceso del destinatario dijo, con
+devuelve `stored: false` con `publication: "pending_publication"`, y
+`stored_at` sigue a null hasta que el broker acusa recibo), `delivered` (el propio proceso del destinatario dijo, con
 `confirm_inbox_delivery`, que guarda la referencia de forma duradera),
 `presented` (reservado: ningún host soportado puede confirmar que un mensaje
 llegó al modelo, así que en esta versión nada lo registra y `presented_at` es

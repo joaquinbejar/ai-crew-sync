@@ -1121,8 +1121,13 @@ pending_publication   accepted, not yet confirmed — and reported as such
 failed                it will not be confirmed; the slot stays, explicit
 ```
 
-A send on that path returns `stored: false`, and the receipts carry no
-`stored_at` until the backend confirms. Slots are leased (60 s), fenced by a
+A send on that path returns `stored: false` with `publication:
+"pending_publication"`, the same word a read of the message uses, and the
+receipts carry no `stored_at` until the backend confirms. That reply means
+accepted and recorded, not lost: sending it again would post a duplicate.
+Repeating the call with the same `request_id` is safe and returns the
+message's current state, `stored` once the backend confirmed it or `failed`
+if it never will. Slots are leased (60 s), fenced by a
 generation so a worker that comes back after its lease expired writes
 nothing, retried with backoff up to eight attempts, and bounded in payload
 size. Network-like work happens outside every database transaction: a
@@ -1395,7 +1400,7 @@ create_conversation {"title": "the empty state", "private": true,
                      "invite": ["dani/design", "dani/review"]}
 join_conversation   {"conversation_id": "…"}           # run by each invited window
 send_conversation_message {"conversation_id": "…", "body": "…", "request_id": "<uuid>"}
-→ {"seq": 1, "stored": true, "recipients": ["dani/design", "dani/review"], …}
+→ {"seq": 1, "stored": true, "publication": "stored", "recipients": ["dani/design", "dani/review"], …}
 ack_message {"message_id": "…"}                                         # dani/review
 ack_message {"message_id": "…", "resolved": true, "note": "done"}       # dani/design
 get_message_receipts {"message_id": "…"}
@@ -1405,8 +1410,8 @@ get_message_receipts {"message_id": "…"}
 **Five observations, never inferred from each other**: `stored` (the backend
 that holds the body confirmed it: on a Postgres thread that is the commit
 itself; on a thread created while the team was routed to JetStream the send
-returns `stored: false` and `stored_at` stays null until the broker
-acknowledges), `delivered` (the recipient's own process said, with
+returns `stored: false` with `publication: "pending_publication"`, and
+`stored_at` stays null until the broker acknowledges), `delivered` (the recipient's own process said, with
 `confirm_inbox_delivery`, that it holds the reference durably), `presented`
 (reserved: no supported host can confirm that a message reached the model,
 so in this release nothing records it and `presented_at` is always null),

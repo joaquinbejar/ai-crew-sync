@@ -1428,8 +1428,10 @@ pub async fn send(
             seq,
             // What the original actually is, not what the first call was
             // told. A retry of an accepted-but-unpublished message must not
-            // be handed a storage confirmation the first call did not get.
+            // be handed a storage confirmation the first call did not get,
+            // and one of a message published since is told it is stored.
             stored: publication_state == "stored",
+            publication: publication_state,
             recipients,
             created_at: ts(created_at),
         });
@@ -1567,8 +1569,15 @@ pub async fn send(
         seq,
         // Accepted is not stored. On the synchronous path they coincide
         // because this commit *is* the persistence; on the outbox path the
-        // caller is told the truth and can watch it settle.
+        // caller is told the truth, in the same words a read uses, and can
+        // watch it settle.
         stored: !asynchronous,
+        publication: if asynchronous {
+            "pending_publication"
+        } else {
+            "stored"
+        }
+        .to_owned(),
         recipients,
         created_at: ts(created_at.0),
     })
