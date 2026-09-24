@@ -603,9 +603,14 @@ Lo hacen dos ficheros locales:
   equipo y agente esperados, y *qué fichero de tokens* guarda la credencial
   (los mismos `tokens-<equipo>` que escribe `admin token issue --save`). El
   perfil no contiene ningún secreto.
-- **Valores del proyecto** — `.acs.toml` en la raíz del proyecto, commiteado
-  con el código: nombra un perfil aprobado, el proyecto lógico y,
-  opcionalmente, un `channel` por defecto y un `key` de fichero de tokens.
+- **Valores del proyecto** — `.acs.toml` en la raíz del proyecto, **local por
+  defecto**: nombra un perfil aprobado, el proyecto lógico y, opcionalmente,
+  un `channel` por defecto y un `key` de fichero de tokens. El perfil que
+  nombra vive en el `profiles.toml` de cada persona, así que `context
+  set-project` añade el fichero al `.git/info/exclude` del repositorio
+  (compartido por los worktrees enlazados) y avisa si git ya lo sigue.
+  Commitéalo solo como decisión del equipo, cuando todos tengan perfiles con
+  los mismos nombres.
   Nada más: cualquier otra clave se rechaza, y `url`, `endpoint`, `token`,
   `tokens`, `bearer` o `secret` se rechazan con un error explícito.
 

@@ -585,9 +585,13 @@ without a per-shell export or a wrapper function. Two local files do it:
   expected team and agent, and *which token file* holds the credential (the
   same `tokens-<team>` files `admin token issue --save` writes). No secret
   lives in the profile.
-- **Project defaults** — `.acs.toml` at the project root, committed with the
-  code: names an approved profile, the logical project, and optionally a
-  default `channel` and a token-file `key`. Nothing else: any other key is
+- **Project defaults** — `.acs.toml` at the project root, **local by
+  default**: names an approved profile, the logical project, and optionally a
+  default `channel` and a token-file `key`. The profile it names lives in each
+  person's own `profiles.toml`, so `context set-project` lists the file in the
+  repository's `.git/info/exclude` (shared by linked worktrees) and warns
+  when git already tracks it. Commit it only as a team decision, when every
+  member has profiles with the same names. Nothing else: any other key is
   refused, and `url`, `endpoint`, `token`, `tokens`, `bearer` or `secret` are
   refused with an explicit error.
 

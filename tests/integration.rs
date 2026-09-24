@@ -5815,6 +5815,111 @@ async fn adding_a_profile_never_makes_it_the_default_on_its_own() {
     h.shutdown().await;
 }
 
+/// `.acs.toml` names profiles from this machine's `profiles.toml`, so
+/// `set-project` keeps it out of git: it lists it in the repository's
+/// `info/exclude` (shared by linked worktrees), once, and never advises a
+/// commit (#197). Git's own global configuration is isolated, since a
+/// global ignore would hide exactly what this checks.
+#[test]
+fn set_project_keeps_the_project_file_out_of_git() {
+    let root = std::env::temp_dir().join(format!("acs-local-{}", Uuid::new_v4()));
+    let cfg = root.join("config");
+    let home = root.join("home");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let mut store = ai_crew_sync::context::Profiles::default();
+    store.profiles.insert(
+        "acme".into(),
+        ai_crew_sync::context::Profile {
+            url: "http://127.0.0.1:1".into(),
+            team: "acme".into(),
+            agent: "joaquin".into(),
+            tokens: "tokens-acme".into(),
+            key: None,
+        },
+    );
+    ai_crew_sync::context::save_profiles(&cfg, &store).unwrap();
+    let env = |cmd: &mut std::process::Command| {
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("BUS_CONFIG_DIR", &cfg);
+    };
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let mut cmd = std::process::Command::new("git");
+        env(&mut cmd);
+        let out = cmd
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let set_project = |dir: &std::path::Path| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-crew-sync"));
+        env(&mut cmd);
+        let out = cmd
+            .current_dir(dir)
+            .args(["context", "set-project", "--profile", "acme"])
+            .output()
+            .expect("run set-project");
+        assert!(out.status.success(), "{out:?}");
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+
+    let repo = root.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+
+    let (out, _) = set_project(&repo);
+    assert!(out.contains("kept local: added .acs.toml"), "{out}");
+    assert!(!out.to_lowercase().contains("commit it:"), "{out}");
+    assert!(repo.join(".acs.toml").is_file());
+    let status = git(&repo, &["status", "--porcelain", "--untracked-files=all"]);
+    assert!(!status.contains(".acs.toml"), "git sees the file: {status}");
+
+    // Again: already listed, not listed twice.
+    let (out, _) = set_project(&repo);
+    assert!(out.contains("already listed"), "{out}");
+    let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+    assert_eq!(
+        exclude.lines().filter(|l| l.trim() == ".acs.toml").count(),
+        1
+    );
+
+    // A linked worktree shares the main repository's exclude.
+    let wt = root.join("market-data-wt");
+    git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    let (out, _) = set_project(&wt);
+    assert!(out.contains("already listed"), "{out}");
+    let status = git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+    assert!(
+        !status.contains(".acs.toml"),
+        "the worktree sees the file: {status}"
+    );
+
+    // An exclude cannot hide a tracked file: say how to untrack it.
+    let tracked = root.join("tracked");
+    std::fs::create_dir_all(&tracked).unwrap();
+    git(&tracked, &["init", "-q"]);
+    std::fs::write(tracked.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    git(&tracked, &["add", ".acs.toml"]);
+    git(&tracked, &["commit", "-q", "-m", "tracked"]);
+    let (_, err) = set_project(&tracked);
+    assert!(err.contains("git rm --cached .acs.toml"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn proxy_binds_a_conversation_id_to_a_stable_session() {
     use ai_crew_sync::proxy::session_for;
