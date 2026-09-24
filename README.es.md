@@ -1853,7 +1853,7 @@ servidor con sus defaults.
 | `BUS_SESSION_TTL_SECS` | La vida que pide el proxy para su credencial de sesión (60 – 86400; por defecto las 24 h del bus). |
 | `BUS_SESSION_RENEW_LEAD_SECS` | Con cuánta antelación a que caduque la renueva el proxy (por defecto: a mitad de su vida). |
 | `BUS_DIGEST_HOURS` | Cuánto mira hacia atrás el resumen del arranque de sesión (por defecto 8). |
-| `BUS_RESUME_WAIT_SECS` | Cuánto espera el arranque de sesión a que el proxy nuevo de una conversación reanudada recupere su sesión antes de dar la credencial por perdida (por defecto 6). |
+| `BUS_RESUME_WAIT_SECS` | Cuánto espera el arranque de sesión a que el proxy nuevo de una conversación reanudada recupere su sesión antes de dar la credencial por perdida: segundos enteros de 0 a 10, por defecto 6 (cualquier otro valor vuelve a 6). |
 | `BUS_ADMIN_URL`, `BUS_ADMIN_TOKEN` | Juntas, sustituyen al fichero de `admin login` (CI). |
 
 ## Desarrollo

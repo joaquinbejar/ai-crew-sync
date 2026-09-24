@@ -44,8 +44,15 @@ if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
             # new one clears that once it has resumed the session, about a
             # second later. Give it a bounded moment before calling the
             # credential gone (#199).
+            # A whole number of seconds from 0 to 10, or the default 6: the
+            # hook must answer well inside its SessionStart timeout.
+            wait_secs="${BUS_RESUME_WAIT_SECS:-6}"
+            case "$wait_secs" in
+                ''|*[!0-9]*) wait_secs=6 ;;
+            esac
+            [ "$wait_secs" -gt 10 ] && wait_secs=10
             waited=0
-            while [ "$waited" -lt "${BUS_RESUME_WAIT_SECS:-6}" ]; do
+            while [ "$waited" -lt "$wait_secs" ]; do
                 sleep 1
                 waited=$((waited + 1))
                 case "$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)" in
