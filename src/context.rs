@@ -327,13 +327,54 @@ pub fn write_project_file(root: &Path, cfg: &ProjectConfig) -> anyhow::Result<Pa
 
 /// Everything a caller can say. Each field is `None` when not given; the
 /// binary fills them from flags and environment, tests fill them directly.
+/// Where an explicit value physically came from. Provenance for humans
+/// debugging an upgrade, never an authorization signal: precedence is
+/// decided by [`resolve`] exactly as before, whatever the origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Origin {
+    /// Typed on the command line.
+    Flag,
+    /// Inherited from the process environment.
+    Environment,
+}
+
+impl Origin {
+    /// Best-effort attribution of a clap value that may come from a flag or
+    /// an environment variable. clap does not say which one won, but it
+    /// resolves flag-over-environment; so a value equal to the live
+    /// environment variable is attributed to the environment. The one
+    /// ambiguous case — a flag typed with exactly the environment's value —
+    /// is attributed to the environment, which is harmless because both are
+    /// the same value.
+    pub fn of(env_name: &str, value: &str) -> Origin {
+        match std::env::var(env_name) {
+            Ok(v) if v == value => Origin::Environment,
+            _ => Origin::Flag,
+        }
+    }
+
+    /// How this origin reads next to the thing it qualifies, e.g.
+    /// `BUS_TOKEN (environment)` or `--token (flag)`.
+    pub fn describe(self, env_name: &str, flag: &str) -> String {
+        match self {
+            Origin::Environment => format!("{env_name} (environment)"),
+            Origin::Flag => format!("{flag} (flag)"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Inputs {
     pub config_dir: PathBuf,
     /// `--url` / `BUS_URL`.
     pub explicit_url: Option<String>,
+    /// Where `explicit_url` came from, when known.
+    pub url_origin: Option<Origin>,
     /// `--token` / `BUS_TOKEN`.
     pub explicit_token: Option<String>,
+    /// Where `explicit_token` came from, when known.
+    pub token_origin: Option<Origin>,
     /// `--session` / `BUS_SESSION`.
     pub explicit_session: Option<String>,
     /// `--profile` / `BUS_PROFILE`.
@@ -447,15 +488,62 @@ pub struct Resolved {
     pub channel: Option<String>,
     pub project_root: Option<PathBuf>,
     pub session: Option<String>,
+    /// Where the explicit token came from, when `source` is
+    /// [`Source::Explicit`] and the caller said.
+    pub token_origin: Option<Origin>,
+    /// Where the URL came from when it was explicit.
+    pub url_origin: Option<Origin>,
+    /// Configuration the winning rule silently outranked — an installed
+    /// default profile shadowed by leftover environment exports, say. Each
+    /// entry is one printable sentence with no secret in it; every entry
+    /// point shows them on stderr (or the log), never on MCP stdout.
+    pub warnings: Vec<String>,
 }
 
 impl Resolved {
+    /// Where the credential came from, in words a person debugging an
+    /// upgrade can act on. Never contains the secret.
+    pub fn credential_provenance(&self) -> String {
+        match self.source {
+            Source::Explicit => self
+                .token_origin
+                .unwrap_or(Origin::Flag)
+                .describe("BUS_TOKEN", "--token"),
+            _ => format!(
+                "entry '{}' of {} (profile '{}', {})",
+                self.token_key.as_deref().unwrap_or("?"),
+                self.tokens_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                self.profile.as_deref().unwrap_or("?"),
+                match self.source {
+                    Source::ProfileFlag => "selected by --profile / BUS_PROFILE",
+                    Source::ProjectDefault => "named by the project's .acs.toml",
+                    _ => "the user default",
+                }
+            ),
+        }
+    }
+
+    /// Where the endpoint came from. The URL itself is not a secret; what
+    /// matters is whether the profile's endpoint or an override is in use.
+    pub fn url_provenance(&self) -> String {
+        match (self.url_origin, self.source) {
+            (Some(o), _) => o.describe("BUS_URL", "--url"),
+            (None, Source::Explicit) => "the built-in default".to_owned(),
+            (None, _) => format!("profile '{}'", self.profile.as_deref().unwrap_or("?")),
+        }
+    }
+
     /// What `context show` prints: everything but the secret, which is
     /// replaced by its display prefix.
     pub fn redacted(&self) -> serde_json::Value {
         serde_json::json!({
             "mcp_url": self.mcp_url,
+            "url_from": self.url_provenance(),
             "token_prefix": format!("{}…", crate::auth::token_prefix(&self.token)),
+            "token_from": self.credential_provenance(),
             "source": self.source,
             "profile": self.profile,
             "expected_team": self.expected.as_ref().map(|e| e.0.clone()),
@@ -466,6 +554,7 @@ impl Resolved {
             "channel": self.channel,
             "project_root": self.project_root.as_ref().map(|p| p.display().to_string()),
             "session": self.session,
+            "warnings": self.warnings,
         })
     }
 }
@@ -559,6 +648,32 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
                  this window uses"
             );
         }
+        // The winner is decided; now name what it silently outranked.
+        // Leftover exports from a previous release shadowing a freshly
+        // configured profile is the normal state of an upgraded machine,
+        // and invisible precedence is what made issue #187 cost hours.
+        // Precedence itself does not move: this only reports it.
+        let token_origin = inputs.token_origin;
+        let mut warnings = Vec::new();
+        if token_origin == Some(Origin::Environment) {
+            let shadowed = match project_cfg.profile.as_deref() {
+                Some(p) => Some((p.to_owned(), "the project's .acs.toml names")),
+                // A broken profile store must not fail explicit credentials,
+                // which never needed it; it just cannot be reported on.
+                None => load_profiles(&inputs.config_dir)
+                    .ok()
+                    .and_then(|p| p.default)
+                    .map(|p| (p, "the user default is")),
+            };
+            if let Some((name, how)) = shadowed {
+                warnings.push(format!(
+                    "BUS_TOKEN (environment) is overriding profile '{name}' ({how} it): this \
+                     window authenticates with the environment token, not the profile. Unset \
+                     BUS_TOKEN and BUS_URL to use the profile, or drop the profile if the \
+                     override is intended. `ai-crew-sync context verify` shows who each one is."
+                ));
+            }
+        }
         let mcp_url = match explicit_url {
             Some(u) => mcp_url_of(&u)?,
             None => DEFAULT_MCP_URL.to_owned(),
@@ -575,6 +690,9 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
             channel: project_cfg.channel,
             project_root,
             session,
+            token_origin,
+            url_origin: inputs.url_origin,
+            warnings,
         });
     }
 
@@ -625,6 +743,15 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
 
     // The endpoint comes from the explicit flag or the profile — never from
     // the project file, which cannot even express one.
+    let mut warnings = Vec::new();
+    let url_origin = explicit_url.is_some().then_some(()).and(inputs.url_origin);
+    if let (Some(_), Some(Origin::Environment)) = (&explicit_url, inputs.url_origin) {
+        warnings.push(format!(
+            "BUS_URL (environment) is overriding profile '{name}'s endpoint: the profile's \
+             token will be presented to a different bus. Unset BUS_URL to use the profile's \
+             endpoint, or pass --url if the override is intended."
+        ));
+    }
     let mcp_url = match explicit_url {
         Some(u) => mcp_url_of(&u)?,
         None => mcp_url_of(&profile.url)?,
@@ -691,6 +818,9 @@ pub fn resolve(inputs: &Inputs) -> anyhow::Result<Resolved> {
         channel: project_cfg.channel,
         project_root,
         session,
+        token_origin: None,
+        url_origin,
+        warnings,
     })
 }
 
@@ -705,21 +835,29 @@ pub struct Verified {
 /// agent and team the profile expects. Explicit credentials, which promise
 /// nothing, are simply reported.
 pub async fn verify(resolved: &Resolved) -> anyhow::Result<Verified> {
+    // On failure the reader gets what the symptom hides: which endpoint was
+    // called and where each piece came from. The one thing never printed is
+    // the credential itself.
     let (agent, team) = crate::admin_cli::whoami_on_mcp(&resolved.mcp_url, &resolved.token)
         .await
-        .with_context(|| match &resolved.profile {
-            Some(p) => format!(
-                "profile '{p}': the bus at {} did not accept the token (entry '{}' of {}). \
-                 It may be revoked; issue a new one with `admin token issue --save`",
+        .with_context(|| {
+            let provenance = format!(
+                "endpoint {} came from {}; the credential came from {}",
                 resolved.mcp_url,
-                resolved.token_key.as_deref().unwrap_or("?"),
-                resolved
-                    .tokens_file
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
-            ),
-            None => format!("the bus at {} did not accept the token", resolved.mcp_url),
+                resolved.url_provenance(),
+                resolved.credential_provenance()
+            );
+            match &resolved.profile {
+                Some(p) => format!(
+                    "profile '{p}': the bus at {} did not accept the token. {provenance}. \
+                     It may be revoked; issue a new one with `admin token issue --save`",
+                    resolved.mcp_url
+                ),
+                None => format!(
+                    "the bus at {} did not accept the token. {provenance}",
+                    resolved.mcp_url
+                ),
+            }
         })?;
     if let Some((exp_team, exp_agent)) = &resolved.expected
         && (&agent != exp_agent || &team != exp_team)
@@ -824,6 +962,135 @@ mod tests {
             r.project_root.as_deref(),
             Some(repo.canonicalize().unwrap().as_path())
         );
+    }
+
+    #[test]
+    fn environment_shadowing_a_profile_is_warned_never_reordered() {
+        let dir = tmp("shadow");
+        seed(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // An environment token over an installed user default: the token
+        // still wins (precedence untouched) and the shadow is named.
+        let mut i = inputs(&dir, &repo);
+        i.explicit_token = Some("acs_leftover".into());
+        i.token_origin = Some(Origin::Environment);
+        let r = resolve(&i).unwrap();
+        assert_eq!(r.source, Source::Explicit, "precedence must not move");
+        assert_eq!(r.token, "acs_leftover");
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("BUS_TOKEN (environment)"));
+        assert!(
+            r.warnings[0].contains("profile 'acme'"),
+            "{}",
+            r.warnings[0]
+        );
+        assert!(
+            !r.warnings[0].contains("acs_leftover"),
+            "a warning never carries the secret"
+        );
+
+        // The same token typed as a flag shadows nothing worth warning on:
+        // the operator said it out loud.
+        let mut i = inputs(&dir, &repo);
+        i.explicit_token = Some("acs_leftover".into());
+        i.token_origin = Some(Origin::Flag);
+        assert!(resolve(&i).unwrap().warnings.is_empty());
+
+        // A project file naming a profile is reported over the user default.
+        std::fs::write(repo.join(PROJECT_FILE), "profile = \"other\"\n").unwrap();
+        let mut i = inputs(&dir, &repo);
+        i.explicit_token = Some("acs_leftover".into());
+        i.token_origin = Some(Origin::Environment);
+        let r = resolve(&i).unwrap();
+        assert!(
+            r.warnings[0].contains("profile 'other'"),
+            "{}",
+            r.warnings[0]
+        );
+
+        // No profile anywhere: an explicit token shadows nothing.
+        let bare = tmp("shadow-bare");
+        let mut i = inputs(&bare, &repo.join("..")); // no seed: empty config
+        i.explicit_token = Some("acs_leftover".into());
+        i.token_origin = Some(Origin::Environment);
+        assert!(resolve(&i).unwrap().warnings.is_empty());
+    }
+
+    #[test]
+    fn bus_url_from_the_environment_over_a_profile_is_warned() {
+        let dir = tmp("shadow-url");
+        seed(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut i = inputs(&dir, &repo);
+        i.explicit_url = Some("https://elsewhere.example".into());
+        i.url_origin = Some(Origin::Environment);
+        let r = resolve(&i).unwrap();
+        assert_eq!(r.mcp_url, "https://elsewhere.example/mcp");
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("BUS_URL (environment)"));
+        assert!(
+            r.warnings[0].contains("profile 'acme'"),
+            "{}",
+            r.warnings[0]
+        );
+        assert!(r.url_provenance().contains("BUS_URL (environment)"));
+
+        // The same override typed as a flag is intentional: no warning.
+        let mut i = inputs(&dir, &repo);
+        i.explicit_url = Some("https://elsewhere.example".into());
+        i.url_origin = Some(Origin::Flag);
+        assert!(resolve(&i).unwrap().warnings.is_empty());
+    }
+
+    #[test]
+    fn provenance_names_the_source_without_the_secret() {
+        let dir = tmp("provenance");
+        seed(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Profile path: entry, file and what selected the profile.
+        let r = resolve(&inputs(&dir, &repo)).unwrap();
+        let p = r.credential_provenance();
+        assert!(p.contains("entry '_base'"), "{p}");
+        assert!(p.contains("tokens-acme"), "{p}");
+        assert!(p.contains("profile 'acme'"), "{p}");
+        assert!(p.contains("user default"), "{p}");
+        assert!(!p.contains("acs_base00000000"), "never the secret: {p}");
+        assert!(r.url_provenance().contains("profile 'acme'"));
+
+        // Explicit path: the origin, or the flag when unsaid. The fake
+        // token is full-length so the 12-character display prefix does not
+        // accidentally equal the whole secret.
+        let secret = "acs_explicit0secret0secret0secret0secret";
+        let mut i = inputs(&dir, &repo);
+        i.explicit_token = Some(secret.into());
+        i.token_origin = Some(Origin::Environment);
+        let r = resolve(&i).unwrap();
+        assert_eq!(r.credential_provenance(), "BUS_TOKEN (environment)");
+        assert_eq!(r.url_provenance(), "the built-in default");
+
+        // Serialized view carries the same, still without the secret.
+        let view = r.redacted();
+        assert_eq!(view["token_from"], "BUS_TOKEN (environment)");
+        assert!(!view.to_string().contains(secret));
+    }
+
+    #[test]
+    fn origin_of_an_unset_variable_is_the_flag() {
+        assert_eq!(
+            Origin::of("ACS_TEST_UNSET_VARIABLE_187", "acs_x"),
+            Origin::Flag
+        );
+        assert_eq!(
+            Origin::Environment.describe("BUS_TOKEN", "--token"),
+            "BUS_TOKEN (environment)"
+        );
+        assert_eq!(Origin::Flag.describe("BUS_URL", "--url"), "--url (flag)");
     }
 
     #[test]

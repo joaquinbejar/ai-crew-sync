@@ -628,6 +628,19 @@ is fixed, and `context show` prints which one won (`explicit`,
 credential, a profile included: a leftover exported `BUS_URL` sends the
 profile's token to that URL, so unset it when switching to profiles.
 
+Precedence never moves, but it is no longer invisible: when a leftover
+`BUS_TOKEN` or `BUS_URL` export outranks an installed profile, every command
+prints a warning on stderr naming the shadowed profile (the proxy logs it,
+keeping MCP stdout protocol-clean). `context show` and `context verify`
+report where the endpoint and the credential each came from —
+`BUS_TOKEN (environment)`, `--token (flag)`, or the token-file entry and the
+profile that selected it — and `verify` repeats that provenance when the bus
+refuses the token, so the error names the source instead of only the
+symptom. The credential itself is never printed. Since 0.7.1 the handshake's
+`serverInfo` carries `ai-crew-sync` and the server's real version (older
+servers report the framework's), and the proxy logs a version-skew hint when
+its binary and the bus differ — a hint to align them, not a refusal.
+
 A profile that does not exist locally is an **error**, whatever named it: a
 repository can suggest a profile, never define one, and `.acs.toml` is refused
 outright if it carries `url`, `token` or a tokens path. Endpoints and

@@ -451,12 +451,30 @@ impl ContextSelect {
         Ok(context::Inputs {
             config_dir: context::config_dir()?,
             explicit_url: self.url.clone(),
+            // clap resolved flag-over-environment already; this only records
+            // which one supplied the value, for provenance in diagnostics.
+            url_origin: self
+                .url
+                .as_deref()
+                .map(|v| context::Origin::of("BUS_URL", v)),
             explicit_token: self.token.clone(),
+            token_origin: self
+                .token
+                .as_deref()
+                .map(|v| context::Origin::of("BUS_TOKEN", v)),
             explicit_session: self.session.clone(),
             profile: self.profile.clone(),
             project_dir: self.project_dir.clone(),
             host_session: self.host_session.clone(),
         })
+    }
+}
+
+/// Show resolution warnings without touching stdout, which for the proxy is
+/// the MCP protocol stream and for every command is the parseable answer.
+fn warn_context(resolved: &context::Resolved) {
+    for w in &resolved.warnings {
+        eprintln!("warning: {w}");
     }
 }
 
@@ -1233,17 +1251,18 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
     match cmd {
         ContextCmd::Show { select, json } => {
             let resolved = context::resolve(&select.inputs()?)?;
+            warn_context(&resolved);
             let view = resolved.redacted();
             if json {
                 println!("{}", serde_json::to_string_pretty(&view)?);
                 return Ok(());
             }
             let s = |k: &str| view[k].as_str().unwrap_or("-").to_owned();
-            println!("endpoint {}", s("mcp_url"));
+            println!("endpoint {} (from {})", s("mcp_url"), s("url_from"));
             println!(
-                "credentials {} ({})",
+                "credentials {} (from {})",
                 s("token_prefix"),
-                view["source"].as_str().unwrap_or("?")
+                s("token_from")
             );
             println!("profile {}", s("profile"));
             match (
@@ -1265,24 +1284,11 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
         }
         ContextCmd::Verify { select } => {
             let resolved = context::resolve(&select.inputs()?)?;
+            warn_context(&resolved);
             let v = context::verify(&resolved).await?;
-            println!(
-                "ok: {}@{} at {} ({}{})",
-                v.agent,
-                v.team,
-                resolved.mcp_url,
-                match resolved.source {
-                    context::Source::Explicit => "explicit credentials".to_owned(),
-                    context::Source::ProfileFlag => "profile from --profile".to_owned(),
-                    context::Source::ProjectDefault => "project default".to_owned(),
-                    context::Source::UserDefault => "user default profile".to_owned(),
-                },
-                resolved
-                    .profile
-                    .as_deref()
-                    .map(|p| format!(": '{p}'"))
-                    .unwrap_or_default()
-            );
+            println!("ok: {}@{} at {}", v.agent, v.team, resolved.mcp_url);
+            println!("  endpoint from {}", resolved.url_provenance());
+            println!("  credential from {}", resolved.credential_provenance());
         }
         ContextCmd::SetProject {
             profile,

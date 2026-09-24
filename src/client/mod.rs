@@ -327,12 +327,24 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
     let resolved = crate::context::resolve(&crate::context::Inputs {
         config_dir: crate::context::config_dir()?,
         explicit_url: args.url.clone(),
+        url_origin: args
+            .url
+            .as_deref()
+            .map(|v| crate::context::Origin::of("BUS_URL", v)),
         explicit_token: args.token.clone(),
+        token_origin: args
+            .token
+            .as_deref()
+            .map(|v| crate::context::Origin::of("BUS_TOKEN", v)),
         explicit_session: args.session.clone(),
         profile: args.profile.clone(),
         project_dir: args.project_dir.clone(),
         host_session: args.host_session.clone(),
     })?;
+    // Shadow warnings go to stderr: stdout is the command's parseable answer.
+    for w in &resolved.warnings {
+        eprintln!("warning: {w}");
+    }
     let mut config = StreamableHttpClientTransportConfig::with_uri(resolved.mcp_url.clone());
     config.auth_header = Some(resolved.token.clone());
     config.allow_stateless = true;

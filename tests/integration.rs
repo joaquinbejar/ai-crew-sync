@@ -15308,3 +15308,93 @@ async fn two_creates_of_one_key_race_to_a_conflict() {
     let _ = joaquin.cancel().await;
     h.shutdown().await;
 }
+
+#[tokio::test]
+async fn the_handshake_names_the_bus_and_its_version() {
+    let h = require_db!("t_handshake_version");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+
+    // Any client — the 0.6.1 plugin's direct HTTP shape included — learns
+    // the real server and version from `initialize`, not the framework's
+    // name. This is what lets a failure later point at version skew
+    // instead of starting the search at the token and the TLS (#187).
+    let client = connect(&h.base, &token).await;
+    let info = client.peer_info().expect("initialize result");
+    let si = info
+        .server_info
+        .as_ref()
+        .expect("serverInfo is present in the handshake");
+    assert_eq!(si.name, "ai-crew-sync");
+    assert_eq!(si.version, env!("CARGO_PKG_VERSION"));
+
+    let _ = client.cancel().await;
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn verify_failure_names_url_and_credential_provenance() {
+    let h = require_db!("t_verify_provenance");
+    let _ = seed_agent(&h.pool, "acme", "joaquin").await;
+
+    // A leftover environment token from a previous release: the bus refuses
+    // it, and the error must say where the credential and the URL came
+    // from — without printing the credential.
+    let bad = "acs_0000000000000000000000000000000000000000000000000000000000000000";
+    let resolved = ai_crew_sync::context::Resolved {
+        mcp_url: format!("{}/mcp", h.base),
+        token: bad.to_owned(),
+        source: ai_crew_sync::context::Source::Explicit,
+        profile: None,
+        expected: None,
+        tokens_file: None,
+        token_key: None,
+        project: None,
+        channel: None,
+        project_root: None,
+        session: None,
+        token_origin: Some(ai_crew_sync::context::Origin::Environment),
+        url_origin: Some(ai_crew_sync::context::Origin::Environment),
+        warnings: Vec::new(),
+    };
+    let err = format!(
+        "{:#}",
+        ai_crew_sync::context::verify(&resolved)
+            .await
+            .expect_err("a wrong token must not verify")
+    );
+    assert!(err.contains(&format!("{}/mcp", h.base)), "{err}");
+    assert!(err.contains("BUS_TOKEN (environment)"), "{err}");
+    assert!(err.contains("BUS_URL (environment)"), "{err}");
+    assert!(!err.contains(bad), "the credential never crosses: {err}");
+
+    // The same refusal through a profile names the entry and the file the
+    // operator has to fix, still never the secret.
+    let resolved = ai_crew_sync::context::Resolved {
+        mcp_url: format!("{}/mcp", h.base),
+        token: bad.to_owned(),
+        source: ai_crew_sync::context::Source::UserDefault,
+        profile: Some("acme".into()),
+        expected: Some(("acme".into(), "joaquin".into())),
+        tokens_file: Some(std::path::PathBuf::from("/tmp/tokens-acme")),
+        token_key: Some("_base".into()),
+        project: None,
+        channel: None,
+        project_root: None,
+        session: None,
+        token_origin: None,
+        url_origin: None,
+        warnings: Vec::new(),
+    };
+    let err = format!(
+        "{:#}",
+        ai_crew_sync::context::verify(&resolved)
+            .await
+            .expect_err("a wrong token must not verify")
+    );
+    assert!(err.contains("entry '_base'"), "{err}");
+    assert!(err.contains("tokens-acme"), "{err}");
+    assert!(err.contains("profile 'acme'"), "{err}");
+    assert!(!err.contains(bad), "{err}");
+
+    h.shutdown().await;
+}
