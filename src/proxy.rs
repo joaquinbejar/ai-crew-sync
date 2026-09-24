@@ -295,6 +295,10 @@ pub struct Status {
     pub role: Option<String>,
     pub channel: Option<String>,
     pub profile: Option<String>,
+    /// Where this window's credential came from: the environment, a
+    /// profile flag, the project's .acs.toml, or the user default. Never
+    /// the credential itself.
+    pub credential_from: Option<String>,
     pub binding: Binding,
     pub project_root: Option<String>,
     pub bus: Option<String>,
@@ -344,7 +348,8 @@ fn local_tools() -> Vec<Tool> {
             STATUS_TOOL,
             "Who this window is on the bus (verified agent and team), its session id and \
              address (`agent/session`, what teammates use to reach exactly this window), \
-             project, role and default channel. Never returns credentials.",
+             project, role, default channel, and where its credential came from \
+             (`credential_from`). Never returns credentials.",
             schema_of::<EmptyArgs>(),
         )
         .with_title("Session status")
@@ -728,6 +733,16 @@ async fn establish(
     // the server's output, and MCP stdout stays protocol-clean.
     for w in &resolved.warnings {
         tracing::warn!("{w}");
+    }
+    // Nothing outranked anything, but the identity was not chosen for this
+    // directory either: say so where the host shows the server's output.
+    if resolved.source == context::Source::UserDefault {
+        tracing::warn!(
+            "no .acs.toml, BUS_TOKEN or BUS_PROFILE here: this window uses the user default \
+             profile '{}'. `ai-crew-sync context profile default --clear` removes it; a \
+             project's .acs.toml selects its own",
+            resolved.profile.as_deref().unwrap_or("?")
+        );
     }
     // First connection: the agent token, with the label in a header, exactly
     // as any direct client would.
@@ -1130,6 +1145,7 @@ impl Proxy {
             role: st.role.clone(),
             channel: st.channel.clone(),
             profile: c.and_then(|c| c.resolved.profile.clone()),
+            credential_from: c.map(|c| c.resolved.credential_provenance()),
             binding: st.binding,
             project_root: c
                 .and_then(|c| c.resolved.project_root.as_ref())

@@ -467,7 +467,8 @@ pub enum Source {
     ProfileFlag,
     /// `.acs.toml` at the project root.
     ProjectDefault,
-    /// `default = "…"` in the profile store.
+    /// `default = "…"` in the profile store. Only `profile default` or
+    /// `profile add --default` sets it.
     UserDefault,
 }
 
@@ -520,7 +521,7 @@ impl Resolved {
                 match self.source {
                     Source::ProfileFlag => "selected by --profile / BUS_PROFILE",
                     Source::ProjectDefault => "named by the project's .acs.toml",
-                    _ => "the user default",
+                    _ => "the user default, which applies wherever no .acs.toml names a profile",
                 }
             ),
         }

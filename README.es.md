@@ -641,7 +641,7 @@ imprime cuál ganó (`explicit`, `profile-flag`, `project-default` o
 | 1 | `--token` / `BUS_TOKEN` (+ `--url` / `BUS_URL`) | Las credenciales explícitas siempre ganan; `.acs.toml` sigue aportando proyecto y canal. Junto con `--profile` es un error, no una elección silenciosa. Sin URL se conectan a `http://localhost:8787/mcp`. |
 | 2 | `--profile` / `BUS_PROFILE` | Elección por invocación; nunca reescribe los valores del proyecto. Cuando se da un id de conversación del host (`--host-session` / `BUS_HOST_SESSION`, como hacen los hooks), el perfil en el que se quedó el proxy de esa conversación cuenta como esta elección. |
 | 3 | `.acs.toml` en la raíz del proyecto | Se encuentra desde cualquier subdirectorio; un worktree enlazado hereda el fichero del worktree principal. |
-| 4 | `default = "…"` en `profiles.toml` | Valor por defecto del usuario. |
+| 4 | `default = "…"` en `profiles.toml` | Valor por defecto del usuario. Solo lo fijan `profile default <nombre>` o `profile add --default`; añadir un perfil nunca lo fija por sí solo. Responde en todo directorio cuyo `.acs.toml` no nombre un perfil y en todo cliente que arranque el proxy sin `BUS_TOKEN` (Codex lo hace), así que da esa identidad a toda ventana que nada más asigne: el proxy registra un aviso cuando se ejecuta con él, y `session_status` lo indica en `credential_from`. |
 
 `--url` / `BUS_URL` sustituye el endpoint sea cual sea la fuente que elige la
 credencial, perfil incluido: un `BUS_URL` exportado que se quedó olvidado
@@ -746,7 +746,9 @@ perfil local y del `.acs.toml` del proyecto (más arriba). Aparecen todos los
 tools remotos y dos que nunca llegan al bus:
 
 - `session_status` — agente y equipo verificados, id de sesión, **dirección**
-  (`agente/sesión`), proyecto, rol y canal. Nunca credenciales.
+  (`agente/sesión`), proyecto, rol, canal y `credential_from`: de dónde
+  salió la credencial (entorno, selector de perfil, el `.acs.toml` del
+  proyecto o el valor por defecto del usuario). Nunca credenciales.
 - `configure_session({role?, project?, channel?, profile?})` — solo esta
   ventana. Rol y proyecto son metadatos: el id de sesión, los cursores, los
   claims y los locks no se tocan. `profile` cambia a otra credencial aprobada

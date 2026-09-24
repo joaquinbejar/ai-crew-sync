@@ -5740,6 +5740,81 @@ async fn the_proxy_serves_the_fields_mcp_2026_07_28_requires() {
     h.shutdown().await;
 }
 
+/// Adding a profile never makes it the user default on its own (#193): a
+/// default answers for every directory without a .acs.toml and for every
+/// host that starts the proxy without BUS_TOKEN. When a default is set on
+/// purpose, what runs under it says so.
+#[tokio::test]
+async fn adding_a_profile_never_makes_it_the_default_on_its_own() {
+    let h = require_db!("t_profile_default");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = std::env::temp_dir().join(format!("acs-profiles-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tokens-acme"), format!("_base={token}\n")).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ai-crew-sync");
+    let run = |args: &[&str], cwd: &std::path::Path| {
+        let out = std::process::Command::new(bin)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("BUS_CONFIG_DIR", &dir)
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("run ai-crew-sync");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let add = |name: &str, extra: &[&str]| {
+        let mut args = vec![
+            "context", "profile", "add", "--name", name, "--url", &h.base, "--team", "acme",
+            "--agent", "joaquin",
+        ];
+        args.extend_from_slice(extra);
+        run(&args, &dir)
+    };
+    let default = || ai_crew_sync::context::load_profiles(&dir).unwrap().default;
+
+    // The first profile on an empty store: saved, and nothing else.
+    let out = add("first", &[]);
+    assert!(out.contains("no user default is set"), "{out}");
+    assert_eq!(default(), None, "the first profile became the default");
+
+    // Asked for: it is the default, and the output says what that means.
+    let out = add("chosen", &["--default"]);
+    assert!(out.contains("'chosen' is now the user default"), "{out}");
+    assert_eq!(default().as_deref(), Some("chosen"));
+
+    // Another profile leaves the chosen default alone.
+    let out = add("later", &[]);
+    assert!(out.contains("the user default stays 'chosen'"), "{out}");
+    assert_eq!(default().as_deref(), Some("chosen"));
+
+    // Somewhere no .acs.toml names a profile, the default applies, and
+    // both `context show` and the proxy's own status name it as the source.
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let shown = run(&["context", "show"], &elsewhere);
+    assert!(
+        shown.contains("the user default, which applies wherever no .acs.toml names a profile"),
+        "{shown}"
+    );
+    let proxy = spawn_proxy(&dir, &elsewhere, &[], &[]).await;
+    let status = call(&proxy, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    assert_eq!(status["profile"], "chosen");
+    assert!(
+        status["credential_from"]
+            .as_str()
+            .is_some_and(|s| s.contains("the user default")),
+        "{status}"
+    );
+
+    let _ = proxy.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn proxy_binds_a_conversation_id_to_a_stable_session() {
     use ai_crew_sync::proxy::session_for;
