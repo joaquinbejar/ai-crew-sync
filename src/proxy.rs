@@ -1447,8 +1447,35 @@ impl Proxy {
         request: CallToolRequestParams,
         host_ct: CancellationToken,
     ) -> Result<CallToolResult, ErrorData> {
+        self.forward_bound(request, host_ct, None).await
+    }
+
+    /// `forward`, refusing to run unless the connection is still the one of
+    /// `bound` (a generation). A call that spans several requests (a long
+    /// wait) passes the generation it started under, checked under the same
+    /// lock that hands out the connection, so it can never carry on as an
+    /// identity the window switched to midway.
+    async fn forward_bound(
+        &self,
+        request: CallToolRequestParams,
+        host_ct: CancellationToken,
+        bound: Option<u64>,
+    ) -> Result<CallToolResult, ErrorData> {
         let (remote, ct, generation, _guard) = {
             let st = self.state.read().await;
+            if let Some(started) = bound
+                && st.generation != started
+            {
+                return Err(ErrorData::invalid_request(
+                    format!(
+                        "{} was cancelled: this window switched credentials while the call was \
+                         in flight (generation {started}). Nothing was replayed; call again if \
+                         it is still wanted, as the new identity",
+                        request.name
+                    ),
+                    None,
+                ));
+            }
             let Some(c) = &st.connected else {
                 return Err(ErrorData::invalid_request(
                     format!(
@@ -1562,6 +1589,8 @@ impl Proxy {
         let Some(total) = requested.filter(|t| *t > SERVER_WAIT_LIMIT_SECS) else {
             return self.forward(request, host_ct).await;
         };
+        // The whole wait belongs to the identity it started under.
+        let started_under = self.state.read().await.generation;
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(total.min(PROXY_MAX_WAIT_SECS) as u64);
         loop {
@@ -1573,7 +1602,9 @@ impl Proxy {
                 "timeout_seconds".into(),
                 json!(left.clamp(5, SERVER_WAIT_SLICE_SECS)),
             );
-            let result = self.forward(slice, host_ct.clone()).await?;
+            let result = self
+                .forward_bound(slice, host_ct.clone(), Some(started_under))
+                .await?;
             let woke = result
                 .structured_content
                 .as_ref()

@@ -6904,6 +6904,49 @@ async fn a_long_wait_through_the_proxy_outlasts_the_bus_limit() {
     h.shutdown().await;
 }
 
+/// A long wait belongs to the identity it started under: switching the
+/// window's profile midway cancels it instead of letting it carry on, and
+/// report events, as the agent switched to.
+#[tokio::test]
+async fn a_long_wait_is_cancelled_when_the_window_switches_identity() {
+    let h = require_db!("t_long_wait_switch");
+    let joaquin = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = seed_agent(&h.pool, "acme", "marta").await;
+    let dir = proxy_config_dir(
+        h.base.as_str(),
+        &[
+            ("me", "acme", "joaquin", &joaquin),
+            ("marta", "acme", "marta", &marta),
+        ],
+    );
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"me\"\n").unwrap();
+    let window = spawn_proxy(&dir, &repo, &[], &[]).await;
+
+    let switch = async {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        call(&window, "configure_session", json!({"profile": "marta"})).await
+    };
+    let wait = window.call_tool(
+        CallToolRequestParams::new("wait_for_updates")
+            .with_arguments(serde_json::from_value(json!({"timeout_seconds": 150})).unwrap()),
+    );
+    let started = std::time::Instant::now();
+    let (waited, switched) = tokio::join!(wait, switch);
+    assert_eq!(switched["status"]["agent"], "marta", "{switched}");
+    let err = waited.expect_err("the wait went on as the new identity");
+    assert!(err.to_string().contains("switched credentials"), "{err}");
+    assert!(
+        started.elapsed().as_secs() < 30,
+        "the wait was not cancelled promptly"
+    );
+
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
 // ------------------------------------------------- authenticated sessions --
 
 /// A session credential proves which window is calling: it is derived from an
