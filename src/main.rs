@@ -527,7 +527,7 @@ enum ContextCmd {
         /// Id of the host conversation, from the hook payload's session_id.
         #[arg(long)]
         binding: String,
-        /// session_start | heartbeat | stop | session_end | status | call
+        /// session_start | heartbeat | stop | session_end | status | call | watch
         #[arg(long)]
         event: String,
         /// Working directory the presence line describes; the current
@@ -543,6 +543,10 @@ enum ContextCmd {
         /// With `--event call`: the tool's arguments, a JSON object.
         #[arg(long, default_value = "{}")]
         args: String,
+        /// With `--event watch`: how long to watch before giving up quietly,
+        /// in seconds (60-86400). Keep it under the host's hook timeout.
+        #[arg(long, env = "BUS_WATCH_SECS", default_value_t = 14_000)]
+        watch_secs: u64,
     },
 }
 
@@ -1374,8 +1378,31 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
             digest_hours,
             tool,
             args,
+            watch_secs,
         } => {
             let event: hook::Event = event.parse()?;
+            if event == hook::Event::Watch {
+                // Exit 2 with the text on stderr is how a rewaking hook wakes
+                // its host (Claude Code's asyncRewake); anything else, an
+                // error included, exits 0 so the host's session is untouched.
+                match hook::watch(
+                    &context::config_dir()?,
+                    &binding,
+                    watch_secs.clamp(60, 86_400),
+                )
+                .await
+                {
+                    Ok(Some(text)) => {
+                        eprintln!("{text}");
+                        std::process::exit(2);
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(e) => {
+                        eprintln!("ai-crew-sync hook watch: {e:#}");
+                        return Ok(());
+                    }
+                }
+            }
             let cwd = match cwd {
                 Some(d) => d,
                 None => std::env::current_dir()?,

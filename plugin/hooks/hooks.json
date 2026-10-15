@@ -7,6 +7,13 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/session-start.sh",
             "timeout": 15000
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/watch.sh",
+            "async": true,
+            "asyncRewake": true,
+            "timeout": 14400
           }
         ]
       }
@@ -23,6 +30,13 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/stop-drain.sh",
             "timeout": 12000
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/watch.sh",
+            "async": true,
+            "asyncRewake": true,
+            "timeout": 14400
           }
         ]
       }

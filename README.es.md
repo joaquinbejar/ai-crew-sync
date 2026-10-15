@@ -437,6 +437,18 @@ El plugin trae todo preconfigurado:
   8 h — configurable con `BUS_DIGEST_HOURS`); tras cada respuesta renueva la
   presencia con el repo/rama del checkout, y al cerrar sesión marca `idle`.
   Sin ningún bus configurado, no hacen nada.
+- **Despertar una ventana inactiva**: una ventana parada en el prompt no llama
+  a ninguna herramienta, así que un mensaje para ella esperaba a que su humano
+  escribiera. Desde el arranque y tras cada respuesta, un hook en segundo plano
+  (`watch.sh`, con `async` + `asyncRewake` de Claude Code) espera en el bus como
+  esa ventana y la despierta cuando llega algo nuevo dirigido a ella: mensajes
+  directos sin leer, o mensajes de conversación para esa ventana. El aviso
+  lleva recuentos, nunca los cuerpos; los mismos mensajes sin leer nunca
+  despiertan dos veces una ventana, un vigilante nuevo sustituye al anterior, y
+  se rinde en silencio tras `BUS_WATCH_SECS` (por defecto 14000 s, por debajo
+  del límite de 4 h del hook). Solo en modo autenticado (necesita el binario y
+  la credencial propia de la ventana); otros clientes no tienen equivalente,
+  así que Codex sigue viendo las novedades al terminar cada turno.
 
 Para esto ya no hace falta `BUS_SESSION`: el proxy deriva la sesión del id de
 conversación que le da Claude Code, así que una ventana mantiene su identidad
@@ -1853,6 +1865,7 @@ servidor con sus defaults.
 | `BUS_SESSION_TTL_SECS` | La vida que pide el proxy para su credencial de sesión (60 – 86400; por defecto las 24 h del bus). |
 | `BUS_SESSION_RENEW_LEAD_SECS` | Con cuánta antelación a que caduque la renueva el proxy (por defecto: a mitad de su vida). |
 | `BUS_DIGEST_HOURS` | Cuánto mira hacia atrás el resumen del arranque de sesión (por defecto 8). |
+| `BUS_WATCH_SECS` | Cuánto espera en el bus el vigilante en segundo plano de una ventana inactiva antes de rendirse en silencio (60-86400, por defecto 14000; por debajo del límite de 4 h del hook). |
 | `BUS_RESUME_WAIT_SECS` | Cuánto espera el arranque de sesión a que el proxy nuevo de una conversación reanudada recupere su sesión antes de dar la credencial por perdida: segundos enteros de 0 a 10, por defecto 6 (cualquier otro valor vuelve a 6). |
 | `BUS_ADMIN_URL`, `BUS_ADMIN_TOKEN` | Juntas, sustituyen al fichero de `admin login` (CI). |
 

@@ -6663,6 +6663,126 @@ async fn session_start_waits_for_a_resuming_proxy() {
     h.shutdown().await;
 }
 
+/// The background watcher wakes an idle window only for news addressed to
+/// it: a new direct message makes `context hook --event watch` exit 2 with a
+/// notice, the same unread messages never wake it twice, and a newer watcher
+/// of the same window replaces the older one, which stops quietly.
+#[tokio::test]
+async fn the_watcher_wakes_a_window_only_for_new_messages() {
+    let h = require_db!("t_watch");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta_token = seed_agent(&h.pool, "acme", "marta").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let window = spawn_proxy(&dir, &repo, &[], &[("BUS_HOST_SESSION", "conv-watched")]).await;
+    let address = call(&window, "session_status", json!({})).await["address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let marta = connect(&h.base, &marta_token).await;
+    let watcher = || {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_ai-crew-sync"))
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("BUS_CONFIG_DIR", &dir)
+            .args([
+                "context",
+                "hook",
+                "--binding",
+                "conv-watched",
+                "--event",
+                "watch",
+            ])
+            .args(["--watch-secs", "120"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn watcher")
+    };
+    let finished = |child: tokio::process::Child, within: u64| async move {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(within),
+            child.wait_with_output(),
+        )
+        .await
+        .map(|out| {
+            let out = out.expect("watcher output");
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        })
+    };
+    let dm = |body: &'static str| {
+        let (marta, address) = (&marta, address.clone());
+        async move {
+            call(marta, "post_message", json!({"to": address, "body": body})).await;
+        }
+    };
+
+    // Idle window, then a direct message: the watcher wakes it.
+    let first = watcher();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    dm("are you free to review the lease change?").await;
+    let (code, notice) = finished(first, 20).await.expect("the watcher never woke");
+    assert_eq!(code, Some(2), "{notice}");
+    assert!(notice.contains("1 unread direct message"), "{notice}");
+    assert!(
+        !notice.contains("lease change"),
+        "bodies stay on the bus: {notice}"
+    );
+
+    // Re-armed without reading: the same message does not wake it again.
+    let second = watcher();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let mut second = second;
+    assert!(
+        second.try_wait().unwrap().is_none(),
+        "the watcher woke twice for the same unread message"
+    );
+
+    // A newer watcher takes the window over; the next message wakes it and
+    // the older one stops without waking anything.
+    let third = watcher();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    dm("one more thing").await;
+    let (code, notice) = finished(third, 20)
+        .await
+        .expect("the new watcher never woke");
+    assert_eq!(code, Some(2), "{notice}");
+    assert!(notice.contains("2 unread direct message"), "{notice}");
+    let (code, notice) = finished(second, 60)
+        .await
+        .expect("the replaced watcher kept running");
+    assert_eq!(
+        code,
+        Some(0),
+        "the replaced watcher woke the window: {notice}"
+    );
+
+    // A record that only claims the window (a watcher that has not read the
+    // counts yet) holds zeros nobody observed. The next watcher must take
+    // its own reading, not wake for the two messages already waiting.
+    let state = ai_crew_sync::context::binding_path(&dir, "conv-watched").with_extension("watch");
+    std::fs::write(&state, r#"{"token":"claimed","direct":0,"inbox":0}"#).unwrap();
+    let mut fourth = watcher();
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert!(
+        fourth.try_wait().unwrap().is_none(),
+        "the watcher read an unprimed claim as nothing waiting and woke the window"
+    );
+    drop(fourth);
+
+    let _ = marta.cancel().await;
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
 // ------------------------------------------------- authenticated sessions --
 
 /// A session credential proves which window is calling: it is derived from an
