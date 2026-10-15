@@ -6750,7 +6750,7 @@ async fn the_watcher_wakes_a_window_only_for_new_messages() {
     let third = watcher();
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     dm("one more thing").await;
-    let (code, notice) = finished(third, 20)
+    let (code, notice) = finished(third, 40)
         .await
         .expect("the new watcher never woke");
     assert_eq!(code, Some(2), "{notice}");
@@ -6764,9 +6764,21 @@ async fn the_watcher_wakes_a_window_only_for_new_messages() {
         "the replaced watcher woke the window: {notice}"
     );
 
+    // Read, then a new arrival, both before the next watcher's first look
+    // (say, during the turn the window was woken for): the unread count
+    // ends below the mark, but the message is new.
+    call(&window, "read_messages", json!({"scope": "inbox"})).await;
+    dm("and a new question after you read the others").await;
+    let fifth = watcher();
+    let (code, notice) = finished(fifth, 40)
+        .await
+        .expect("a message that arrived after a read never woke the window");
+    assert_eq!(code, Some(2), "{notice}");
+    assert!(notice.contains("1 unread direct message"), "{notice}");
+
     // A record that only claims the window (a watcher that has not read the
     // counts yet) holds zeros nobody observed. The next watcher must take
-    // its own reading, not wake for the two messages already waiting.
+    // its own reading, not wake for the message already waiting.
     let state = ai_crew_sync::context::binding_path(&dir, "conv-watched").with_extension("watch");
     std::fs::write(&state, r#"{"token":"claimed","direct":0,"inbox":0}"#).unwrap();
     let mut fourth = watcher();

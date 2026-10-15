@@ -304,6 +304,14 @@ const WATCH_WAIT_SECS: u64 = 50;
 /// Back-off when the bus cannot be reached, typically while the window's
 /// proxy is resuming or the server is restarting.
 const WATCH_RETRY_SECS: u64 = 30;
+/// Pause after a wait that returned at once. `wait_for_updates` answers
+/// immediately while anything unread is waiting, channel messages included,
+/// so without it a window with an old unread message would be polled flat
+/// out for hours.
+const WATCH_FAST_RETURN_PAUSE_SECS: u64 = 15;
+/// How long a watcher started with the session waits for the window's proxy
+/// to register or resume before giving up: SessionStart runs alongside it.
+const WATCH_STARTUP_SECS: u64 = 20;
 
 /// What a watcher has already woken its window for, and which watcher owns
 /// the window now. Kept next to the binding (0600, in the 0700 directory),
@@ -315,6 +323,11 @@ struct WatchState {
     token: String,
     /// Unread direct messages for this window at the last check.
     direct: i64,
+    /// Newest direct message addressed to this window at the last check.
+    /// The arrival mark: a message read and another received between two
+    /// checks leave the count unchanged, but not this.
+    #[serde(default)]
+    newest_direct: i64,
     /// Conversation messages addressed to this window and not yet delivered.
     inbox: i64,
     /// False until a watcher has read the counts once. A record written
@@ -323,6 +336,16 @@ struct WatchState {
     /// window for messages its session start already announced.
     #[serde(default)]
     primed: bool,
+}
+
+/// One reading of what is waiting for the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reading {
+    direct: i64,
+    newest_direct: i64,
+    /// `None` when the inbox could not be read this time; the last known
+    /// figure stands rather than a zero nobody observed.
+    inbox: Option<i64>,
 }
 
 fn watch_path(config_dir: &Path, binding_id: &str) -> std::path::PathBuf {
@@ -337,19 +360,35 @@ fn write_watch_state(path: &Path, state: &WatchState) -> anyhow::Result<()> {
     context::write_binding_file(path, &serde_json::to_string(state)?)
 }
 
-/// What is waiting for this window: unread direct messages, and undelivered
-/// conversation messages when the team has conversations at all.
-async fn pending_for_window(binding: &Binding) -> anyhow::Result<(i64, i64)> {
+/// What is waiting for this window: unread direct messages and the newest
+/// one addressed to it, and undelivered conversation messages when the team
+/// has conversations at all. A history read (`only_new: false`) never moves
+/// the window's read cursor.
+async fn pending_for_window(binding: &Binding) -> anyhow::Result<Reading> {
     let who = call_as_window(binding, "whoami", json!({})).await?;
     let direct = who["unread_direct_messages"].as_i64().unwrap_or(0);
+    let newest = call_as_window(
+        binding,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": false, "limit": 1}),
+    )
+    .await?;
+    let newest_direct = newest["messages"]
+        .as_array()
+        .and_then(|m| m.first())
+        .and_then(|m| m["id"].as_i64())
+        .unwrap_or(0);
     // Opt-in per team: a team without conversations refuses the call, and
-    // has no inbox to report.
+    // has no inbox to report. Any failure leaves the figure unknown.
     let inbox = call_as_window(binding, "conversation_inbox_status", json!({}))
         .await
         .ok()
-        .and_then(|v| v["undelivered"].as_i64())
-        .unwrap_or(0);
-    Ok((direct, inbox))
+        .and_then(|v| v["undelivered"].as_i64());
+    Ok(Reading {
+        direct,
+        newest_direct,
+        inbox,
+    })
 }
 
 /// The text the host shows the woken model. Counts only: bodies are
@@ -373,17 +412,21 @@ fn wake_text(direct: i64, inbox: i64) -> String {
     )
 }
 
-/// Decide from the counts whether to wake, and the new mark. A count above
-/// the mark is news; a count below it means the window read something, so
-/// the mark comes down and the next arrival counts again. The same unread
-/// messages never wake a window twice.
-fn watch_step(seen: &WatchState, direct: i64, inbox: i64) -> (bool, WatchState) {
-    let wake = direct > seen.direct || inbox > seen.inbox;
+/// Decide from a reading whether to wake, and the new mark. A direct
+/// message newer than the last one seen, while something is unread, is
+/// news; so is an inbox count above the mark. A count below the mark means
+/// the window read something, so the mark comes down and the next arrival
+/// counts again. The same unread messages never wake a window twice.
+fn watch_step(seen: &WatchState, reading: Reading) -> (bool, WatchState) {
+    let inbox = reading.inbox.unwrap_or(seen.inbox);
+    let wake =
+        (reading.direct > 0 && reading.newest_direct > seen.newest_direct) || inbox > seen.inbox;
     (
         wake,
         WatchState {
             token: seen.token.clone(),
-            direct,
+            direct: reading.direct,
+            newest_direct: reading.newest_direct.max(seen.newest_direct),
             inbox,
             primed: true,
         },
@@ -396,36 +439,42 @@ fn watch_step(seen: &WatchState, direct: i64, inbox: i64) -> (bool, WatchState) 
 /// takes the window over from any earlier watcher, keeping what that one
 /// had already woken the window for; a window watched for the first time
 /// starts from what is waiting now, which its session start already said.
+/// Every read-check-write of the state file holds the configuration lock,
+/// so a replaced watcher can never overwrite its successor's claim.
 pub async fn watch(
     config_dir: &Path,
     binding_id: &str,
     max_secs: u64,
 ) -> anyhow::Result<Option<String>> {
-    if !matches!(
+    // Started with the session, this can run before the window's proxy has
+    // registered or resumed: give it a bounded moment, as SessionStart does.
+    let startup = std::time::Instant::now();
+    while !matches!(
         resolve_binding(config_dir, binding_id),
         Resolution::Authenticated(_)
     ) {
-        return Ok(None);
+        if startup.elapsed() >= std::time::Duration::from_secs(WATCH_STARTUP_SECS) {
+            return Ok(None);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     let path = watch_path(config_dir, binding_id);
     let token = uuid::Uuid::new_v4().to_string();
-    let mut seen = read_watch_state(&path)
-        .filter(|s| s.primed)
-        .map(|s| WatchState {
-            token: token.clone(),
-            ..s
-        });
-    if let Some(s) = &seen {
-        write_watch_state(&path, s)?;
-    } else {
-        write_watch_state(
-            &path,
-            &WatchState {
+    let mut seen = context::with_config_lock(config_dir, || {
+        let prior = read_watch_state(&path).filter(|s| s.primed);
+        let claim = match &prior {
+            Some(s) => WatchState {
+                token: token.clone(),
+                ..s.clone()
+            },
+            None => WatchState {
                 token: token.clone(),
                 ..WatchState::default()
             },
-        )?;
-    }
+        };
+        write_watch_state(&path, &claim)?;
+        Ok(prior.map(|_| claim))
+    })?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     loop {
         if read_watch_state(&path).is_none_or(|s| s.token != token) {
@@ -440,30 +489,35 @@ pub async fn watch(
             return Ok(None);
         }
         match pending_for_window(&binding).await {
-            Ok((direct, inbox)) => {
+            Ok(reading) => {
                 let (wake, next) = match &seen {
-                    Some(s) => watch_step(s, direct, inbox),
+                    Some(s) => watch_step(s, reading),
                     None => (
                         false,
                         WatchState {
                             token: token.clone(),
-                            direct,
-                            inbox,
+                            direct: reading.direct,
+                            newest_direct: reading.newest_direct,
+                            inbox: reading.inbox.unwrap_or(0),
                             primed: true,
                         },
                     ),
                 };
-                // Only the owner writes: a watcher replaced between the check
-                // above and here must not overwrite the new one's token.
-                if read_watch_state(&path).is_some_and(|s| s.token == token) {
-                    write_watch_state(&path, &next)?;
-                } else {
+                let still_owner = context::with_config_lock(config_dir, || {
+                    if read_watch_state(&path).is_some_and(|s| s.token == token) {
+                        write_watch_state(&path, &next)?;
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                })?;
+                if !still_owner {
                     return Ok(None);
                 }
-                seen = Some(next);
                 if wake {
-                    return Ok(Some(wake_text(direct, inbox)));
+                    return Ok(Some(wake_text(next.direct, next.inbox)));
                 }
+                seen = Some(next);
             }
             Err(_) => {
                 tokio::time::sleep(remaining.min(std::time::Duration::from_secs(WATCH_RETRY_SECS)))
@@ -471,18 +525,23 @@ pub async fn watch(
                 continue;
             }
         }
-        let wait = remaining.as_secs().clamp(1, WATCH_WAIT_SECS);
+        let wait = remaining.as_secs().clamp(5, WATCH_WAIT_SECS);
         let started = std::time::Instant::now();
         let waited = call_as_window(
             &binding,
             "wait_for_updates",
-            json!({"timeout_seconds": wait.max(5), "kinds": ["message"]}),
+            json!({"timeout_seconds": wait, "kinds": ["message"]}),
         )
         .await;
-        // A refusal that comes back at once must not turn into a busy loop.
-        if waited.is_err() && started.elapsed() < std::time::Duration::from_secs(2) {
-            tokio::time::sleep(remaining.min(std::time::Duration::from_secs(WATCH_RETRY_SECS)))
-                .await;
+        // An answer that comes back at once (something unread is already
+        // waiting, or a refusal) must not turn into a busy loop.
+        if started.elapsed() < std::time::Duration::from_secs(2) {
+            let pause = if waited.is_err() {
+                WATCH_RETRY_SECS
+            } else {
+                WATCH_FAST_RETURN_PAUSE_SECS
+            };
+            tokio::time::sleep(remaining.min(std::time::Duration::from_secs(pause))).await;
         }
     }
 }
