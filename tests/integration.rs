@@ -5719,6 +5719,66 @@ async fn proxy_gives_each_conversation_its_own_session_and_forwards_as_the_profi
     h.shutdown().await;
 }
 
+/// A conversation resumed after its session credential expired (a window
+/// left closed, or a laptop asleep, past the credential's lifetime) gets the
+/// bus back: the proxy registers the same session label again with the
+/// agent token, as the bus's own refusal says to, instead of starting with
+/// no bus at all. Only expiry does this; a revoked or replaced credential
+/// still fails closed.
+#[tokio::test]
+async fn a_window_whose_credential_expired_registers_again_on_resume() {
+    let h = require_db!("t_expired_resume");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-expired")];
+
+    let first = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let before = call(&first, "session_status", json!({})).await;
+    assert_eq!(before["connected"], true, "{before}");
+    let _ = first.cancel().await;
+
+    // Days later: the stored credential is past its expiry.
+    sqlx::query("UPDATE agent_sessions SET expires_at = now() - interval '1 minute'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let resumed = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let after = call(&resumed, "session_status", json!({})).await;
+    assert_eq!(
+        after["connected"], true,
+        "the window came back without a bus: {after}"
+    );
+    assert_eq!(
+        after["session"], before["session"],
+        "same window, same label: {after}"
+    );
+    let who = call(&resumed, "whoami", json!({})).await;
+    assert_eq!(who["agent"], "joaquin");
+    assert_eq!(who["session"], before["session"]);
+    let _ = resumed.cancel().await;
+
+    // A revoked credential is not an expired one: the window stays off the
+    // bus rather than registering its way around the revocation.
+    sqlx::query("UPDATE agent_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let revoked = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&revoked, "session_status", json!({})).await;
+    assert_eq!(
+        status["connected"], false,
+        "a revoked window registered again: {status}"
+    );
+    let _ = revoked.cancel().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
 /// A host on protocol `2026-07-28` rejects a list without `ttlMs` and
 /// `cacheScope`, and a call result without `resultType`; Claude Code 2.1.281
 /// then shows the proxy connected with no tools (#192). The forwarded result

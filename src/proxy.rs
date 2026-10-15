@@ -520,6 +520,14 @@ fn verdict(e: &ServiceError) -> Option<Verdict> {
     }
 }
 
+/// Whether the bus refused a stored session credential because it expired,
+/// as opposed to being revoked (401 "invalid or revoked") or replaced by a
+/// newer process (409, stale epoch). The transport carries the bus's own
+/// refusal text, which is the only place the distinction is visible.
+fn credential_expired(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("session credential has expired")
+}
+
 fn verdict_of(e: &anyhow::Error) -> Option<Verdict> {
     e.chain().find_map(|c| c.downcast_ref::<Verdict>().copied())
 }
@@ -800,7 +808,24 @@ async fn establish(
     // registers a new one.
     let stored = existing_proof;
     let proof = match &stored {
-        Some(prior) => resume_with(&resolved.mcp_url, prior, session).await?,
+        Some(prior) => match resume_with(&resolved.mcp_url, prior, session).await {
+            Ok(proof) => proof,
+            // Expired, and only expired: the window was away longer than
+            // its credential lives (closed, or the machine asleep). The bus
+            // says to register again with the agent token, and the label —
+            // with everything filed under it — is unchanged. A revoked or
+            // replaced credential is refused differently and still fails
+            // closed: re-registering would undo a revocation or take a
+            // window back from the process that resumed it.
+            Err(e) if credential_expired(&e) => {
+                tracing::warn!(
+                    "this window's stored session credential had expired; registering \
+                     session '{session}' again with the agent token"
+                );
+                register_new(&remote, session).await?
+            }
+            Err(e) => return Err(e),
+        },
         None => register_new(&remote, session).await?,
     };
 
