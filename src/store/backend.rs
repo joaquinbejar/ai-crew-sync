@@ -199,15 +199,26 @@ impl MessagingBackend for PostgresBackend {
         if self.faults.fatal {
             return Published::Fatal("the backend refused this payload".into());
         }
-        if self
-            .retryable_left
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |left| (left > 0).then(|| left - 1),
-            )
-            .is_ok()
-        {
+        // Take one retryable failure if any are left. A compare-exchange
+        // loop rather than `fetch_update`, which newer toolchains deprecate
+        // in favour of a method the MSRV does not have.
+        let took_retryable = {
+            use std::sync::atomic::Ordering::SeqCst;
+            let mut left = self.retryable_left.load(SeqCst);
+            loop {
+                if left == 0 {
+                    break false;
+                }
+                match self
+                    .retryable_left
+                    .compare_exchange(left, left - 1, SeqCst, SeqCst)
+                {
+                    Ok(_) => break true,
+                    Err(current) => left = current,
+                }
+            }
+        };
+        if took_retryable {
             return Published::Retryable("the backend was unreachable".into());
         }
         // Idempotent by construction: the row already exists, and confirming
