@@ -21,8 +21,11 @@ const MAX_TIMEOUT_SECS: i64 = 55;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WaitArgs {
-    /// How long to wait before giving up, in seconds (5-55, default 25).
-    /// Kept under a minute so HTTP intermediaries do not cut the call.
+    /// How long to wait before giving up, in seconds (5-55 on the bus,
+    /// default 25; kept under a minute so HTTP intermediaries do not cut the
+    /// call). Through `ai-crew-sync mcp proxy` it may be up to 1800: the
+    /// proxy keeps waiting on the bus for you, so one call covers a long idle
+    /// stretch instead of one model turn per minute.
     #[serde(default)]
     pub timeout_seconds: Option<i64>,
     /// Restrict to certain event kinds: any of "message", "task", "lock",
@@ -207,7 +210,11 @@ fn suggestion_for(events: &[WaitEvent], unread: i64) -> String {
     } else if events.iter().any(|e| e.kind == "note") {
         "Call get_note to read the updated note.".into()
     } else {
-        "Nothing happened; do other work or wait again.".into()
+        "Nothing happened. Every further wait costs you a model turn: do other work, \
+         or end your turn if there is none, rather than waiting again in a loop. If you \
+         must keep watching, wait once with a long timeout_seconds (up to 1800 through \
+         ai-crew-sync mcp proxy)."
+            .into()
     }
 }
 

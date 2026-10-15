@@ -10,8 +10,17 @@
 [mcp_servers.ai-crew-sync]
 command = "ai-crew-sync"
 args = ["mcp", "proxy"]
+# Let one wait_for_updates call cover a long idle stretch (the proxy accepts
+# timeout_seconds up to 1800). Codex cuts a tool call at 60 s by default, and
+# an agent that re-asks every minute spends a model turn, and tokens, each time.
+tool_timeout_sec = 1900
 
 # Optional: the role every window started from this config announces, so
 # teammates can find it with list_sessions. The project label normally comes
 # from the repository's .acs.toml instead.
 # args = ["mcp", "proxy", "--role", "review"]
+
+# Installed as the Codex plugin instead (marketplace ai-crew-sync), the same
+# setting goes on the plugin's server:
+# [plugins."ai-crew-sync@ai-crew-sync".mcp_servers.ai-crew-sync]
+# tool_timeout_sec = 1900

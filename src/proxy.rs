@@ -97,6 +97,13 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub const CONFIGURE_TOOL: &str = "configure_session";
 pub const STATUS_TOOL: &str = "session_status";
+/// What the bus serves in one `wait_for_updates` request.
+const SERVER_WAIT_LIMIT_SECS: i64 = 55;
+/// Each slice of a long wait: under the bus's limit with room to spare.
+const SERVER_WAIT_SLICE_SECS: i64 = 50;
+/// The longest wait the proxy covers in one call (30 minutes). A host must
+/// allow a tool call that long (Codex: `tool_timeout_sec`).
+const PROXY_MAX_WAIT_SECS: i64 = 1800;
 
 type Remote = RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>;
 
@@ -1538,6 +1545,46 @@ impl Proxy {
         })
     }
 
+    /// `wait_for_updates` with a `timeout_seconds` above what the bus serves
+    /// in one request: wait on the bus in slices until something happens or
+    /// the whole time has passed, and answer once. Up to the bus's own limit
+    /// the call is forwarded unchanged.
+    async fn long_wait(
+        &self,
+        request: CallToolRequestParams,
+        host_ct: CancellationToken,
+    ) -> Result<CallToolResult, ErrorData> {
+        let requested = request
+            .arguments
+            .as_ref()
+            .and_then(|a| a.get("timeout_seconds"))
+            .and_then(Value::as_i64);
+        let Some(total) = requested.filter(|t| *t > SERVER_WAIT_LIMIT_SECS) else {
+            return self.forward(request, host_ct).await;
+        };
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(total.min(PROXY_MAX_WAIT_SECS) as u64);
+        loop {
+            let left = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs() as i64;
+            let mut slice = request.clone();
+            slice.arguments.get_or_insert_with(Default::default).insert(
+                "timeout_seconds".into(),
+                json!(left.clamp(5, SERVER_WAIT_SLICE_SECS)),
+            );
+            let result = self.forward(slice, host_ct.clone()).await?;
+            let woke = result
+                .structured_content
+                .as_ref()
+                .and_then(|v| v["woke"].as_bool())
+                .unwrap_or(true);
+            if woke || left <= SERVER_WAIT_SLICE_SECS || host_ct.is_cancelled() {
+                return Ok(result);
+            }
+        }
+    }
+
     /// Record that the bus refused this window's credential, so
     /// `session_status` and the next `initialize` say so instead of
     /// claiming a healthy connection. Non-blocking: a busy lock means the
@@ -2030,6 +2077,10 @@ impl ServerHandler for Proxy {
             // window's channel. The state was decorative until now: the
             // instructions and session_status promised a default the bus
             // never saw.
+            // A long wait is one call for the model and many for the bus:
+            // the bus answers within a minute (HTTP intermediaries), and a
+            // host that re-asks every minute spends a model turn each time.
+            "wait_for_updates" => Ok(self.long_wait(request, context.ct).await?.into()),
             "post_message" => {
                 let mut request = request;
                 if let Some(channel) = self.default_channel().await {

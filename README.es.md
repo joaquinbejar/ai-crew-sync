@@ -776,6 +776,16 @@ tools remotos y dos que nunca llegan al bus:
   nunca se transfiere. Otro equipo exige una conversación nueva: cambiar de
   credencial no puede borrar lo que esta conversación ya ha visto.
 
+Las esperas largas son una sola llamada. El bus responde a un
+`wait_for_updates` en 55 s como mucho (los intermediarios HTTP cortan
+peticiones más largas), y un cliente que simplemente vuelve a preguntar gasta
+un turno del modelo por cada minuto sin nada que hacer; una sesión de Codex
+inactiva consume tokens así. A través del proxy, `timeout_seconds` puede llegar
+a 1800: el proxy sigue esperando en el bus por tramos y responde una sola vez,
+cuando pasa algo o se acaba el tiempo. El cliente tiene que permitir una
+llamada a herramienta tan larga; en Codex, con `tool_timeout_sec` en el
+servidor (ver `examples/codex-config.toml`).
+
 El proxy hace todo esto por ti: registra la sesión al conectar, reenvía cada
 llamada con la credencial y el epoch, renueva la credencial a mitad de su
 vida tanto si la ventana está ocupada como ociosa (`BUS_SESSION_TTL_SECS` y

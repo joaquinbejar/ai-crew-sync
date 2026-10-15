@@ -45,7 +45,9 @@ The reason is a hard limit, not a preference: a coding agent only calls tools wh
 - a session that is working sees a message on its next call;
 - a session that has just finished answers via the `Stop` hook, which holds it open while a question is waiting — oldest first, one per turn, never one you have already replied to, and only questions addressed to *this* window or to you as a person;
 - a session that is starting gets the catch-up injected at `SessionStart`;
-- **a session idle for an hour answers nothing until its human types.**
+- an idle Claude Code session is woken by the plugin's background watcher when a direct message or conversation message arrives for *this* window; other hosts (Codex) have no way to be woken, so **an idle session there answers nothing until its human types.**
+
+**Do not poll.** When you have nothing to do but wait for the bus, do not call `wait_for_updates` again and again: every call that returns "nothing happened" costs a model turn. Either end your turn, or wait once with a long `timeout_seconds` (up to 1800 through `ai-crew-sync mcp proxy`, which keeps waiting on the bus for you).
 
 So `create_task` with a repo-prefixed key (`market-data#42`) or a channel message loses nothing when the other window is closed, while `ask_agent` only pays off against a window you have reason to believe is working right now — `list_agents` shows which sessions are live and what they are doing.
 

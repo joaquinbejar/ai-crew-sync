@@ -754,6 +754,15 @@ as usual, plus two that never reach the bus:
   team needs a new conversation, because switching credentials cannot erase
   what this conversation has already seen.
 
+Long waits are one call. The bus answers a `wait_for_updates` within 55 s
+(HTTP intermediaries cut longer requests), and a host that simply asks again
+spends a model turn every minute it has nothing to do; an idle Codex session
+burns tokens that way. Through the proxy, `timeout_seconds` may be up to
+1800: the proxy keeps waiting on the bus in slices and answers once,
+when something happens or the time is up. The host must allow a tool call
+that long; for Codex, set `tool_timeout_sec` on the server (see
+`examples/codex-config.toml`).
+
 The proxy does this for you: it registers the session on connect, forwards
 every call with the credential and the epoch, renews the credential half-way
 through its lifetime whether the window is busy or idle (`BUS_SESSION_TTL_SECS`

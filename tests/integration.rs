@@ -6855,6 +6855,55 @@ async fn the_watcher_wakes_a_window_only_for_new_messages() {
     h.shutdown().await;
 }
 
+/// A long wait through the proxy is one call for the model: past the bus's
+/// one-request limit (55 s) the proxy keeps waiting in slices and answers
+/// once something happens, instead of handing back "nothing happened" for
+/// the host to spend a model turn asking again.
+#[tokio::test]
+async fn a_long_wait_through_the_proxy_outlasts_the_bus_limit() {
+    let h = require_db!("t_long_wait");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta_token = seed_agent(&h.pool, "acme", "marta").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let window = spawn_proxy(&dir, &repo, &[], &[]).await;
+    let address = call(&window, "session_status", json!({})).await["address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let marta = connect(&h.base, &marta_token).await;
+
+    let started = std::time::Instant::now();
+    let post = async {
+        tokio::time::sleep(std::time::Duration::from_secs(62)).await;
+        call(
+            &marta,
+            "post_message",
+            json!({"to": address, "body": "still there?"}),
+        )
+        .await;
+    };
+    let wait = call(
+        &window,
+        "wait_for_updates",
+        json!({"timeout_seconds": 150, "kinds": ["message"]}),
+    );
+    let (waited, ()) = tokio::join!(wait, post);
+    let elapsed = started.elapsed().as_secs();
+    assert_eq!(waited["woke"], true, "{waited}");
+    assert!(
+        (60..140).contains(&elapsed),
+        "woke after {elapsed}s; the bus alone gives up at 55s: {waited}"
+    );
+
+    let _ = marta.cancel().await;
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
 // ------------------------------------------------- authenticated sessions --
 
 /// A session credential proves which window is calling: it is derived from an
