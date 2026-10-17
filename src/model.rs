@@ -332,6 +332,20 @@ pub struct TaskList {
     pub claimed: i64,
 }
 
+/// Additive paged task-list response. The original task fields remain present;
+/// callers that do not understand pagination can ignore the two new fields.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TaskPageList {
+    pub tasks: Vec<TaskInfo>,
+    pub open: i64,
+    pub claimed: i64,
+    /// Opaque cursor for the next page, bound to the authenticated team and
+    /// active filters.
+    pub next_cursor: Option<String>,
+    /// True when another page is available through `next_cursor`.
+    pub has_more: bool,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ClaimResult {
     pub claimed: bool,

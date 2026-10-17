@@ -218,6 +218,15 @@ pub(super) fn render(cmd: &ClientCmd, value: &Value) -> anyhow::Result<()> {
                 render_task_line(t);
             }
             println!("({} open, {} claimed)", value["open"], value["claimed"]);
+            if value["incomplete"].as_bool() == Some(true) {
+                if let Some(cursor) = value["next_cursor"].as_str() {
+                    println!("(incomplete; continue with --cursor {cursor} or use --all-pages)");
+                } else {
+                    println!("(incomplete; the server did not provide a continuation cursor)");
+                }
+            } else if value["exhausted"].as_bool() == Some(true) {
+                println!("(exhausted)");
+            }
         }
         ClientCmd::Task(TaskCmd::Show { .. }) => {
             render_task_line(&value["task"]);

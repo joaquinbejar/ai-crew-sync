@@ -7,12 +7,69 @@ use serde::Deserialize;
 
 use super::{Bus, auth_of};
 use crate::{
-    model::{ClaimResult, TaskDetail, TaskInfo, TaskList},
+    model::{ClaimResult, TaskDetail, TaskInfo, TaskPageList},
     store::tasks,
 };
 
 fn default_limit() -> i64 {
     50
+}
+
+fn default_search_mode() -> String {
+    "keywords".to_owned()
+}
+
+fn default_search_fields() -> String {
+    "both".to_owned()
+}
+
+fn default_search_language() -> String {
+    "simple".to_owned()
+}
+
+fn validate_search_args(args: &ListTasksArgs) -> Result<(), ErrorData> {
+    if !args
+        .search
+        .as_deref()
+        .is_some_and(|query| !query.trim().is_empty())
+    {
+        return Ok(());
+    }
+
+    if !matches!(args.search_mode.as_str(), "keywords" | "contains" | "regex") {
+        return Err(ErrorData::invalid_params(
+            "search_mode must be one of: keywords, contains, regex",
+            None,
+        ));
+    }
+    if !matches!(
+        args.search_fields.as_str(),
+        "title" | "description" | "both"
+    ) {
+        return Err(ErrorData::invalid_params(
+            "search_fields must be one of: title, description, both",
+            None,
+        ));
+    }
+    if !matches!(
+        args.search_language.as_str(),
+        "simple" | "english" | "russian"
+    ) {
+        return Err(ErrorData::invalid_params(
+            "search_language must be one of: simple, english, russian",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn search_query_from_args(args: &ListTasksArgs) -> tasks::TaskSearchQuery {
+    tasks::TaskSearchQuery {
+        search: args.search.clone(),
+        search_mode: Some(args.search_mode.clone()),
+        search_fields: Some(args.search_fields.clone()),
+        search_language: Some(args.search_language.clone()),
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -46,9 +103,27 @@ pub struct ListTasksArgs {
     /// Only return tasks this session currently holds a live claim on.
     #[serde(default)]
     pub mine_only: bool,
-    /// Maximum tasks to return (1-200).
+    /// Maximum tasks to return (1-10,000 per page).
     #[serde(default = "default_limit")]
     pub limit: i64,
+    /// Optional key prefix used to scope the inventory, for example `api#`.
+    #[serde(default)]
+    pub project_prefix: Option<String>,
+    /// Opaque cursor returned by an earlier page for the same team and filters.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Optional title/description search query. Empty or omitted preserves the legacy list.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// Search strategy: `keywords`, `contains`, or `regex`.
+    #[serde(default = "default_search_mode")]
+    pub search_mode: String,
+    /// Fields searched: `title`, `description`, or `both`.
+    #[serde(default = "default_search_fields")]
+    pub search_fields: String,
+    /// PostgreSQL text-search language: `simple`, `english`, or `russian`.
+    #[serde(default = "default_search_language")]
+    pub search_language: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -115,11 +190,30 @@ impl Bus {
         &self,
         ctx: RequestContext<rmcp::RoleServer>,
         Parameters(args): Parameters<ListTasksArgs>,
-    ) -> Result<Json<TaskList>, ErrorData> {
+    ) -> Result<Json<TaskPageList>, ErrorData> {
+        validate_search_args(&args)?;
+        let search_query = search_query_from_args(&args);
         let auth = auth_of(&ctx)?;
-        Ok(Json(
-            tasks::list_tasks(&self.db, &auth, args.status, args.mine_only, args.limit).await?,
-        ))
+        let page = tasks::list_tasks_page_with_search(
+            &self.db,
+            &auth,
+            tasks::TaskPageQuery {
+                status: args.status,
+                mine_only: args.mine_only,
+                limit: args.limit,
+                project_prefix: args.project_prefix,
+                cursor: args.cursor,
+            },
+            search_query,
+        )
+        .await?;
+        Ok(Json(TaskPageList {
+            tasks: page.tasks,
+            open: page.open,
+            claimed: page.claimed,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+        }))
     }
 
     #[tool(description = "Get one task with its full history of claims and completions.")]
@@ -204,5 +298,83 @@ impl Bus {
         Ok(Json(
             tasks::complete_task(&self.db, &auth, &args.key, args.result).await?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ListTasksArgs, search_query_from_args, validate_search_args};
+
+    #[test]
+    fn legacy_list_arguments_default_pagination_filters() {
+        let args: ListTasksArgs =
+            serde_json::from_str(r#"{"status":"open","mine_only":true,"limit":25}"#)
+                .expect("legacy task-list arguments should remain valid");
+
+        assert_eq!(args.status.as_deref(), Some("open"));
+        assert!(args.mine_only);
+        assert_eq!(args.limit, 25);
+        assert_eq!(args.project_prefix, None);
+        assert_eq!(args.cursor, None);
+        assert_eq!(args.search, None);
+        assert_eq!(args.search_mode, "keywords");
+        assert_eq!(args.search_fields, "both");
+        assert_eq!(args.search_language, "simple");
+    }
+
+    #[test]
+    fn search_arguments_accept_frozen_options() {
+        let args: ListTasksArgs = serde_json::from_str(
+            r#"{"search":"lease renewal","search_mode":"contains","search_fields":"title","search_language":"english"}"#,
+        )
+        .expect("search task-list arguments should deserialize");
+
+        assert_eq!(args.search.as_deref(), Some("lease renewal"));
+        assert_eq!(args.search_mode, "contains");
+        assert_eq!(args.search_fields, "title");
+        assert_eq!(args.search_language, "english");
+    }
+
+    #[test]
+    fn search_arguments_map_to_store_query_without_dropping_filters() {
+        let args: ListTasksArgs = serde_json::from_str(
+            r#"{"status":"open","mine_only":true,"limit":7,"project_prefix":"api#","cursor":"next","search":"lease","search_mode":"regex","search_fields":"description","search_language":"russian"}"#,
+        )
+        .expect("search task-list arguments should deserialize");
+        let query = search_query_from_args(&args);
+
+        assert_eq!(query.search.as_deref(), Some("lease"));
+        assert_eq!(query.search_mode.as_deref(), Some("regex"));
+        assert_eq!(query.search_fields.as_deref(), Some("description"));
+        assert_eq!(query.search_language.as_deref(), Some("russian"));
+        assert_eq!(args.status.as_deref(), Some("open"));
+        assert!(args.mine_only);
+        assert_eq!(args.limit, 7);
+        assert_eq!(args.project_prefix.as_deref(), Some("api#"));
+        assert_eq!(args.cursor.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn search_options_reject_unknown_values_only_for_nonempty_search() {
+        let mut args: ListTasksArgs =
+            serde_json::from_str(r#"{"search":"term","search_mode":"wildcard"}"#)
+                .expect("search task-list arguments should deserialize");
+        assert!(validate_search_args(&args).is_err());
+
+        args.search = Some("   ".to_owned());
+        args.search_mode = "wildcard".to_owned();
+        assert!(validate_search_args(&args).is_ok());
+    }
+
+    #[test]
+    fn paged_list_arguments_accept_prefix_and_cursor() {
+        let args: ListTasksArgs =
+            serde_json::from_str(r#"{"project_prefix":"api#","cursor":"opaque-token"}"#)
+                .expect("paged task-list arguments should deserialize");
+
+        assert_eq!(args.project_prefix.as_deref(), Some("api#"));
+        assert_eq!(args.cursor.as_deref(), Some("opaque-token"));
+        assert_eq!(args.limit, 50);
+        assert!(!args.mine_only);
     }
 }

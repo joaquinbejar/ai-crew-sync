@@ -186,6 +186,30 @@ pub enum ClientCmd {
         status: Option<String>,
         #[arg(long)]
         mine: bool,
+        /// Restrict the inventory to task keys beginning with this prefix.
+        #[arg(long)]
+        project_prefix: Option<String>,
+        /// Maximum number of tasks returned per page.
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Continue from a cursor returned by an earlier page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Search task titles and descriptions.
+        #[arg(long)]
+        search: Option<String>,
+        /// Search mode: keywords, contains, or regex.
+        #[arg(long, value_parser = ["keywords", "contains", "regex"])]
+        search_mode: Option<String>,
+        /// Search fields: title, description, or both.
+        #[arg(long, value_parser = ["title", "description", "both"])]
+        search_fields: Option<String>,
+        /// Full-text search language: simple, english, or russian.
+        #[arg(long, value_parser = ["simple", "english", "russian"])]
+        search_language: Option<String>,
+        /// Fetch every page until the server reports exhaustion.
+        #[arg(long)]
+        all_pages: bool,
     },
     /// Operate on a single task.
     #[command(subcommand)]
@@ -420,18 +444,25 @@ async fn run_command(
 
     let arguments: serde_json::Map<String, Value> =
         serde_json::from_value(call_args).context("arguments did not form a JSON object")?;
-    let result = client
-        .call_tool(CallToolRequestParams::new(tool.clone()).with_arguments(arguments))
-        .await
-        .map_err(|e| anyhow::anyhow!("{tool} failed: {e}"))?;
+    let mut value = if matches!(
+        &args.command,
+        ClientCmd::Tasks {
+            all_pages: true,
+            ..
+        }
+    ) {
+        fetch_all_task_pages(client, &tool, arguments).await?
+    } else {
+        call_tool_value(client, &tool, arguments).await?
+    };
 
-    if result.is_error == Some(true) {
-        bail!("{tool} returned an error: {:?}", result.content);
+    if let ClientCmd::Tasks {
+        all_pages: false, ..
+    } = &args.command
+    {
+        let (incomplete, exhausted) = task_page_state(&value);
+        add_task_pagination_metadata(&mut value, incomplete, exhausted);
     }
-    let value = result
-        .structured_content
-        .clone()
-        .unwrap_or_else(|| json!({ "ok": true }));
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -439,4 +470,131 @@ async fn run_command(
         render(&args.command, &value)?;
     }
     Ok(())
+}
+
+async fn call_tool_value(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>,
+    tool: &str,
+    arguments: serde_json::Map<String, Value>,
+) -> anyhow::Result<Value> {
+    let result = client
+        .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments))
+        .await
+        .map_err(|e| anyhow::anyhow!("{tool} failed: {e}"))?;
+
+    if result.is_error == Some(true) {
+        bail!("{tool} returned an error: {:?}", result.content);
+    }
+    Ok(result
+        .structured_content
+        .clone()
+        .unwrap_or_else(|| json!({ "ok": true })))
+}
+
+fn task_page_state(value: &Value) -> (bool, bool) {
+    match value.get("has_more").and_then(Value::as_bool) {
+        Some(has_more) => (has_more, !has_more),
+        None => (true, false),
+    }
+}
+
+fn add_task_pagination_metadata(value: &mut Value, incomplete: bool, exhausted: bool) {
+    if let Value::Object(object) = value {
+        object.insert("incomplete".to_owned(), json!(incomplete));
+        object.insert("exhausted".to_owned(), json!(exhausted));
+        object.insert(
+            "pagination".to_owned(),
+            json!({ "incomplete": incomplete, "exhausted": exhausted }),
+        );
+    }
+}
+
+async fn fetch_all_task_pages(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>,
+    tool: &str,
+    mut arguments: serde_json::Map<String, Value>,
+) -> anyhow::Result<Value> {
+    let mut combined = Value::Null;
+    let mut seen_cursors = std::collections::HashSet::new();
+    if let Some(cursor) = arguments.get("cursor").and_then(Value::as_str) {
+        seen_cursors.insert(cursor.to_owned());
+    }
+    let mut incomplete = false;
+    let mut exhausted = false;
+
+    loop {
+        let page = call_tool_value(client, tool, arguments.clone()).await?;
+        let (has_more, page_exhausted) = task_page_state(&page);
+        let next_cursor = page
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .filter(|cursor| !cursor.is_empty());
+
+        if combined.is_null() {
+            combined = page.clone();
+            if let Some(object) = combined.as_object_mut() {
+                object.insert("tasks".to_owned(), json!([]));
+            }
+        }
+        if let (Some(target), Some(tasks)) = (
+            combined.as_object_mut(),
+            page.get("tasks").and_then(Value::as_array),
+        ) {
+            if let Some(existing) = target.get_mut("tasks").and_then(Value::as_array_mut) {
+                existing.extend(tasks.iter().cloned());
+            }
+        }
+
+        if page_exhausted {
+            exhausted = true;
+            break;
+        }
+        let Some(next_cursor) = next_cursor else {
+            incomplete = true;
+            break;
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            incomplete = true;
+            break;
+        }
+        arguments.insert("cursor".to_owned(), json!(next_cursor));
+        if !has_more {
+            exhausted = true;
+            break;
+        }
+    }
+
+    if let Some(object) = combined.as_object_mut() {
+        object.insert("next_cursor".to_owned(), Value::Null);
+        object.insert("has_more".to_owned(), json!(!exhausted));
+    }
+    add_task_pagination_metadata(&mut combined, incomplete, exhausted);
+    Ok(combined)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_page_state_preserves_exhausted_and_incomplete_semantics() {
+        assert_eq!(task_page_state(&json!({"has_more": false})), (false, true));
+        assert_eq!(task_page_state(&json!({"has_more": true})), (true, false));
+        assert_eq!(task_page_state(&json!({"tasks": []})), (true, false));
+    }
+
+    #[test]
+    fn task_pagination_metadata_is_explicit_in_json() {
+        let mut value = json!({"tasks": []});
+        add_task_pagination_metadata(&mut value, true, false);
+        assert_eq!(value["incomplete"], true);
+        assert_eq!(value["exhausted"], false);
+        assert_eq!(value["pagination"]["incomplete"], true);
+        assert_eq!(value["pagination"]["exhausted"], false);
+
+        add_task_pagination_metadata(&mut value, false, true);
+        assert_eq!(value["incomplete"], false);
+        assert_eq!(value["exhausted"], true);
+    }
 }

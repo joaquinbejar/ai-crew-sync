@@ -7,9 +7,19 @@ use crate::{
     model::{ClaimResult, TaskDetail, TaskEventInfo, TaskInfo, TaskList, ts, ts_opt},
 };
 
+#[path = "task_cursor.rs"]
+mod task_cursor;
+use task_cursor::{
+    CursorLifetime, TaskCursorContext, TaskCursorFilters, TaskOrder, decode_cursor_at,
+    encode_cursor_with_lifetime,
+};
+
 const DEFAULT_LEASE_SECS: i64 = 900; // 15 minutes
 const MAX_LEASE_SECS: i64 = 86_400;
-const MAX_LIMIT: i64 = 200;
+// Keep list requests bounded while allowing callers to page through larger inventories.
+// This raises only the legacy clamp; the API's default page size remains 50 and
+// effective status/lease calculations remain governed by EFFECTIVE_STATUS.
+const MAX_LIMIT: i64 = 10_000;
 
 /// A title is a handle a human recognises in a list, not a description.
 const MAX_TITLE_BYTES: usize = 512;
@@ -29,6 +39,7 @@ struct TaskRow {
     title: String,
     description: Option<String>,
     status: String,
+    status_rank: i32,
     depends_on: Vec<String>,
     blocked: bool,
     claimed_by: Option<String>,
@@ -116,6 +127,12 @@ const TASK_SELECT: &str = r#"
            t.title,
            t.description,
            t.status,
+           CASE
+               WHEN t.status = 'claimed' AND t.lease_expires_at <= now() THEN 1
+               WHEN t.status = 'claimed' THEN 0
+               WHEN t.status = 'open' THEN 1
+               ELSE 2
+           END AS status_rank,
            COALESCE(
                (SELECT array_agg(d.key ORDER BY d.key)
                 FROM task_deps td JOIN tasks d ON d.id = td.blocked_by_task_id
@@ -357,6 +374,523 @@ pub async fn get_task(pool: &PgPool, auth: &AuthCtx, key: &str) -> BusResult<Tas
 
 // -------------------------------------------------------------------- list --
 
+const STATUS_RANK: &str = "CASE WHEN t.status = 'claimed' AND t.lease_expires_at <= now() THEN 1 WHEN t.status = 'claimed' THEN 0 WHEN t.status = 'open' THEN 1 ELSE 2 END";
+const CURSOR_TTL_SECS: i64 = 900;
+
+#[derive(Debug, Clone)]
+pub struct TaskPageQuery {
+    pub status: Option<String>,
+    pub mine_only: bool,
+    pub limit: i64,
+    pub project_prefix: Option<String>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct TaskPage {
+    pub tasks: Vec<TaskInfo>,
+    pub open: i64,
+    pub claimed: i64,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskSearchQuery {
+    pub search: Option<String>,
+    pub search_mode: Option<String>,
+    pub search_fields: Option<String>,
+    pub search_language: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedSearch {
+    query: String,
+    mode: &'static str,
+    fields: &'static str,
+    language: &'static str,
+    parameter: String,
+}
+
+const MAX_SEARCH_BYTES: usize = 512;
+const REGEX_STATEMENT_TIMEOUT: &str = "250ms";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchFailure {
+    InvalidRegex,
+    Timeout,
+    Cancelled,
+}
+
+fn classify_search_failure(code: Option<&str>, message: &str) -> Option<SearchFailure> {
+    match code {
+        Some("2201B") => Some(SearchFailure::InvalidRegex),
+        Some("57014") if message.contains("statement timeout") => Some(SearchFailure::Timeout),
+        Some("57014") if message.contains("user request") => Some(SearchFailure::Cancelled),
+        _ => None,
+    }
+}
+
+fn search_failure_error(failure: SearchFailure) -> BusError {
+    match failure {
+        SearchFailure::InvalidRegex => {
+            BusError::invalid("search regex is not a valid PostgreSQL regular expression")
+        }
+        SearchFailure::Timeout => BusError::invalid(
+            "regex search exceeded the 250ms execution limit; narrow the pattern and retry",
+        ),
+        SearchFailure::Cancelled => {
+            BusError::conflict("task search was cancelled before completion; retry the request")
+        }
+    }
+}
+
+fn map_search_database_error(error: &sqlx::Error) -> Option<BusError> {
+    let database_error = error.as_database_error()?;
+    classify_search_failure(database_error.code().as_deref(), database_error.message())
+        .map(search_failure_error)
+}
+
+fn escape_contains(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn normalize_search(search: TaskSearchQuery) -> BusResult<Option<NormalizedSearch>> {
+    let Some(query) = search
+        .search
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if query.len() > MAX_SEARCH_BYTES {
+        return Err(BusError::invalid(format!(
+            "search must be at most {MAX_SEARCH_BYTES} bytes"
+        )));
+    }
+    let mode = search
+        .search_mode
+        .unwrap_or_else(|| "keywords".to_owned())
+        .trim()
+        .to_lowercase();
+    let fields = search
+        .search_fields
+        .unwrap_or_else(|| "both".to_owned())
+        .trim()
+        .to_lowercase();
+    let language = search
+        .search_language
+        .unwrap_or_else(|| "simple".to_owned())
+        .trim()
+        .to_lowercase();
+    let mode = match mode.as_str() {
+        "keywords" => "keywords",
+        "contains" => "contains",
+        "regex" => "regex",
+        _ => {
+            return Err(BusError::invalid(
+                "search_mode must be one of: keywords, contains, regex",
+            ));
+        }
+    };
+    let fields = match fields.as_str() {
+        "title" => "title",
+        "description" => "description",
+        "both" => "both",
+        _ => {
+            return Err(BusError::invalid(
+                "search_fields must be one of: title, description, both",
+            ));
+        }
+    };
+    let language = match language.as_str() {
+        "simple" => "simple",
+        "english" => "english",
+        "russian" => "russian",
+        _ => {
+            return Err(BusError::invalid(
+                "search_language must be one of: simple, english, russian",
+            ));
+        }
+    };
+    if mode == "regex" && query.as_bytes().contains(&0) {
+        return Err(BusError::invalid("regex search cannot contain NUL bytes"));
+    }
+    let parameter = if mode == "contains" {
+        escape_contains(&query)
+    } else {
+        query.clone()
+    };
+    Ok(Some(NormalizedSearch {
+        query,
+        mode,
+        fields,
+        language,
+        parameter,
+    }))
+}
+
+fn keyword_vector_expression(language: &str) -> &'static str {
+    match language {
+        "simple" => {
+            "(setweight(to_tsvector('simple', coalesce(t.title, '')), 'A') || setweight(to_tsvector('simple', coalesce(t.description, '')), 'B'))"
+        }
+        "english" => {
+            "(setweight(to_tsvector('english', coalesce(t.title, '')), 'A') || setweight(to_tsvector('english', coalesce(t.description, '')), 'B'))"
+        }
+        "russian" => {
+            "(setweight(to_tsvector('russian', coalesce(t.title, '')), 'A') || setweight(to_tsvector('russian', coalesce(t.description, '')), 'B'))"
+        }
+        _ => unreachable!("search language is normalized before SQL construction"),
+    }
+}
+
+fn keyword_search_clause(search: &NormalizedSearch) -> String {
+    let vector = keyword_vector_expression(search.language);
+    let query = format!("websearch_to_tsquery('{}', $7)", search.language);
+    let field_clause = match search.fields {
+        "title" => format!(
+            "({vector} @@ {query} AND to_tsvector('{}', coalesce(t.title, '')) @@ {query})",
+            search.language
+        ),
+        "description" => format!(
+            "({vector} @@ {query} AND to_tsvector('{}', coalesce(t.description, '')) @@ {query})",
+            search.language
+        ),
+        "both" => format!("{vector} @@ {query}"),
+        _ => unreachable!("search fields are normalized before SQL construction"),
+    };
+    format!("($8::text IS NOT NULL AND {field_clause})")
+}
+
+fn search_clause(search: Option<&NormalizedSearch>) -> String {
+    let Some(search) = search else {
+        return "($7::text IS NULL AND $8::text IS NULL)".to_owned();
+    };
+    match (search.mode, search.fields) {
+        ("keywords", _) => keyword_search_clause(search),
+        ("contains", "title") => "t.title ILIKE ('%' || $7 || '%') ESCAPE chr(92)".to_owned(),
+        ("contains", "description") => "coalesce(t.description, '') ILIKE ('%' || $7 || '%') ESCAPE chr(92)".to_owned(),
+        ("contains", "both") => "(t.title ILIKE ('%' || $7 || '%') ESCAPE chr(92) OR coalesce(t.description, '') ILIKE ('%' || $7 || '%') ESCAPE chr(92))".to_owned(),
+        ("regex", "title") => "t.title ~* $7".to_owned(),
+        ("regex", "description") => "coalesce(t.description, '') ~* $7".to_owned(),
+        ("regex", "both") => "(t.title ~* $7 OR coalesce(t.description, '') ~* $7)".to_owned(),
+        _ => unreachable!("search options are normalized before SQL construction"),
+    }
+}
+
+fn search_cursor_binding(project_prefix: Option<&str>, search: &NormalizedSearch) -> String {
+    serde_json::to_string(&(
+        project_prefix,
+        search.mode,
+        search.fields,
+        search.language,
+        &search.query,
+    ))
+    .expect("search cursor binding is serializable")
+}
+
+fn cursor_secret() -> BusResult<Vec<u8>> {
+    std::env::var("TASK_CURSOR_SECRET")
+        .or_else(|_| std::env::var("BUS_DASHBOARD_SECRET"))
+        .map(|secret| secret.into_bytes())
+        .map_err(|_| {
+            BusError::invalid("TASK_CURSOR_SECRET must be configured for paged task scans")
+        })
+}
+
+fn normalize_project_prefix(prefix: Option<String>) -> Option<String> {
+    prefix
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn page_cursor_context(
+    auth: &AuthCtx,
+    project_prefix: Option<&str>,
+    status: Option<&str>,
+    mine_only: bool,
+    search: Option<&NormalizedSearch>,
+) -> TaskCursorContext {
+    TaskCursorContext {
+        team_id: auth.team_id.to_string(),
+        filters: TaskCursorFilters {
+            project_prefix: project_prefix.map(str::to_owned),
+            status: status.map(str::to_owned),
+            mine: mine_only,
+            search: search.map(|value| value.query.clone()),
+            search_mode: search.map(|value| value.mode.to_owned()),
+            search_fields: search.map(|value| value.fields.to_owned()),
+            search_language: search.map(|value| value.language.to_owned()),
+        },
+    }
+}
+
+fn invalid_cursor(error: impl std::fmt::Display) -> BusError {
+    BusError::invalid(format!("invalid task-list cursor: {error}"))
+}
+
+pub async fn list_tasks_page(
+    pool: &PgPool,
+    auth: &AuthCtx,
+    query: TaskPageQuery,
+) -> BusResult<TaskPage> {
+    let limit = query.limit.clamp(1, MAX_LIMIT);
+    let status = query
+        .status
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| value != "any");
+    if let Some(value) = &status
+        && !["open", "claimed", "done", "cancelled"].contains(&value.as_str())
+    {
+        return Err(BusError::invalid(
+            "status must be one of: open, claimed, done, cancelled, any",
+        ));
+    }
+    let project_prefix = normalize_project_prefix(query.project_prefix);
+    let context = page_cursor_context(
+        auth,
+        project_prefix.as_deref(),
+        status.as_deref(),
+        query.mine_only,
+        None,
+    );
+    let secret = cursor_secret()?;
+    let now = chrono::Utc::now();
+    let decoded = query
+        .cursor
+        .as_deref()
+        .map(|token| decode_cursor_at(&secret, token, &context, now.timestamp()))
+        .transpose()
+        .map_err(invalid_cursor)?;
+    let cursor_order = decoded.as_ref().map(|cursor| &cursor.order);
+    let cursor_time = cursor_order
+        .map(|order| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_micros(order.updated_at_micros)
+                .ok_or_else(|| BusError::invalid("invalid task-list cursor timestamp"))
+        })
+        .transpose()?;
+
+    let rows: Vec<TaskRow> = sqlx::query_as(AssertSqlSafe(format!(
+        r#"{TASK_SELECT}
+           WHERE t.team_id = $1
+             AND ($2::text IS NULL OR left(t.key, char_length($2::text)) = $2::text)
+             AND ($3::text IS NULL OR ({EFFECTIVE_STATUS}) = $3)
+             AND (NOT $4::bool
+                  OR (t.claimed_by = $5 AND COALESCE(t.claimed_session, '') = $6
+                      AND COALESCE(t.lease_expires_at > now(), true)))
+             AND ($7::int IS NULL OR (
+                    ({STATUS_RANK}) > $7
+                    OR (({STATUS_RANK}) = $7 AND t.updated_at < $8)
+                    OR (({STATUS_RANK}) = $7 AND t.updated_at = $8 AND t.key > $9)
+                 ))
+           ORDER BY ({STATUS_RANK}) ASC, t.updated_at DESC, t.key ASC
+           LIMIT $10"#
+    )))
+    .bind(auth.team_id)
+    .bind(project_prefix.as_deref())
+    .bind(status.as_deref())
+    .bind(query.mine_only)
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .bind(cursor_order.map(|order| order.status_rank))
+    .bind(cursor_time)
+    .bind(cursor_order.map(|order| order.task_key.as_str()))
+    .bind(limit + 1)
+    .fetch_all(pool)
+    .await?;
+
+    let (open, claimed): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
+        r#"SELECT count(*) FILTER (WHERE ({EFFECTIVE_STATUS}) = 'open'),
+                  count(*) FILTER (WHERE ({EFFECTIVE_STATUS}) = 'claimed')
+           FROM tasks t WHERE t.team_id = $1"#
+    )))
+    .bind(auth.team_id)
+    .fetch_one(pool)
+    .await?;
+
+    let mut rows = rows;
+    let has_more = rows.len() > limit as usize;
+    if has_more {
+        rows.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        let last = rows
+            .last()
+            .ok_or_else(|| BusError::invalid("page sentinel was inconsistent"))?;
+        let order = TaskOrder::from_sql(
+            last.status_rank,
+            last.updated_at.timestamp_micros(),
+            last.key.clone(),
+        );
+        let issued_at = now.timestamp();
+        let lifetime =
+            CursorLifetime::new(issued_at, issued_at + CURSOR_TTL_SECS).map_err(invalid_cursor)?;
+        Some(
+            encode_cursor_with_lifetime(&secret, &context, &order, lifetime)
+                .map_err(invalid_cursor)?,
+        )
+    } else {
+        None
+    };
+
+    Ok(TaskPage {
+        tasks: rows.into_iter().map(Into::into).collect(),
+        open,
+        claimed,
+        next_cursor,
+        has_more,
+    })
+}
+
+pub async fn list_tasks_page_with_search(
+    pool: &PgPool,
+    auth: &AuthCtx,
+    query: TaskPageQuery,
+    search_query: TaskSearchQuery,
+) -> BusResult<TaskPage> {
+    let search = normalize_search(search_query)?;
+    let limit = query.limit.clamp(1, MAX_LIMIT);
+    let status = query
+        .status
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| value != "any");
+    if let Some(value) = &status
+        && !["open", "claimed", "done", "cancelled"].contains(&value.as_str())
+    {
+        return Err(BusError::invalid(
+            "status must be one of: open, claimed, done, cancelled, any",
+        ));
+    }
+    let project_prefix = normalize_project_prefix(query.project_prefix);
+    let context = page_cursor_context(
+        auth,
+        project_prefix.as_deref(),
+        status.as_deref(),
+        query.mine_only,
+        search.as_ref(),
+    );
+    let secret = cursor_secret()?;
+    let now = chrono::Utc::now();
+    let decoded = query
+        .cursor
+        .as_deref()
+        .map(|token| decode_cursor_at(&secret, token, &context, now.timestamp()))
+        .transpose()
+        .map_err(invalid_cursor)?;
+    let cursor_order = decoded.as_ref().map(|cursor| &cursor.order);
+    let cursor_time = cursor_order
+        .map(|order| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_micros(order.updated_at_micros)
+                .ok_or_else(|| BusError::invalid("invalid task-list cursor timestamp"))
+        })
+        .transpose()?;
+    let search_clause = search_clause(search.as_ref());
+    let search_parameter = search.as_ref().map(|value| value.parameter.as_str());
+    let search_language = search.as_ref().map(|value| value.language);
+    let timeout = match search.as_ref().map(|value| value.mode) {
+        Some("regex") => REGEX_STATEMENT_TIMEOUT,
+        Some(_) => "5s",
+        None => "5s",
+    };
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(timeout)
+        .execute(&mut *tx)
+        .await?;
+    let rows_result: Result<Vec<TaskRow>, sqlx::Error> = sqlx::query_as(AssertSqlSafe(format!(
+        r#"{TASK_SELECT}
+           WHERE t.team_id = $1
+             AND ($2::text IS NULL OR left(t.key, char_length($2::text)) = $2::text)
+             AND ($3::text IS NULL OR ({EFFECTIVE_STATUS}) = $3)
+             AND (NOT $4::bool
+                  OR (t.claimed_by = $5 AND COALESCE(t.claimed_session, '') = $6
+                      AND COALESCE(t.lease_expires_at > now(), true)))
+             AND ({search_clause})
+             AND ($9::int IS NULL OR (
+                    ({STATUS_RANK}) > $9
+                    OR (({STATUS_RANK}) = $9 AND t.updated_at < $10)
+                    OR (({STATUS_RANK}) = $9 AND t.updated_at = $10 AND t.key > $11)
+                 ))
+           ORDER BY ({STATUS_RANK}) ASC, t.updated_at DESC, t.key ASC
+           LIMIT $12"#
+    )))
+    .bind(auth.team_id)
+    .bind(project_prefix.as_deref())
+    .bind(status.as_deref())
+    .bind(query.mine_only)
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .bind(search_parameter)
+    .bind(search_language)
+    .bind(cursor_order.map(|order| order.status_rank))
+    .bind(cursor_time)
+    .bind(cursor_order.map(|order| order.task_key.as_str()))
+    .bind(limit + 1)
+    .fetch_all(&mut *tx)
+    .await;
+    let mut rows = match rows_result {
+        Err(error) => {
+            let mapped = map_search_database_error(&error);
+            let fallback = if mapped.is_none() {
+                Some(error.into())
+            } else {
+                None
+            };
+            let _ = tx.rollback().await;
+            return Err(mapped
+                .or(fallback)
+                .expect("search database error mapping produced no error"));
+        }
+        Ok(rows) => rows,
+    };
+    let (open, claimed): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
+        r#"SELECT count(*) FILTER (WHERE ({EFFECTIVE_STATUS}) = 'open'),
+                  count(*) FILTER (WHERE ({EFFECTIVE_STATUS}) = 'claimed')
+           FROM tasks t WHERE t.team_id = $1"#
+    )))
+    .bind(auth.team_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let has_more = rows.len() > limit as usize;
+    if has_more {
+        rows.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        let last = rows
+            .last()
+            .ok_or_else(|| BusError::invalid("page sentinel was inconsistent"))?;
+        let order = TaskOrder::from_sql(
+            last.status_rank,
+            last.updated_at.timestamp_micros(),
+            last.key.clone(),
+        );
+        let issued_at = now.timestamp();
+        let lifetime =
+            CursorLifetime::new(issued_at, issued_at + CURSOR_TTL_SECS).map_err(invalid_cursor)?;
+        Some(
+            encode_cursor_with_lifetime(&secret, &context, &order, lifetime)
+                .map_err(invalid_cursor)?,
+        )
+    } else {
+        None
+    };
+
+    Ok(TaskPage {
+        tasks: rows.into_iter().map(Into::into).collect(),
+        open,
+        claimed,
+        next_cursor,
+        has_more,
+    })
+}
+
 pub async fn list_tasks(
     pool: &PgPool,
     auth: &AuthCtx,
@@ -390,7 +924,8 @@ pub async fn list_tasks(
                       AND COALESCE(t.lease_expires_at > now(), true)))
            ORDER BY
              CASE ({EFFECTIVE_STATUS}) WHEN 'claimed' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
-             t.updated_at DESC
+             t.updated_at DESC,
+             t.key ASC
            LIMIT $5"#
     )))
     .bind(auth.team_id)
@@ -820,5 +1355,223 @@ pub async fn complete_task(
                 current.status
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_LEASE_SECS, MAX_LIMIT, NormalizedSearch, SearchFailure, TaskSearchQuery,
+        classify_search_failure, escape_contains, keyword_search_clause, normalize_search,
+        search_clause, search_cursor_binding, search_failure_error,
+    };
+
+    #[test]
+    fn postgres_search_failures_map_timeout_cancellation_and_invalid_regex() {
+        assert_eq!(
+            classify_search_failure(Some("2201B"), "invalid regular expression"),
+            Some(SearchFailure::InvalidRegex),
+        );
+        assert_eq!(
+            classify_search_failure(
+                Some("57014"),
+                "canceling statement due to statement timeout"
+            ),
+            Some(SearchFailure::Timeout),
+        );
+        assert_eq!(
+            classify_search_failure(Some("57014"), "canceling statement due to user request"),
+            Some(SearchFailure::Cancelled),
+        );
+        assert_eq!(
+            classify_search_failure(Some("57014"), "canceling statement"),
+            None,
+        );
+        assert_eq!(
+            classify_search_failure(Some("23505"), "duplicate key value"),
+            None,
+        );
+
+        assert!(
+            search_failure_error(SearchFailure::InvalidRegex)
+                .to_string()
+                .contains("not a valid PostgreSQL regular expression")
+        );
+        assert!(
+            search_failure_error(SearchFailure::Timeout)
+                .to_string()
+                .contains("250ms execution limit")
+        );
+        assert!(
+            search_failure_error(SearchFailure::Cancelled)
+                .to_string()
+                .contains("cancelled before completion")
+        );
+    }
+
+    #[test]
+    fn search_defaults_and_rejects_unknown_options() {
+        let normalized = normalize_search(TaskSearchQuery {
+            search: Some("  cargo  ".to_owned()),
+            search_mode: None,
+            search_fields: None,
+            search_language: None,
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(normalized.query, "cargo");
+        assert_eq!(normalized.mode, "keywords");
+        assert_eq!(normalized.fields, "both");
+        assert_eq!(normalized.language, "simple");
+        assert!(
+            normalize_search(TaskSearchQuery {
+                search: Some("x".to_owned()),
+                search_mode: Some("sql".to_owned()),
+                search_fields: None,
+                search_language: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn keyword_search_uses_static_index_matching_language_expressions() {
+        for language in ["simple", "english", "russian"] {
+            let normalized = normalize_search(TaskSearchQuery {
+                search: Some("cargo".to_owned()),
+                search_mode: Some("keywords".to_owned()),
+                search_fields: Some("both".to_owned()),
+                search_language: Some(language.to_owned()),
+            })
+            .unwrap()
+            .unwrap();
+            let clause = keyword_search_clause(&normalized);
+            assert!(clause.contains(&format!("to_tsvector('{language}'")));
+            assert!(clause.contains("setweight(to_tsvector"));
+            assert!(clause.contains("$8::text IS NOT NULL"));
+            assert!(!clause.contains("$8::regconfig"));
+        }
+    }
+
+    #[test]
+    fn keyword_field_filters_keep_indexed_candidate_expression_and_field_semantics() {
+        for fields in ["title", "description"] {
+            let normalized = normalize_search(TaskSearchQuery {
+                search: Some("cargo".to_owned()),
+                search_mode: Some("keywords".to_owned()),
+                search_fields: Some(fields.to_owned()),
+                search_language: Some("simple".to_owned()),
+            })
+            .unwrap()
+            .unwrap();
+            let clause = keyword_search_clause(&normalized);
+            assert!(clause.matches("setweight(to_tsvector").count() >= 2);
+            assert!(clause.contains(&format!("to_tsvector('simple', coalesce(t.{fields}")));
+            assert!(!clause.contains("$8::regconfig"));
+        }
+    }
+
+    #[test]
+    fn empty_search_preserves_no_search_path_and_contains_escapes_literals() {
+        assert!(
+            normalize_search(TaskSearchQuery {
+                search: Some("   ".to_owned()),
+                search_mode: Some("regex".to_owned()),
+                search_fields: Some("title".to_owned()),
+                search_language: Some("russian".to_owned()),
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(escape_contains("100%_\\").as_bytes(), b"100\\%\\_\\\\");
+        let normalized = normalize_search(TaskSearchQuery {
+            search: Some("needle".to_owned()),
+            search_mode: Some("contains".to_owned()),
+            search_fields: Some("title".to_owned()),
+            search_language: None,
+        })
+        .unwrap()
+        .unwrap();
+        let contains_title = search_clause(Some(&normalized));
+        assert!(contains_title.contains("ILIKE"));
+        assert!(contains_title.contains("ESCAPE chr(92)"));
+        let contains_description = search_clause(Some(&NormalizedSearch {
+            fields: "description",
+            ..normalized.clone()
+        }));
+        assert!(contains_description.contains("ESCAPE chr(92)"));
+        let contains_both = search_clause(Some(&NormalizedSearch {
+            fields: "both",
+            ..normalized
+        }));
+        assert_eq!(contains_both.matches("ESCAPE chr(92)").count(), 2);
+    }
+
+    #[test]
+    fn search_cursor_binding_covers_all_search_options() {
+        let normalized = normalize_search(TaskSearchQuery {
+            search: Some("Cargo".to_owned()),
+            search_mode: Some("regex".to_owned()),
+            search_fields: Some("description".to_owned()),
+            search_language: Some("russian".to_owned()),
+        })
+        .unwrap()
+        .unwrap();
+        let binding = search_cursor_binding(Some("api#"), &normalized);
+        assert!(binding.contains("Cargo"));
+        assert!(binding.contains("regex"));
+        assert!(binding.contains("description"));
+        assert!(binding.contains("russian"));
+        assert_ne!(
+            binding,
+            search_cursor_binding(
+                Some("api#"),
+                &normalize_search(TaskSearchQuery {
+                    search: Some("Cargo".to_owned()),
+                    search_mode: Some("keywords".to_owned()),
+                    search_fields: Some("description".to_owned()),
+                    search_language: Some("russian".to_owned()),
+                })
+                .unwrap()
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn search_rejects_oversized_and_nul_regex_input() {
+        assert!(
+            normalize_search(TaskSearchQuery {
+                search: Some("x".repeat(513)),
+                search_mode: Some("regex".to_owned()),
+                search_fields: None,
+                search_language: None,
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_search(TaskSearchQuery {
+                search: Some(format!("a{}b", '\0')),
+                search_mode: Some("regex".to_owned()),
+                search_fields: None,
+                search_language: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn list_limit_allows_a_bounded_high_page_without_changing_small_limits() {
+        assert_eq!(DEFAULT_LEASE_SECS, 900);
+        assert_eq!(50_i64.clamp(1, MAX_LIMIT), 50);
+        assert_eq!(200_i64.clamp(1, MAX_LIMIT), 200);
+        assert_eq!(10_000_i64.clamp(1, MAX_LIMIT), 10_000);
+        assert_eq!(25_000_i64.clamp(1, MAX_LIMIT), 10_000);
+    }
+
+    #[test]
+    fn list_limit_never_becomes_zero_or_negative() {
+        assert_eq!(0_i64.clamp(1, MAX_LIMIT), 1);
+        assert_eq!((-50_i64).clamp(1, MAX_LIMIT), 1);
     }
 }

@@ -13,6 +13,7 @@ pub mod presence;
 pub mod quota;
 pub mod routing;
 pub mod sessions;
+pub mod task_cursor;
 pub mod tasks;
 
 pub mod attachments;

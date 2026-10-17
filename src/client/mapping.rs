@@ -164,9 +164,31 @@ pub fn to_call_with(
                 "ttl_seconds": ttl_seconds
             }),
         ),
-        ClientCmd::Tasks { status, mine } => {
-            ("list_tasks", json!({"status": status, "mine_only": mine}))
-        }
+        ClientCmd::Tasks {
+            status,
+            mine,
+            project_prefix,
+            limit,
+            cursor,
+            search,
+            search_mode,
+            search_fields,
+            search_language,
+            all_pages: _,
+        } => (
+            "list_tasks",
+            json!({
+                "status": status,
+                "mine_only": mine,
+                "project_prefix": project_prefix,
+                "limit": limit,
+                "cursor": cursor,
+                "search": search,
+                "search_mode": search_mode,
+                "search_fields": search_fields,
+                "search_language": search_language
+            }),
+        ),
         ClientCmd::Wait {
             timeout_seconds,
             kinds,
@@ -319,6 +341,14 @@ mod tests {
             ClientCmd::Tasks {
                 status: None,
                 mine: false,
+                project_prefix: None,
+                limit: None,
+                cursor: None,
+                search: None,
+                search_mode: None,
+                search_fields: None,
+                search_language: None,
+                all_pages: false,
             },
             ClientCmd::Task(TaskCmd::Show { key: "k".into() }),
             ClientCmd::Notes {
@@ -394,12 +424,51 @@ mod tests {
         let (tool, args) = mapped(ClientCmd::Tasks {
             status: Some("open".into()),
             mine: true,
+            project_prefix: Some("proj/".into()),
+            limit: Some(25),
+            cursor: Some("cursor-1".into()),
+            search: Some("quoted phrase".into()),
+            search_mode: Some("keywords".into()),
+            search_fields: Some("both".into()),
+            search_language: Some("english".into()),
+            all_pages: false,
         });
         assert_eq!(tool, "list_tasks");
         assert_eq!(
             args["mine_only"], true,
             "the schema argument is mine_only; `mine` is the flag name"
         );
+        assert_eq!(args["project_prefix"], "proj/");
+        assert_eq!(args["limit"], 25);
+        assert_eq!(args["cursor"], "cursor-1");
+        assert_eq!(args["search"], "quoted phrase");
+        assert_eq!(args["search_mode"], "keywords");
+        assert_eq!(args["search_fields"], "both");
+        assert_eq!(args["search_language"], "english");
+        assert!(args.get("all_pages").is_none());
+    }
+
+    #[test]
+    fn task_pagination_flags_are_omitted_when_unset() {
+        let (_, args) = mapped(ClientCmd::Tasks {
+            status: None,
+            mine: false,
+            project_prefix: None,
+            limit: None,
+            cursor: None,
+            search: None,
+            search_mode: None,
+            search_fields: None,
+            search_language: None,
+            all_pages: true,
+        });
+        assert!(args.get("project_prefix").is_none());
+        assert!(args.get("limit").is_none());
+        assert!(args.get("cursor").is_none());
+        assert!(args.get("search").is_none());
+        assert!(args.get("search_mode").is_none());
+        assert!(args.get("search_fields").is_none());
+        assert!(args.get("search_language").is_none());
     }
 
     #[test]
