@@ -203,6 +203,14 @@ deploy-check` ejecuta solo las comprobaciones de variables y nunca contacta
 con el clúster. Fija una versión completa como `0.7.5`: cada release publica
 además un tag móvil `0.7`, y el preflight no lo detecta.
 
+En un swarm de más de un nodo, fija los servicios con estado: los volúmenes
+de la base de datos y del broker son locales al nodo que los guarda, y un
+servicio sin fijar se reprograma tras un reinicio en el primer nodo que
+vuelva, donde arranca con un volumen vacío (todos los tokens parecen entonces
+revocados). Define `POSTGRES_PLACEMENT="node.hostname == <nodo>"` y, con
+JetStream activo, `NATS_PLACEMENT` en el entorno del stack; sin definir no
+fija nada.
+
 Detrás de un proxy Traefik v3 (`--providers.swarm`) que ya termina TLS, pon
 `TRAEFIK_ENABLE=true` y `BUS_PUBLIC_HOST=crew.example.com` (más
 `TRAEFIK_NETWORK`/`TRAEFIK_ENTRYPOINT`/`TRAEFIK_CERTRESOLVER` si difieren de

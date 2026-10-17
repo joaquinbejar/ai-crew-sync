@@ -33,6 +33,15 @@ services:
       retries: 10
     deploy:
       replicas: 1
+      # The volume is local to the node that holds it. On a multi-node swarm
+      # an unpinned database is rescheduled after a reboot onto whichever
+      # node comes back first, and starts there on an empty volume: every
+      # token, task and message then reads as gone. Pin it to the node that
+      # holds the data (POSTGRES_PLACEMENT="node.hostname == <node>"). The
+      # default matches every Linux node, i.e. no pin, for a single host.
+      placement:
+        constraints:
+          - ${POSTGRES_PLACEMENT:-node.platform.os == linux}
       restart_policy:
         condition: on-failure
         delay: 3s
@@ -76,6 +85,11 @@ services:
       - nats-data:/data
     deploy:
       replicas: ${NATS_REPLICAS:-0}
+      # Same reason as the database: JetStream keeps its streams on a
+      # node-local volume, so pin it where they are (NATS_PLACEMENT).
+      placement:
+        constraints:
+          - ${NATS_PLACEMENT:-node.platform.os == linux}
       restart_policy:
         condition: on-failure
         delay: 3s

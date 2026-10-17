@@ -198,6 +198,13 @@ deploy-check` runs the variable checks alone and never contacts the cluster.
 Pin a full version such as `0.7.5`: each release also publishes a moving
 `0.7` tag, and the preflight does not catch it.
 
+On a swarm of more than one node, pin the stateful services: the database
+and broker volumes are local to the node that holds them, and an unpinned
+service is rescheduled after a reboot onto whichever node returns first,
+where it starts on an empty volume (every token then reads as revoked). Set
+`POSTGRES_PLACEMENT="node.hostname == <node>"` and, with JetStream on,
+`NATS_PLACEMENT` in the stack environment; unset means no pin.
+
 Behind a Traefik v3 proxy (`--providers.swarm`) that already terminates TLS,
 set `TRAEFIK_ENABLE=true` and `BUS_PUBLIC_HOST=crew.example.com` (plus
 `TRAEFIK_NETWORK`/`TRAEFIK_ENTRYPOINT`/`TRAEFIK_CERTRESOLVER` if they differ
