@@ -12353,6 +12353,46 @@ async fn a_lapsed_lease_reads_as_open_everywhere() {
     h.shutdown().await;
 }
 
+/// Revoking a session ends that credential, not the label (#207): the agent
+/// token speaks for every window of the agent, so its holder can register the
+/// label again and gets a fresh credential, while the revoked one stays dead.
+/// Keeping an agent off the bus is what revoking its agent token is for.
+#[tokio::test]
+async fn revoking_a_session_ends_the_credential_not_the_label() {
+    let h = require_db!("t_revoke_label");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let agent = connect(&h.base, &token).await;
+
+    let first = call(&agent, "register_session", json!({"session": "conv-x"})).await;
+    let old = first["session_token"].as_str().unwrap().to_owned();
+    call(&agent, "revoke_session", json!({"session": "conv-x"})).await;
+
+    let mut config = StreamableHttpClientTransportConfig::with_uri(format!("{}/mcp", h.base));
+    config.auth_header = Some(old.clone());
+    config.allow_stateless = true;
+    let refused = ClientConfig::default()
+        .serve(StreamableHttpClientTransport::from_config(config))
+        .await;
+    assert!(
+        refused.is_err(),
+        "a revoked session credential still opened a connection"
+    );
+
+    let again = call(&agent, "register_session", json!({"session": "conv-x"})).await;
+    let fresh = again["session_token"].as_str().unwrap();
+    assert_ne!(fresh, old, "the label came back with the revoked secret");
+    assert_eq!(again["session"], "conv-x");
+    let window = connect(&h.base, fresh).await;
+    assert_eq!(
+        call(&window, "whoami", json!({})).await["session"],
+        "conv-x"
+    );
+
+    let _ = window.cancel().await;
+    let _ = agent.cancel().await;
+    h.shutdown().await;
+}
+
 /// Revoking an agent token takes its session credentials with it. Auth
 /// already refused them, but their rows still read as live: recovery
 /// counted a window that could not answer and the label stayed reserved

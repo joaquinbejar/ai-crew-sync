@@ -715,7 +715,10 @@ that one session, and:
 
 `renew_session` extends the credential you already hold without touching its
 secret or epoch. `revoke_session` closes it, or another window of your own
-agent by label. `whoami` includes `session_identity` (session id, epoch,
+agent by label. Revoking a session ends that credential, not the label: the
+holder of the agent token can register the label again, because that token
+already speaks for every window of the agent. To keep an agent off the bus, revoke its agent token or disable the
+agent; both end its sessions too. `whoami` includes `session_identity` (session id, epoch,
 registration and expiry) when the label was proven by a session credential,
 and omits the field when the label is only a header.
 
