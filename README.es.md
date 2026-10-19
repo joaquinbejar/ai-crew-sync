@@ -739,9 +739,8 @@ A partir de ahí la envías como bearer token. Autentica como tu agente, en esa
 `renew_session` alarga la credencial que ya tienes sin tocar su secreto ni su
 epoch. `revoke_session` la cierra, o cierra otra ventana de tu propio agente
 por etiqueta. Revocar una sesión termina esa credencial, no la etiqueta: quien
-tenga el token del agente puede registrar la etiqueta de nuevo (y el proxy lo
-hace al reconectar), porque ese token ya habla por todas las ventanas del
-agente. Para dejar a un agente fuera del bus, revoca su token de agente o
+tenga el token del agente puede registrar la etiqueta de nuevo, porque ese
+token ya habla por todas las ventanas del agente. Para dejar a un agente fuera del bus, revoca su token de agente o
 deshabilita el agente; ambas cosas terminan también sus sesiones. `whoami` incluye `session_identity` (id de sesión, epoch,
 registro y caducidad) cuando la etiqueta está probada por una credencial de
 sesión, y omite el campo cuando la etiqueta solo es una cabecera.
