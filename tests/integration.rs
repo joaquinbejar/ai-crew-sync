@@ -1265,6 +1265,73 @@ async fn wait_for_updates_wakes_on_a_teammates_message() {
     let _ = marta.cancel().await;
 }
 
+/// What happens between two waits is not lost (#211): each wait returns the
+/// position it reached, and the next one, given it as `since`, reports the
+/// task, lock and note changes that landed in between. Another team's events
+/// are never replayed.
+#[tokio::test]
+async fn a_wait_replays_what_happened_since_the_previous_one() {
+    let h = require_db!("t_wait_replay");
+    let joaquin = connect(&h.base, &seed_agent(&h.pool, "acme", "joaquin").await).await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let eve = connect(&h.base, &seed_agent(&h.pool, "other", "eve").await).await;
+    let wait = |args: Value| {
+        let joaquin = &joaquin;
+        async move { call(joaquin, "wait_for_updates", args).await }
+    };
+
+    // A lock held, then a quiet wait that records where it stopped.
+    call(&marta, "acquire_lock", json!({"name": "deploy:staging"})).await;
+    let first = wait(json!({"timeout_seconds": 5, "kinds": ["task", "lock"]})).await;
+    assert_eq!(first["timed_out"], true, "{first}");
+    let since = first["resume_from"].as_i64().expect("resume_from");
+
+    // Between the two waits: a task, a release, and another team's task.
+    call(
+        &marta,
+        "create_task",
+        json!({"key": "api#1", "title": "rotate keys"}),
+    )
+    .await;
+    call(&marta, "release_lock", json!({"name": "deploy:staging"})).await;
+    call(
+        &eve,
+        "create_task",
+        json!({"key": "secret#1", "title": "not yours"}),
+    )
+    .await;
+
+    // Without `since` they are gone: nothing new arrives during the wait.
+    let blind = wait(json!({"timeout_seconds": 5, "kinds": ["task", "lock"]})).await;
+    assert_eq!(blind["timed_out"], true, "{blind}");
+
+    // With it, both come back at once, and only this team's.
+    let started = std::time::Instant::now();
+    let replayed =
+        wait(json!({"timeout_seconds": 30, "kinds": ["task", "lock"], "since": since})).await;
+    assert!(
+        started.elapsed().as_secs() < 5,
+        "the replay waited instead of answering"
+    );
+    assert_eq!(replayed["woke"], true, "{replayed}");
+    let text = replayed["events"].to_string();
+    assert!(text.contains("api#1"), "{replayed}");
+    assert!(
+        text.contains("deploy:staging") && text.contains("released"),
+        "{replayed}"
+    );
+    assert!(
+        !text.contains("secret#1"),
+        "another team's task was replayed: {replayed}"
+    );
+    assert!(replayed["resume_from"].as_i64().unwrap() > since);
+
+    for c in [joaquin, marta, eve] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn ask_agent_returns_the_teammates_answer() {
     let h = require_db!("t_ask");

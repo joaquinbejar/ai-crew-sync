@@ -773,6 +773,13 @@ when something happens or the time is up. The host must allow a tool call
 that long; for Codex, set `tool_timeout_sec` on the server (see
 `examples/codex-config.toml`).
 
+Nothing is lost between two waits either. Every `wait_for_updates` result
+carries `resume_from`, its position on the bus; pass it back as `since` and
+the next wait reports at once the task, lock and note changes that landed in
+between (messages never needed it: their unread state is in the database).
+The proxy chains it from one slice of a long wait to the next. The bus keeps
+those events for about a day (`bus_event_log`, migration 0020).
+
 The proxy does this for you: it registers the session on connect, forwards
 every call with the credential and the epoch, renews the credential half-way
 through its lifetime whether the window is busy or idle (`BUS_SESSION_TTL_SECS`

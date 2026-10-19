@@ -31,6 +31,12 @@ impl BusEvent {
         self.0.get("kind").and_then(|v| v.as_str()).unwrap_or("")
     }
 
+    /// Position of a task, lock or note event in the replay log (#211);
+    /// `None` for events that are not logged (messages, pings).
+    pub fn event_id(&self) -> Option<i64> {
+        self.0.get("event_id").and_then(|v| v.as_i64())
+    }
+
     fn uuid_field(&self, key: &str) -> Option<Uuid> {
         self.0
             .get(key)

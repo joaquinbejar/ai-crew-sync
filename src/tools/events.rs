@@ -38,6 +38,11 @@ pub struct WaitArgs {
     /// and notes always wake you either way.
     #[serde(default)]
     pub all_channels: bool,
+    /// `resume_from` from your previous wait_for_updates. Task, lock and note
+    /// changes after that position are reported at once, so waiting again
+    /// never loses what happened between two calls. Omit on a first wait.
+    #[serde(default)]
+    pub since: Option<i64>,
 }
 
 async fn unread_dms(pool: &PgPool, auth: &AuthCtx) -> Result<i64, sqlx::Error> {
@@ -261,6 +266,16 @@ impl Bus {
         // Subscribe before checking the database so nothing slips between the
         // check and the wait.
         let mut rx = self.hub.subscribe();
+        // The log position at subscription: everything up to here is either
+        // replayed below or was before the caller's `since`; everything after
+        // arrives on `rx`.
+        let head: i64 = sqlx::query_scalar("SELECT COALESCE(max(id), 0) FROM bus_event_log")
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "event log position failed");
+                ErrorData::internal_error("database error", None)
+            })?;
 
         // Same rule as the wake filter below: reporting a backlog the wait
         // would not have woken for is a lie the caller cannot act on.
@@ -279,11 +294,42 @@ impl Bus {
                 }],
                 unread_direct_messages: dms,
                 suggestion: "Call read_messages to fetch them.".into(),
+                resume_from: head,
             }));
         }
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64);
+        // What happened since the caller's last wait, before this one
+        // subscribed: replayed from the log, under the same filters.
         let mut events: Vec<WaitEvent> = Vec::new();
+        let mut position = head;
+        if let Some(since) = args.since.filter(|s| (0..head).contains(s)) {
+            let missed: Vec<(serde_json::Value,)> = sqlx::query_as(
+                "SELECT payload FROM bus_event_log
+                  WHERE team_id = $1 AND id > $2 AND id <= $3
+                  ORDER BY id LIMIT 200",
+            )
+            .bind(auth.team_id)
+            .bind(since)
+            .bind(head)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "event replay failed");
+                ErrorData::internal_error("database error", None)
+            })?;
+            for (payload,) in missed {
+                let event = crate::events::BusEvent(payload);
+                if event.visible_to(auth.team_id, auth.agent_id, &auth.session)
+                    && wants(event.kind())
+                    && in_focus(&event, focus)
+                    && let Some(described) = describe(&self.db, &event).await
+                {
+                    events.push(described);
+                }
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64);
 
         while events.is_empty() {
             let event = tokio::select! {
@@ -303,6 +349,14 @@ impl Bus {
                 },
             };
 
+            // Only this team's events move the position: the log is per
+            // database, and an id seen on the shared channel says nothing
+            // about what this caller has or has not been shown.
+            if event.team_id() == Some(auth.team_id)
+                && let Some(id) = event.event_id()
+            {
+                position = position.max(id);
+            }
             if !event.visible_to(auth.team_id, auth.agent_id, &auth.session)
                 || !wants(event.kind())
                 || !in_focus(&event, focus)
@@ -325,6 +379,11 @@ impl Bus {
                 // Grace window: batch events that arrive together.
                 let grace = tokio::time::Instant::now() + Duration::from_millis(150);
                 while let Ok(Ok(more)) = tokio::time::timeout_at(grace, rx.recv()).await {
+                    if more.team_id() == Some(auth.team_id)
+                        && let Some(id) = more.event_id()
+                    {
+                        position = position.max(id);
+                    }
                     if more.visible_to(auth.team_id, auth.agent_id, &auth.session)
                         && in_focus(&more, focus)
                         && wants(more.kind())
@@ -346,6 +405,7 @@ impl Bus {
             suggestion: suggestion_for(&events, unread),
             events,
             unread_direct_messages: unread,
+            resume_from: position,
         }))
     }
 }
