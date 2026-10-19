@@ -436,8 +436,8 @@ pub struct WaitResult {
     pub suggestion: String,
     /// Position reached on the bus. Pass it as `since` to the next
     /// wait_for_updates so a task, lock or note change that lands between the
-    /// two calls is reported instead of lost.
-    pub resume_from: i64,
+    /// two calls is reported instead of lost. Opaque.
+    pub resume_from: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

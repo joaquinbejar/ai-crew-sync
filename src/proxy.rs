@@ -1597,7 +1597,8 @@ impl Proxy {
             .arguments
             .as_ref()
             .and_then(|a| a.get("since"))
-            .and_then(Value::as_i64);
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(total.min(PROXY_MAX_WAIT_SECS) as u64);
         loop {
@@ -1610,7 +1611,7 @@ impl Proxy {
                 "timeout_seconds".into(),
                 json!(left.clamp(5, SERVER_WAIT_SLICE_SECS)),
             );
-            if let Some(position) = since {
+            if let Some(position) = &since {
                 args.insert("since".into(), json!(position));
             }
             let result = self
@@ -1627,7 +1628,7 @@ impl Proxy {
             since = result
                 .structured_content
                 .as_ref()
-                .and_then(|v| v["resume_from"].as_i64())
+                .and_then(|v| v["resume_from"].as_str().map(str::to_owned))
                 .or(since);
         }
     }

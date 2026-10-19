@@ -1284,7 +1284,10 @@ async fn a_wait_replays_what_happened_since_the_previous_one() {
     call(&marta, "acquire_lock", json!({"name": "deploy:staging"})).await;
     let first = wait(json!({"timeout_seconds": 5, "kinds": ["task", "lock"]})).await;
     assert_eq!(first["timed_out"], true, "{first}");
-    let since = first["resume_from"].as_i64().expect("resume_from");
+    let since = first["resume_from"]
+        .as_str()
+        .expect("resume_from")
+        .to_owned();
 
     // Between the two waits: a task, a release, and another team's task.
     call(
@@ -1324,11 +1327,154 @@ async fn a_wait_replays_what_happened_since_the_previous_one() {
         !text.contains("secret#1"),
         "another team's task was replayed: {replayed}"
     );
-    assert!(replayed["resume_from"].as_i64().unwrap() > since);
+    assert_ne!(replayed["resume_from"].as_str().unwrap(), since);
 
     for c in [joaquin, marta, eve] {
         let _ = c.cancel().await;
     }
+    h.shutdown().await;
+}
+
+/// The replay position is commit-safe (#211 review): a transaction that
+/// wrote an event before another but commits after it is still reported
+/// once it commits, because positions are snapshots, not row ids.
+#[tokio::test]
+async fn a_replay_reports_a_slow_transaction_once_it_commits() {
+    let h = require_db!("t_wait_replay_race");
+    let joaquin = connect(&h.base, &seed_agent(&h.pool, "acme", "joaquin").await).await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    call(
+        &marta,
+        "create_task",
+        json!({"key": "slow#1", "title": "slow"}),
+    )
+    .await;
+    call(
+        &marta,
+        "create_task",
+        json!({"key": "fast#1", "title": "fast"}),
+    )
+    .await;
+    let start = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 5, "kinds": ["task"]}),
+    )
+    .await;
+    let since = start["resume_from"].as_str().unwrap().to_owned();
+
+    // The slow write takes its log row first and holds its transaction open.
+    let mut slow = h.pool.begin().await.unwrap();
+    sqlx::query("UPDATE tasks SET title = 'slow, edited' WHERE key = 'slow#1'")
+        .execute(&mut *slow)
+        .await
+        .unwrap();
+    // The fast one commits, and a wait reports it and moves on.
+    call(
+        &marta,
+        "complete_task",
+        json!({"key": "fast#1", "result": "done"}),
+    )
+    .await;
+    let fast = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 10, "kinds": ["task"], "since": since}),
+    )
+    .await;
+    assert!(fast["events"].to_string().contains("fast#1"), "{fast}");
+    assert!(!fast["events"].to_string().contains("slow#1"), "{fast}");
+    let after_fast = fast["resume_from"].as_str().unwrap().to_owned();
+
+    // The slow one commits after that position was handed out: still reported.
+    slow.commit().await.unwrap();
+    let late = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 10, "kinds": ["task"], "since": after_fast}),
+    )
+    .await;
+    assert_eq!(
+        late["woke"], true,
+        "the slow transaction's event was lost: {late}"
+    );
+    assert!(late["events"].to_string().contains("slow#1"), "{late}");
+
+    let _ = joaquin.cancel().await;
+    let _ = marta.cancel().await;
+    h.shutdown().await;
+}
+
+/// A wait that finds unread messages reports the logged changes in the same
+/// answer, and one that finds more than it describes says how many it left
+/// out, so its position never skips anything silently (#211 review).
+#[tokio::test]
+async fn a_replay_is_never_skipped_by_messages_or_a_backlog() {
+    let h = require_db!("t_wait_replay_more");
+    let joaquin = connect(&h.base, &seed_agent(&h.pool, "acme", "joaquin").await).await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let start = call(&joaquin, "wait_for_updates", json!({"timeout_seconds": 5})).await;
+    let since = start["resume_from"].as_str().unwrap().to_owned();
+
+    // A task and a direct message between two waits: both in one answer.
+    call(
+        &marta,
+        "create_task",
+        json!({"key": "both#1", "title": "t"}),
+    )
+    .await;
+    call(
+        &marta,
+        "post_message",
+        json!({"to": "joaquin", "body": "ping"}),
+    )
+    .await;
+    let both = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 10, "since": since}),
+    )
+    .await;
+    let text = both["events"].to_string();
+    assert!(text.contains("unread message"), "{both}");
+    assert!(
+        text.contains("both#1"),
+        "the task was skipped behind the message: {both}"
+    );
+    call(&joaquin, "read_messages", json!({})).await;
+    let since = both["resume_from"].as_str().unwrap().to_owned();
+
+    // Sixty changes: fifty described, the rest counted, none silently lost.
+    for n in 0..60 {
+        call(
+            &marta,
+            "create_task",
+            json!({"key": format!("bulk#{n}"), "title": "t"}),
+        )
+        .await;
+    }
+    let bulk = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 10, "kinds": ["task"], "since": since}),
+    )
+    .await;
+    let events = bulk["events"].as_array().unwrap();
+    assert_eq!(events.len(), 51, "{bulk}");
+    assert!(
+        events.last().unwrap()["summary"]
+            .as_str()
+            .unwrap()
+            .contains("10 more"),
+        "{bulk}"
+    );
+
+    // Something that is not a position is refused with what to do.
+    let err = call_expect_error(&joaquin, "wait_for_updates", json!({"since": "nope"})).await;
+    assert!(err.contains("resume_from"), "{err}");
+
+    let _ = joaquin.cancel().await;
+    let _ = marta.cancel().await;
     h.shutdown().await;
 }
 

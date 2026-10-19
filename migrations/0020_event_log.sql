@@ -7,15 +7,21 @@
 -- could miss a task, lock or note change landing between two calls. Messages
 -- never had the problem: their unread state is in the database.
 --
--- Each of those events is now also appended here, and the NOTIFY carries
--- the row id as `event_id`. A wait returns the position it reached, and the
--- next one replays what came after it. Rows hold the same ids-only payload
--- the NOTIFY always carried, scoped by team, and are kept for a day.
+-- Each of those events is now also appended here with the transaction that
+-- wrote it. A wait returns the snapshot it read from (`pg_current_snapshot()`)
+-- and the next one replays the rows that snapshot could not see. Positions
+-- are snapshots rather than row ids because ids are allocated before commit:
+-- a slow transaction can commit a lower id after a higher one was already
+-- reported, and an id watermark would skip it for good. Rows hold the same
+-- ids-only payload the NOTIFY always carried, scoped by team, and are kept for
+-- a day.
 
 CREATE TABLE bus_event_log (
     id      BIGSERIAL   PRIMARY KEY,
     team_id UUID        NOT NULL,
     at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The writing transaction, for snapshot visibility on replay.
+    tx      XID8        NOT NULL DEFAULT pg_current_xact_id(),
     payload JSONB       NOT NULL
 );
 
@@ -26,17 +32,14 @@ COMMENT ON TABLE bus_event_log IS
     'Replayable copy of task, lock and note events for wait_for_updates (#211). '
     'Ids-only payloads, team-scoped, kept for about a day.';
 
--- Append, then notify with the row id, so a listener and a replay agree on
--- the position of every event. Roughly one call in a hundred also trims what
--- is older than a day, which keeps the table small without a scheduler.
+-- Append, then notify exactly as before. Roughly one call in a hundred also
+-- trims what is older than a day, which keeps the table small without a
+-- scheduler.
 CREATE FUNCTION bus_emit(p JSONB) RETURNS void LANGUAGE plpgsql AS $$
-DECLARE
-    event_id BIGINT;
 BEGIN
     INSERT INTO bus_event_log (team_id, payload)
-        VALUES ((p ->> 'team_id')::uuid, p)
-        RETURNING id INTO event_id;
-    PERFORM pg_notify('bus_events', (p || jsonb_build_object('event_id', event_id))::text);
+        VALUES ((p ->> 'team_id')::uuid, p);
+    PERFORM pg_notify('bus_events', p::text);
     IF random() < 0.01 THEN
         DELETE FROM bus_event_log WHERE at < now() - interval '1 day';
     END IF;
