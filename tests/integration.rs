@@ -2615,7 +2615,8 @@ async fn attachments_travel_with_messages_and_tasks() {
 #[tokio::test]
 async fn list_tasks_pages_through_every_task_once() {
     let h = require_db!("t_task_pages");
-    let joaquin = connect(&h.base, &seed_agent(&h.pool, "acme", "joaquin").await).await;
+    let joaquin_token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let joaquin = connect(&h.base, &joaquin_token).await;
     let eve = connect(&h.base, &seed_agent(&h.pool, "other", "eve").await).await;
     for n in 0..7 {
         call(
@@ -2697,6 +2698,29 @@ async fn list_tasks_pages_through_every_task_once() {
     )
     .await;
     assert!(err.contains("different filters"), "{err}");
+    // With mine_only the window is part of the list: another window of the
+    // same agent, holding different claims, cannot continue this one's.
+    for n in 0..4 {
+        call(&joaquin, "claim_task", json!({"key": format!("api#{n}")})).await;
+    }
+    let mine = call(
+        &joaquin,
+        "list_tasks",
+        json!({"limit": 2, "mine_only": true}),
+    )
+    .await;
+    let mine_cursor = mine["next_cursor"]
+        .as_str()
+        .expect("more claims than one page");
+    let sibling = connect_with_session(&h.base, &joaquin_token, "other-window").await;
+    let err = call_expect_error(
+        &sibling,
+        "list_tasks",
+        json!({"limit": 2, "mine_only": true, "cursor": mine_cursor}),
+    )
+    .await;
+    assert!(err.contains("another window"), "{err}");
+    let _ = sibling.cancel().await;
     // Something that was never a cursor.
     let err = call_expect_error(&joaquin, "list_tasks", json!({"cursor": "not-a-cursor"})).await;
     assert!(err.contains("not one list_tasks issued"), "{err}");

@@ -397,14 +397,22 @@ fn status_rank(status: &str) -> i32 {
 }
 
 fn page_fingerprint(
-    team: Uuid,
+    auth: &AuthCtx,
     status: Option<&str>,
     mine_only: bool,
     prefix: Option<&str>,
 ) -> String {
     use sha2::{Digest, Sha256};
+    // `mine_only` lists this window's claims, so the window is part of the
+    // filter: another window's cursor would page through a different list.
+    let window = if mine_only {
+        format!("{}/{}", auth.agent_id, auth.session)
+    } else {
+        String::new()
+    };
     let digest = Sha256::digest(format!(
-        "{team}\u{1f}{}\u{1f}{mine_only}\u{1f}{}",
+        "{}\u{1f}{}\u{1f}{mine_only}\u{1f}{}\u{1f}{window}",
+        auth.team_id,
         status.unwrap_or(""),
         prefix.unwrap_or("")
     ));
@@ -436,8 +444,9 @@ fn decode_cursor(raw: &str, fingerprint: &str) -> BusResult<PageCursor> {
     if cursor.f != fingerprint {
         return Err(BusError::invalid(
             "this cursor was issued for different filters (status, mine_only or \
-             project_prefix). Repeat the call with the same filters as the page it came \
-             from, or call list_tasks without a cursor to start again.",
+             project_prefix) or, with mine_only, for another window. Repeat the call from \
+             the same window with the same filters as the page it came from, or call \
+             list_tasks without a cursor to start again.",
         ));
     }
     Ok(cursor)
@@ -469,12 +478,7 @@ pub async fn list_tasks(
             "project_prefix is longer than a task key can be (200 bytes); shorten it",
         ));
     }
-    let fingerprint = page_fingerprint(
-        auth.team_id,
-        status.as_deref(),
-        query.mine_only,
-        prefix.as_deref(),
-    );
+    let fingerprint = page_fingerprint(auth, status.as_deref(), query.mine_only, prefix.as_deref());
     let after = match query.cursor.as_deref().filter(|c| !c.trim().is_empty()) {
         Some(raw) => {
             let c = decode_cursor(raw, &fingerprint)?;
