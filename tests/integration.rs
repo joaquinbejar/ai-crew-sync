@@ -6063,8 +6063,9 @@ async fn proxy_gives_each_conversation_its_own_session_and_forwards_as_the_profi
 /// left closed, or a laptop asleep, past the credential's lifetime) gets the
 /// bus back: the proxy registers the same session label again with the
 /// agent token, as the bus's own refusal says to, instead of starting with
-/// no bus at all. Only expiry does this; a revoked or replaced credential
-/// still fails closed.
+/// no bus at all. A revoked credential does the same (#214); a label that is
+/// still live under a secret this window does not hold is refused by the
+/// bus, with the way out in the refusal.
 #[tokio::test]
 async fn a_window_whose_credential_expired_registers_again_on_resume() {
     let h = require_db!("t_expired_resume");
@@ -6101,8 +6102,10 @@ async fn a_window_whose_credential_expired_registers_again_on_resume() {
     assert_eq!(who["session"], before["session"]);
     let _ = resumed.cancel().await;
 
-    // A revoked credential is not an expired one: the window stays off the
-    // bus rather than registering its way around the revocation.
+    // Revoked (`revoke_session` from a terminal, say): the stored secret is
+    // dead, and reloading it forever left the conversation with no way
+    // back but a new one (#214). The agent token registers the label again,
+    // exactly as `register_session` allows for a revoked one.
     sqlx::query("UPDATE agent_sessions SET revoked_at = now() WHERE revoked_at IS NULL")
         .execute(&h.pool)
         .await
@@ -6110,11 +6113,429 @@ async fn a_window_whose_credential_expired_registers_again_on_resume() {
     let revoked = spawn_proxy(&dir, &repo, &[], &conv).await;
     let status = call(&revoked, "session_status", json!({})).await;
     assert_eq!(
-        status["connected"], false,
-        "a revoked window registered again: {status}"
+        status["connected"], true,
+        "a revoked window did not register again: {status}"
     );
+    assert_eq!(status["session"], before["session"], "{status}");
+    let who = call(&revoked, "whoami", json!({})).await;
+    assert_eq!(who["session"], before["session"]);
     let _ = revoked.cancel().await;
 
+    // Rotated by a process this file never heard of, and still live: the
+    // bus will not hand that window to the agent token. The window stays
+    // off the bus and says how to close the other one.
+    sqlx::query(
+        "UPDATE agent_sessions SET token_hash = 'rotated-elsewhere' WHERE revoked_at IS NULL",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let rotated = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&rotated, "session_status", json!({})).await;
+    assert_eq!(
+        status["connected"], false,
+        "a live window was taken back with the agent token: {status}"
+    );
+    let reason = status["error"].as_str().unwrap_or_default();
+    assert!(reason.contains("still live"), "{status}");
+    assert!(
+        reason.contains("client call revoke_session"),
+        "the refusal names the way out: {status}"
+    );
+    let _ = rotated.cancel().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// `resume_session` called by the model through the proxy rotates the very
+/// secret the proxy sends. The proxy keeps the new one — for its own calls,
+/// for its hooks' binding and for the next restart of the conversation —
+/// and the result describes the credential without carrying it (#214).
+#[tokio::test]
+async fn resume_session_through_the_proxy_keeps_the_rotated_credential() {
+    let h = require_db!("t_proxy_resume_tool");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-resume-tool")];
+    let stored = || -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(ai_crew_sync::context::binding_path(
+                &dir,
+                "conv-resume-tool",
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    };
+
+    let window = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let before = stored();
+
+    let resumed = call(&window, "resume_session", json!({})).await;
+    assert!(
+        resumed.get("session_token").is_none(),
+        "the secret reached the tool result"
+    );
+    assert!(!resumed.to_string().contains("acss_"), "{resumed}");
+    assert_eq!(resumed["session"], status["session"], "{resumed}");
+    assert_eq!(
+        resumed["epoch"].as_i64(),
+        before["epoch"].as_i64().map(|e| e + 1),
+        "{resumed}"
+    );
+
+    // The window keeps working on the rotated credential.
+    let who = call(&window, "whoami", json!({})).await;
+    assert_eq!(who["session"], status["session"], "{who}");
+    assert_eq!(who["session_identity"]["epoch"], resumed["epoch"], "{who}");
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+
+    // And so does what reads the binding: it holds the new secret.
+    let after = stored();
+    assert_eq!(after["epoch"], resumed["epoch"], "{after}");
+    assert_ne!(after["session_token"], before["session_token"]);
+    let _ = window.cancel().await;
+
+    // A restart of the conversation resumes with it.
+    let again = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&again, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let who = call(&again, "whoami", json!({})).await;
+    assert_eq!(who["session"], resumed["session"], "{who}");
+    let _ = again.cancel().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// A front for the bus that relays every request as is, except that once a
+/// `resume_session` call has gone through it refuses the next `fail`
+/// connection handshakes (`initialize`) with a bare 503, the way a gateway
+/// does while the bus restarts. Returns its base URL and the counter.
+async fn spawn_flaky_front(
+    bus: String,
+    fail: usize,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let remaining = Arc::new(AtomicUsize::new(fail));
+    let resumed = Arc::new(AtomicBool::new(false));
+    let http = reqwest::Client::new();
+    let app = axum::Router::new().fallback({
+        let remaining = remaining.clone();
+        move |method: axum::http::Method,
+              uri: axum::http::Uri,
+              headers: axum::http::HeaderMap,
+              body: axum::body::Bytes| {
+            let (remaining, resumed, http, bus) = (
+                remaining.clone(),
+                resumed.clone(),
+                http.clone(),
+                bus.clone(),
+            );
+            async move {
+                let text = String::from_utf8_lossy(&body);
+                if text.contains("\"method\":\"initialize\"")
+                    && resumed.load(Ordering::SeqCst)
+                    && remaining
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                {
+                    return axum::response::Response::builder()
+                        .status(503)
+                        .body(axum::body::Body::from("upstream unavailable"))
+                        .unwrap();
+                }
+                if text.contains("\"name\":\"resume_session\"") {
+                    resumed.store(true, Ordering::SeqCst);
+                }
+                let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+                let mut req = http.request(method, format!("{bus}{path}"));
+                for (k, v) in &headers {
+                    if k != axum::http::header::HOST && k != axum::http::header::CONTENT_LENGTH {
+                        req = req.header(k, v);
+                    }
+                }
+                let resp = req.body(body).send().await.unwrap();
+                let mut out = axum::response::Response::builder().status(resp.status());
+                for (k, v) in resp.headers() {
+                    if k != axum::http::header::CONTENT_LENGTH
+                        && k != axum::http::header::TRANSFER_ENCODING
+                    {
+                        out = out.header(k, v);
+                    }
+                }
+                out.body(axum::body::Body::from_stream(resp.bytes_stream()))
+                    .unwrap()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), remaining)
+}
+
+/// The bus rotates the secret on `resume_session` and the next handshake
+/// fails: the old connection now carries a secret the bus refuses. One
+/// failure is retried and the window carries on as the rotated credential;
+/// when the new one cannot connect at all, the window goes off the bus and
+/// says so, rather than reporting itself connected on the old secret, and
+/// a restart resumes with the new one it saved.
+#[tokio::test]
+async fn a_resume_whose_new_credential_cannot_connect_does_not_report_a_healthy_window() {
+    let h = require_db!("t_proxy_resume_flaky");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+
+    // One refused handshake after the resume: retried, and the window works.
+    let (front, _) = spawn_flaky_front(h.base.clone(), 1).await;
+    let dir = proxy_config_dir(&front, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-resume-flaky")];
+    let window = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let resumed = call(&window, "resume_session", json!({})).await;
+    let who = call(&window, "whoami", json!({})).await;
+    assert_eq!(who["session_identity"]["epoch"], resumed["epoch"], "{who}");
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Every handshake after the resume refused: the resume happened, and
+    // the window says so and goes off the bus.
+    let (front, remaining) = spawn_flaky_front(h.base.clone(), usize::MAX).await;
+    let dir = proxy_config_dir(&front, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-resume-stranded")];
+    let stored = || -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(ai_crew_sync::context::binding_path(
+                &dir,
+                "conv-resume-stranded",
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let window = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let before = stored();
+
+    let said = call_expect_error(&window, "resume_session", json!({})).await;
+    assert!(said.contains("was resumed"), "{said}");
+    assert!(said.contains("restarted"), "says what to do: {said}");
+    // One sentence for the model; the transport's detail is the log's.
+    assert!(!said.contains("503"), "{said}");
+    assert!(!said.contains("127.0.0.1"), "{said}");
+    assert!(!said.contains("upstream unavailable"), "{said}");
+
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(
+        status["connected"], false,
+        "a window on a refused secret reported itself connected: {status}"
+    );
+    assert!(
+        status["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("was resumed"),
+        "{status}"
+    );
+    let after = stored();
+    assert_eq!(
+        after["epoch"].as_i64(),
+        before["epoch"].as_i64().map(|e| e + 1),
+        "the rotated credential was not saved: {after}"
+    );
+    assert_ne!(after["session_token"], before["session_token"]);
+    let _ = window.cancel().await;
+
+    // The bus is back: a restart resumes with the credential it saved.
+    remaining.store(0, std::sync::atomic::Ordering::SeqCst);
+    let again = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&again, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let who = call(&again, "whoami", json!({})).await;
+    assert_eq!(who["session"], before["session"], "{who}");
+    let _ = again.cancel().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// A window off the bus after a failed adoption is still bound to its team:
+/// its transcript holds that team's material. Once the bus is back, a
+/// profile of another team is refused exactly as for a connected window.
+#[tokio::test]
+async fn a_window_off_the_bus_after_a_resume_cannot_switch_teams() {
+    let h = require_db!("t_proxy_stranded_team");
+    let joaquin = seed_agent(&h.pool, "acme", "joaquin").await;
+    let eve = seed_agent(&h.pool, "other", "eve").await;
+    let (front, remaining) = spawn_flaky_front(h.base.clone(), usize::MAX).await;
+    let dir = proxy_config_dir(
+        &front,
+        &[
+            ("acme", "acme", "joaquin", &joaquin),
+            ("other", "other", "eve", &eve),
+        ],
+    );
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-stranded-team")];
+    let window = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["team"], "acme", "{status}");
+
+    // Every handshake after the resume fails: the window goes off the bus.
+    let said = call_expect_error(&window, "resume_session", json!({})).await;
+    assert!(said.contains("was resumed"), "{said}");
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["connected"], false, "{status}");
+
+    // The bus is back, and the window asks for another team's profile.
+    remaining.store(0, std::sync::atomic::Ordering::SeqCst);
+    let said = call_expect_error(&window, "configure_session", json!({"profile": "other"})).await;
+    assert!(said.contains("team 'acme'"), "{said}");
+    assert!(said.contains("new conversation"), "{said}");
+    let status = call(&window, "session_status", json!({})).await;
+    assert_ne!(
+        status["team"], "other",
+        "the conversation changed teams: {status}"
+    );
+    assert_ne!(status["agent"], "eve", "{status}");
+    let stored: Value = serde_json::from_str(
+        &std::fs::read_to_string(ai_crew_sync::context::binding_path(
+            &dir,
+            "conv-stranded-team",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored["team"], "acme", "{stored}");
+    assert_eq!(stored["agent"], "joaquin", "{stored}");
+
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// A window off the bus after a failed adoption still fences its shutdown
+/// on its own credential. A successor for the same conversation resumes
+/// with the saved credential and rewrites the binding; when the old
+/// process exits, it leaves that binding alone instead of stamping it
+/// closed under the live window's hooks.
+#[tokio::test]
+async fn a_window_off_the_bus_after_a_resume_does_not_close_its_successor() {
+    let h = require_db!("t_proxy_stranded_close");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let (front, remaining) = spawn_flaky_front(h.base.clone(), usize::MAX).await;
+    let dir = proxy_config_dir(&front, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-stranded-close")];
+    let stored = || -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(ai_crew_sync::context::binding_path(
+                &dir,
+                "conv-stranded-close",
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    };
+
+    let stranded = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let said = call_expect_error(&stranded, "resume_session", json!({})).await;
+    assert!(said.contains("was resumed"), "{said}");
+    let status = call(&stranded, "session_status", json!({})).await;
+    assert_eq!(status["connected"], false, "{status}");
+    let saved = stored();
+
+    // The bus is back; the same conversation starts a successor, which
+    // resumes with the saved credential and owns the binding from now on.
+    remaining.store(0, std::sync::atomic::Ordering::SeqCst);
+    let successor = spawn_proxy(&dir, &repo, &[], &conv).await;
+    let status = call(&successor, "session_status", json!({})).await;
+    assert_eq!(status["connected"], true, "{status}");
+    let owned = stored();
+    assert_eq!(owned["session"], saved["session"], "{owned}");
+    assert_ne!(owned["epoch"], saved["epoch"], "{owned}");
+    assert!(owned["closed_at"].is_null(), "{owned}");
+
+    // The old process exits (the transport waits for it).
+    let _ = stranded.cancel().await;
+    let after = stored();
+    assert!(
+        after["closed_at"].is_null(),
+        "the retired window closed its successor's binding: {after}"
+    );
+    assert_eq!(after["epoch"], owned["epoch"], "{after}");
+    let who = call(&successor, "whoami", json!({})).await;
+    assert_eq!(who["session_identity"]["epoch"], owned["epoch"], "{who}");
+
+    // The successor's own exit still closes it.
+    let _ = successor.cancel().await;
+    assert!(!stored()["closed_at"].is_null(), "{}", stored());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// The proxy runs `resume_session` itself, and the credential it holds is
+/// renewed with the lifetime the window is configured with. A lifetime
+/// asked for on the call would be undone by the next renewal, so it is not
+/// advertised and is refused, without resuming anything.
+#[tokio::test]
+async fn resume_session_through_the_proxy_refuses_a_lifetime_of_its_own() {
+    let h = require_db!("t_proxy_resume_ttl");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let conv = [("BUS_HOST_SESSION", "conv-resume-ttl")];
+    let window = spawn_proxy(&dir, &repo, &[], &conv).await;
+
+    let tools = window.list_all_tools().await.unwrap();
+    let resume = tools
+        .iter()
+        .find(|t| t.name == "resume_session")
+        .expect("resume_session is served");
+    assert!(
+        resume.input_schema["properties"]
+            .get("ttl_seconds")
+            .is_none(),
+        "{:?}",
+        resume.input_schema
+    );
+    assert_eq!(resume.input_schema["additionalProperties"], false);
+
+    let before = call(&window, "whoami", json!({})).await;
+    let said = call_expect_error(&window, "resume_session", json!({"ttl_seconds": 60})).await;
+    assert!(said.contains("ttl_seconds is not accepted"), "{said}");
+    assert!(said.contains("nothing was resumed"), "{said}");
+    let who = call(&window, "whoami", json!({})).await;
+    assert_eq!(
+        who["session_identity"]["epoch"], before["session_identity"]["epoch"],
+        "the refused call rotated the credential: {who}"
+    );
+
+    let _ = window.cancel().await;
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
 }

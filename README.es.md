@@ -818,6 +818,22 @@ termina antes. Una renovación que el bus rechace la informa `session_status`
 como credencial rechazada; nunca se tapa con otra identidad. Un bus demasiado antiguo para
 emitir credenciales se queda simplemente con la conexión por etiqueta.
 
+Cuando la credencial guardada ya no sirve al reconectar —caducada, revocada,
+o rotada por algo de lo que esta ventana nunca supo—, el proxy vuelve a
+registrar la misma etiqueta con el token del agente. Sigue decidiendo el bus:
+una etiqueta que sigue viva con un secreto que esta ventana no tiene se
+rechaza, y el rechazo dice cómo cerrarla (`revoke_session` con su etiqueta,
+desde otra ventana o con `ai-crew-sync client call`). `resume_session`
+llamado a través del proxy lo ejecuta el propio proxy, que se queda con la
+credencial rotada y devuelve su descripción sin el secreto. Ahí no acepta
+`ttl_seconds`: la credencial conserva la vida con la que la ventana la renueva
+(`BUS_SESSION_TTL_SECS`). Si la credencial rotada no consigue abrir una
+conexión, el proxy la guarda, sale del bus en vez de seguir con el secreto
+rechazado, y lo dice; al reiniciar el servidor MCP reconecta con ella.
+Fuera del bus la ventana sigue siendo la misma identidad: no puede cambiar a
+un perfil de otro equipo, y al salir solo cierra un binding que conserve la
+credencial que guardó.
+
 **Identidad de la conversación**, por orden: `--host-session` /
 `BUS_HOST_SESSION` (cualquier host que pueda fijar una variable por ventana),
 `CLAUDE_CODE_SESSION_ID` (Claude Code la exporta a los procesos MCP), el

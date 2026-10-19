@@ -94,6 +94,10 @@ const RENEW_LEAD_ENV: &str = "BUS_SESSION_RENEW_LEAD_SECS";
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the exit heartbeat may take; the host is waiting.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Attempts at opening a connection with a credential `resume_session` just
+/// rotated, before the window gives up and goes off the bus. The old secret
+/// is already refused, so one transient failure must not strand it.
+const ADOPT_ATTEMPTS: u32 = 3;
 
 pub const CONFIGURE_TOOL: &str = "configure_session";
 pub const STATUS_TOOL: &str = "session_status";
@@ -229,6 +233,44 @@ struct State {
     channel: Option<String>,
     /// Bumped on every context switch.
     generation: u64,
+    /// A credential `resume_session` rotated whose new secret could not open
+    /// a connection. The context it belonged to is retired, and this keeps
+    /// the binding holding the new secret so a restart resumes with it.
+    /// It is still this window's identity: read it through
+    /// [`State::identity`], never through `connected` alone.
+    stranded: Option<Identity>,
+}
+
+/// Who this window is on the bus: the agent, team and credential it speaks
+/// as, whether or not a connection is open right now.
+#[derive(Clone)]
+struct Identity {
+    profile: Option<String>,
+    agent: String,
+    team: String,
+    mcp_url: String,
+    proof: Option<SessionProof>,
+}
+
+impl State {
+    /// This window's identity: the connected context, else the one a
+    /// failed adoption retired. Every check of team, ownership or
+    /// credential reads it here: a window that lost its connection is
+    /// still bound to its team and still owns its binding, and a check
+    /// that looked only at `connected` would treat it as nobody.
+    fn identity(&self) -> Option<Identity> {
+        match (&self.connected, &self.stranded) {
+            (Some(c), _) => Some(Identity {
+                profile: c.resolved.profile.clone(),
+                agent: c.agent.clone(),
+                team: c.team.clone(),
+                mcp_url: c.resolved.mcp_url.clone(),
+                proof: c.proof.clone(),
+            }),
+            (None, Some(s)) => Some(s.clone()),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Counts calls currently forwarded; decremented on drop so a request the
@@ -702,7 +744,8 @@ async fn register_new(remote: &Remote, session: &str) -> anyhow::Result<Option<S
 
 /// Reconnect a window we already hold a credential for. Its own credential
 /// is the proof, so no agent token is involved; a rejected resume means the
-/// window was revoked or expired and the caller must register afresh.
+/// window was revoked, rotated or expired and the caller must register
+/// afresh.
 async fn resume_with(
     url: &str,
     prior: &SessionProof,
@@ -728,6 +771,99 @@ async fn resume_with(
         epoch: v["epoch"].as_i64().unwrap_or(1),
         expires_at: v["expires_at"].as_str().unwrap_or_default().to_owned(),
     }))
+}
+
+/// The rotation `resume_session` asked for through the proxy, with the
+/// credential the window holds. The error is the one sentence the model
+/// reads, classified once like a forwarded call's: whether the resume
+/// happened, and what to do. The transport's detail goes to the log only.
+async fn rotate(url: &str, prior: &SessionProof, session: &str) -> Result<SessionProof, String> {
+    const KEPT: &str = "nothing was resumed and this window keeps the credential it holds";
+    let rejected = || {
+        "resume_session: the bus rejected this window's credential (revoked or rotated), so \
+         nothing was resumed; restart this MCP server to reconnect the window"
+            .to_owned()
+    };
+    let remote = connect_remote(url, &prior.token, session, Some(prior.epoch))
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = format!("{e:#}"), "resume_session could not connect");
+            if verdict_of(&e) == Some(Verdict::Unauthorized) {
+                rejected()
+            } else {
+                // `connect_remote` words its own error for the model.
+                format!("resume_session: {e}; {KEPT}. Try again once the bus answers")
+            }
+        })?;
+    let mut args = rmcp::model::JsonObject::new();
+    if let Some(ttl) = requested_session_ttl() {
+        args.insert("ttl_seconds".into(), json!(ttl));
+    }
+    let outcome = remote
+        .call_tool(CallToolRequestParams::new("resume_session").with_arguments(args))
+        .await;
+    let _ = remote.cancel().await;
+    let lost = |what: &str| {
+        format!(
+            "resume_session: {what}, so the resume may or may not have happened. If this \
+             window's next call is refused, it did and the new credential is lost: close the \
+             window with revoke_session (its label, from another window of this agent or \
+             `ai-crew-sync client call revoke_session`) and restart this MCP server"
+        )
+    };
+    let result = outcome.map_err(|e| {
+        tracing::warn!(error = %e, "resume_session through the proxy failed");
+        if unauthorized(&e) {
+            rejected()
+        } else if let ServiceError::McpError(data) = &e {
+            format!("resume_session: {KEPT}: {}", data.message)
+        } else if let Some(r) = refusal(&e) {
+            format!("resume_session: {}; {KEPT}", r.text())
+        } else {
+            lost("the connection to the bus failed before an answer came back")
+        }
+    })?;
+    if result.is_error == Some(true) {
+        let said: Vec<String> = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect();
+        return Err(format!("resume_session: {KEPT}: {}", said.join(" ")));
+    }
+    let v = result.structured_content.unwrap_or(Value::Null);
+    let Some(token) = v["session_token"].as_str() else {
+        tracing::warn!("resume_session answered without a credential");
+        return Err(lost("the bus answered without a credential"));
+    };
+    Ok(SessionProof {
+        token: token.to_owned(),
+        session_id: v["session_id"].as_str().unwrap_or_default().to_owned(),
+        epoch: v["epoch"].as_i64().unwrap_or(1),
+        expires_at: v["expires_at"].as_str().unwrap_or_default().to_owned(),
+    })
+}
+
+/// A connection on `proof` with the bus's tool list, or why not in words
+/// the model can read.
+async fn open_with(
+    url: &str,
+    proof: &SessionProof,
+    session: &str,
+) -> Result<(Remote, Vec<Tool>), String> {
+    let remote = connect_remote(url, &proof.token, session, Some(proof.epoch))
+        .await
+        // `connect_remote` logged the transport's detail and words its own
+        // error for the model.
+        .map_err(|e| e.to_string())?;
+    match remote.list_all_tools().await {
+        Ok(tools) => Ok((remote, tools)),
+        Err(e) => {
+            let why = format!("could not list the bus's tools: {}", remote_error_text(&e));
+            let _ = remote.cancel().await;
+            Err(why)
+        }
+    }
 }
 
 async fn establish(
@@ -817,13 +953,10 @@ async fn establish(
     let proof = match &stored {
         Some(prior) => match resume_with(&resolved.mcp_url, prior, session).await {
             Ok(proof) => proof,
-            // Expired, and only expired: the window was away longer than
-            // its credential lives (closed, or the machine asleep). The bus
-            // says to register again with the agent token, and the label —
-            // with everything filed under it — is unchanged. A revoked or
-            // replaced credential is refused differently and still fails
-            // closed: re-registering would undo a revocation or take a
-            // window back from the process that resumed it.
+            // Expired: the window was away longer than its credential lives
+            // (closed, or the machine asleep). The bus says to register
+            // again with the agent token, and the label — with everything
+            // filed under it — is unchanged.
             Err(e) if credential_expired(&e) => {
                 tracing::warn!(
                     "this window's stored session credential had expired; registering \
@@ -831,6 +964,25 @@ async fn establish(
                 );
                 register_new(&remote, session).await?
             }
+            // Revoked or rotated: the bus no longer knows this secret (a
+            // `revoke_session`, a revoked parent token, a rotation this
+            // file never saw, or a bus that lost its sessions). Retrying
+            // the same secret can only fail again, so the agent token —
+            // already verified above — asks for the label. The bus decides:
+            // a label that is revoked or dead is registered again, as
+            // `register_session` documents, and one that is still live (the
+            // process that rotated it holds the new secret) is refused, so
+            // nothing is taken back from a window that can still speak for
+            // itself.
+            Err(e) if verdict_of(&e) == Some(Verdict::Unauthorized) => {
+                tracing::warn!(
+                    "the bus rejected this window's stored session credential (revoked or \
+                     rotated); registering session '{session}' again with the agent token"
+                );
+                register_new(&remote, session).await?
+            }
+            // A stale epoch (409): another process resumed this window
+            // after the stored credential was written. Fail closed.
             Err(e) => return Err(e),
         },
         None => register_new(&remote, session).await?,
@@ -930,6 +1082,7 @@ impl Proxy {
                 role: opts.role.clone(),
                 channel: opts.channel.clone(),
                 generation: 0,
+                stranded: None,
             })),
             in_flight: Arc::new(AtomicUsize::new(0)),
             switch: Arc::new(Mutex::new(())),
@@ -987,10 +1140,12 @@ impl Proxy {
 
         // A team switch would let one conversation carry another team's
         // transcript into this one. The credential was verified and is
-        // dropped unused.
+        // dropped unused. Checked against the window's identity, not its
+        // connection: a window off the bus after a failed adoption has the
+        // same transcript and is bound to the same team.
         {
             let st = self.state.read().await;
-            if let Some(old) = &st.connected
+            if let Some(old) = st.identity()
                 && old.team != team
             {
                 let _ = remote.cancel().await;
@@ -1080,6 +1235,7 @@ impl Proxy {
             let mut st = self.state.write().await;
             st.connected = Some(connected);
             st.disconnected_reason = None;
+            st.stranded = None;
             st.generation += 1;
         }
         // A stored permit, not a broadcast: a keepalive that is not waiting
@@ -1125,6 +1281,19 @@ impl Proxy {
         // a hook of the same conversation can look up — and by the session
         // label otherwise, where nothing else can find it anyway.
         let key = st.host_id.clone().unwrap_or_else(|| st.session.clone());
+        // The connected context, else the one a failed adoption retired:
+        // its secret is the only one the bus still accepts for this window.
+        let identity = st.identity();
+        let (profile, agent, team, mcp_url, proof) = match identity {
+            Some(i) => (
+                i.profile,
+                Some(i.agent),
+                Some(i.team),
+                Some(i.mcp_url),
+                i.proof,
+            ),
+            None => (None, None, None, None, None),
+        };
         // The credential goes in here, which is why the file is 0600 inside a
         // 0700 directory and why `context hook` is the only thing that reads
         // it. It never reaches a tool result, a log or argv.
@@ -1135,16 +1304,16 @@ impl Proxy {
             "project": st.project,
             "role": st.role,
             "channel": st.channel,
-            "profile": st.connected.as_ref().and_then(|c| c.resolved.profile.clone()),
-            "agent": st.connected.as_ref().map(|c| c.agent.clone()),
-            "team": st.connected.as_ref().map(|c| c.team.clone()),
-            "mcp_url": st.connected.as_ref().map(|c| c.resolved.mcp_url.clone()),
-            "session_token": st.connected.as_ref().and_then(|c| c.proof.as_ref().map(|p| p.token.clone())),
-            "session_id": st.connected.as_ref().and_then(|c| c.proof.as_ref().map(|p| p.session_id.clone())),
+            "profile": profile,
+            "agent": agent,
+            "team": team,
+            "mcp_url": mcp_url,
+            "session_token": proof.as_ref().map(|p| p.token.clone()),
+            "session_id": proof.as_ref().map(|p| p.session_id.clone()),
             // Hooks send this epoch, so they are fenced with their proxy
             // rather than fencing it: a hook never bumps it.
-            "epoch": st.connected.as_ref().and_then(|c| c.proof.as_ref().map(|p| p.epoch)),
-            "expires_at": st.connected.as_ref().and_then(|c| c.proof.as_ref().map(|p| p.expires_at.clone())),
+            "epoch": proof.as_ref().map(|p| p.epoch),
+            "expires_at": proof.as_ref().map(|p| p.expires_at.clone()),
             "proxy_pid": std::process::id(),
             "updated_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         });
@@ -1297,12 +1466,14 @@ impl Proxy {
             st.binding = Binding::RequestMeta;
             st.session = session_for(&host_id);
         }
+        // The profile this window speaks as, connected or not: a window off
+        // the bus reconnects as itself, not as the startup default.
         let inputs = {
             let st = self.state.read().await;
-            match &st.connected {
-                Some(c) => {
+            match st.identity() {
+                Some(id) => {
                     let mut i = self.opts.inputs.clone();
-                    i.profile = c.resolved.profile.clone();
+                    i.profile = id.profile;
                     i
                 }
                 None => self.opts.inputs.clone(),
@@ -1508,7 +1679,7 @@ impl Proxy {
                 // what to do. This is what a revoked or rotated token looks
                 // like from here; see `unauthorized` for what it is not.
                 if unauthorized(&e) {
-                    self.mark_unauthorized(&profile);
+                    self.mark_unauthorized(&profile, generation);
                     ErrorData::invalid_request(
                         format!(
                             "{name}: the bus rejected this window's credential — it has been \
@@ -1636,9 +1807,14 @@ impl Proxy {
     /// Record that the bus refused this window's credential, so
     /// `session_status` and the next `initialize` say so instead of
     /// claiming a healthy connection. Non-blocking: a busy lock means the
-    /// next call reports it.
-    fn mark_unauthorized(&self, profile: &Option<String>) {
-        if let Ok(mut st) = self.state.try_write() {
+    /// next call reports it. Only for the context the refused call ran
+    /// in: a call that was still in flight on a connection this window has
+    /// since replaced (a resume, a profile switch) says nothing about the
+    /// credential it holds now.
+    fn mark_unauthorized(&self, profile: &Option<String>, generation: u64) {
+        if let Ok(mut st) = self.state.try_write()
+            && st.generation == generation
+        {
             st.disconnected_reason = Some(format!(
                 "the bus rejected the credential{} (revoked or rotated)",
                 profile
@@ -1647,6 +1823,139 @@ impl Proxy {
                     .unwrap_or_default()
             ));
         }
+    }
+
+    /// `resume_session` asked for through this window.
+    ///
+    /// Forwarded as is, the bus rotates the secret and bumps the epoch of
+    /// the credential this proxy sends, hands the new secret to the model,
+    /// and every later call — this proxy's, its hooks', its next restart's —
+    /// presents the old one and is refused. So the proxy runs the resume
+    /// with the credential it holds, adopts what comes back exactly as a
+    /// reconnect does (new connection, binding rewritten), and answers
+    /// with the credential's description, never its secret. `None` when
+    /// this window holds no credential (a bus that issues none, or no
+    /// connection): the call is forwarded and the bus answers it. The error
+    /// is the sentence the model reads; the detail behind it is logged.
+    async fn resume_in_place(&self) -> Option<Result<Value, String>> {
+        let _guard = self.switch.lock().await;
+        let (url, proof, session) = {
+            let st = self.state.read().await;
+            let c = st.connected.as_ref()?;
+            let proof = c.proof.clone()?;
+            (c.resolved.mcp_url.clone(), proof, st.session.clone())
+        };
+        Some(self.adopt_resumed(&url, &proof, &session).await)
+    }
+
+    async fn adopt_resumed(
+        &self,
+        url: &str,
+        prior: &SessionProof,
+        session: &str,
+    ) -> Result<Value, String> {
+        let proof = rotate(url, prior, session).await?;
+        // From here the bus refuses the old secret. A connection on the new
+        // one gets a few tries: one transient failure must not cost the
+        // window the bus.
+        let mut attempt = 1;
+        let opened = loop {
+            match open_with(url, &proof, session).await {
+                Ok(opened) => break Ok(opened),
+                Err(why) if attempt < ADOPT_ATTEMPTS => {
+                    tracing::warn!(
+                        attempt,
+                        "the resumed credential could not open a connection ({why}); retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250 * 4u64.pow(attempt - 1))).await;
+                    attempt += 1;
+                }
+                Err(why) => break Err(why),
+            }
+        };
+        let old = {
+            let mut st = self.state.write().await;
+            let Some(c) = st.connected.take() else {
+                return Err(
+                    "resume_session: the session was resumed, but this window lost its \
+                     connection meanwhile; restart this MCP server to reconnect it"
+                        .to_owned(),
+                );
+            };
+            match opened {
+                Ok((remote, tools)) => {
+                    let instructions = remote.peer_info().and_then(|i| i.instructions.clone());
+                    st.connected = Some(Connected {
+                        resolved: c.resolved.clone(),
+                        agent: c.agent.clone(),
+                        team: c.team.clone(),
+                        remote: Arc::new(remote),
+                        tools,
+                        remote_instructions: instructions,
+                        proof: Some(proof.clone()),
+                        ct: CancellationToken::new(),
+                    });
+                    st.disconnected_reason = None;
+                }
+                Err(why) => {
+                    // The old secret is refused and the new one opens no
+                    // connection: serving on the old connection would only
+                    // collect refusals while reporting a healthy window. It
+                    // is retired, and the new credential stays in the
+                    // binding, where a restart resumes with it.
+                    st.stranded = Some(Identity {
+                        profile: c.resolved.profile.clone(),
+                        agent: c.agent.clone(),
+                        team: c.team.clone(),
+                        mcp_url: c.resolved.mcp_url.clone(),
+                        proof: Some(proof.clone()),
+                    });
+                    let said = format!(
+                        "the session was resumed and the bus rotated this window's credential, \
+                         but the new one could not open a connection ({why}); it is saved, and \
+                         this window is off the bus until this MCP server is restarted, which \
+                         reconnects with it"
+                    );
+                    st.disconnected_reason = Some(said.clone());
+                    st.generation += 1;
+                    drop(st);
+                    c.ct.cancel();
+                    close_remote(c.remote).await;
+                    self.wake.notify_one();
+                    self.write_binding().await;
+                    return Err(format!("resume_session: {said}"));
+                }
+            }
+            st.generation += 1;
+            c
+        };
+        // Calls still in flight on the old connection are refused by the
+        // bus from now on; cancel them rather than let them report a
+        // rejected credential the window no longer has.
+        old.ct.cancel();
+        close_remote(old.remote).await;
+        self.wake.notify_one();
+        self.write_binding().await;
+        let expires_in_seconds = chrono::DateTime::parse_from_rfc3339(&proof.expires_at)
+            .map(|t| (t.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds())
+            .unwrap_or(0)
+            .max(0);
+        // The bus's own shape, without the secret: the proxy holds it.
+        let described = crate::model::SessionCredential {
+            session_token: None,
+            session_id: proof.session_id,
+            session: session.to_owned(),
+            address: format!("{}/{session}", old.agent),
+            epoch: proof.epoch,
+            expires_at: proof.expires_at,
+            expires_in_seconds,
+        };
+        serde_json::to_value(described).map_err(|e| {
+            tracing::warn!(error = %e, "could not describe the resumed credential");
+            "resume_session: the session was resumed and this window holds the new \
+             credential, but its description could not be built; session_status shows it"
+                .to_owned()
+        })
     }
 
     /// The channel this window posts to when a message names none: its own
@@ -1844,7 +2153,7 @@ impl Proxy {
             Err(e) => match verdict_of(&e) {
                 Some(Verdict::Unauthorized) => {
                     tracing::warn!(error = %e, "the bus refused to renew this window's credential");
-                    self.mark_unauthorized(&profile);
+                    self.mark_unauthorized(&profile, generation);
                     Renewal::Refused
                 }
                 Some(Verdict::NoSuchTool) => {
@@ -1948,10 +2257,13 @@ impl Proxy {
         let (key, mine) = {
             let st = self.state.read().await;
             let key = st.host_id.clone().unwrap_or_else(|| st.session.clone());
-            let mine = st
-                .connected
-                .as_ref()
-                .and_then(|c| c.proof.as_ref().map(|p| (p.session_id.clone(), p.epoch)));
+            // The window's identity, not its connection: one retired by a
+            // failed adoption still owns the record it wrote, and only that
+            // record. A window with no identity at all wrote none.
+            let Some(identity) = st.identity() else {
+                return;
+            };
+            let mine = identity.proof.map(|p| (p.session_id, p.epoch));
             (key, mine)
         };
         let path = context::binding_path(&self.opts.state_dir, &key);
@@ -2052,6 +2364,44 @@ async fn report_holdings(
     }
 }
 
+/// Why `resume_session` with a lifetime of its own is refused here.
+const RESUME_TTL_REFUSED: &str = "resume_session: through this proxy a resumed credential keeps \
+     the lifetime this window renews it with (BUS_SESSION_TTL_SECS, else the bus default), so \
+     ttl_seconds is not accepted and nothing was resumed; call it without ttl_seconds";
+
+/// A bus tool as this proxy serves it. `resume_session` is run by the
+/// proxy, and its credential lives as long as every other one the window
+/// holds: register, resume and each renewal ask for `BUS_SESSION_TTL_SECS`,
+/// and the renewal schedule is computed from it. A lifetime asked for on one
+/// call would last until the next renewal, so the proxy does not advertise
+/// `ttl_seconds` and refuses it.
+fn as_proxied(mut tool: Tool) -> Tool {
+    if tool.name != "resume_session" {
+        return tool;
+    }
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        properties.remove("ttl_seconds");
+    }
+    if let Some(Value::Array(required)) = schema.get_mut("required") {
+        required.retain(|r| r != "ttl_seconds");
+    }
+    schema.insert("additionalProperties".into(), Value::Bool(false));
+    tool.input_schema = Arc::new(schema);
+    let said = tool.description.as_deref().unwrap_or_default();
+    tool.description = Some(
+        format!(
+            "{said} Through this proxy, the proxy runs the resume and keeps the new secret; \
+             the lifetime is this window's (BUS_SESSION_TTL_SECS), so ttl_seconds is not \
+             accepted."
+        )
+        .trim_start()
+        .to_owned()
+        .into(),
+    );
+    tool
+}
+
 fn tool_error(msg: String) -> CallToolResult {
     CallToolResult::error(vec![rmcp::model::ContentBlock::text(msg)])
 }
@@ -2077,7 +2427,7 @@ impl ServerHandler for Proxy {
     ) -> Result<ListToolsResult, ErrorData> {
         let mut tools = local_tools();
         if let Some(c) = &self.state.read().await.connected {
-            tools.extend(c.tools.iter().cloned());
+            tools.extend(c.tools.iter().cloned().map(as_proxied));
         }
         Ok(crate::tools::catalogue(tools))
     }
@@ -2129,6 +2479,24 @@ impl ServerHandler for Proxy {
             // the bus answers within a minute (HTTP intermediaries), and a
             // host that re-asks every minute spends a model turn each time.
             "wait_for_updates" => Ok(self.long_wait(request, context.ct).await?.into()),
+            // A resume rotates the secret this proxy sends; the proxy has to
+            // be the one that keeps the new one (#214). The lifetime is the
+            // window's, not the call's: see `as_proxied`.
+            "resume_session" => {
+                if request
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("ttl_seconds"))
+                    .is_some_and(|v| !v.is_null())
+                {
+                    return Ok(tool_error(RESUME_TTL_REFUSED.to_owned()).into());
+                }
+                match self.resume_in_place().await {
+                    Some(Ok(value)) => Ok(CallToolResult::structured(value).into()),
+                    Some(Err(said)) => Ok(tool_error(said).into()),
+                    None => Ok(self.forward(request, context.ct).await?.into()),
+                }
+            }
             "post_message" => {
                 let mut request = request;
                 if let Some(channel) = self.default_channel().await {

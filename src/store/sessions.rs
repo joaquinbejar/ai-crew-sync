@@ -146,7 +146,10 @@ pub async fn register(
             "session '{label}' is already registered and still live. Holding the agent \
              token does not make you that window: reconnect it with resume_session, using \
              the session credential the process that owns it holds, or close it first \
-             with revoke_session if it is gone for good."
+             with revoke_session if it is gone for good — {{\"session\": \"{label}\"}} \
+             from another window of this agent, or `ai-crew-sync client call \
+             revoke_session --args '{{\"session\":\"{label}\"}}'` from a terminal — and \
+             register again."
         )));
     };
 
