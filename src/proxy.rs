@@ -1591,6 +1591,14 @@ impl Proxy {
         };
         // The whole wait belongs to the identity it started under.
         let started_under = self.state.read().await.generation;
+        // Each slice resumes where the previous one stopped, so a task, lock
+        // or note change between two slices is replayed, not lost (#211).
+        let mut since = request
+            .arguments
+            .as_ref()
+            .and_then(|a| a.get("since"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(total.min(PROXY_MAX_WAIT_SECS) as u64);
         loop {
@@ -1598,10 +1606,14 @@ impl Proxy {
                 .saturating_duration_since(std::time::Instant::now())
                 .as_secs() as i64;
             let mut slice = request.clone();
-            slice.arguments.get_or_insert_with(Default::default).insert(
+            let args = slice.arguments.get_or_insert_with(Default::default);
+            args.insert(
                 "timeout_seconds".into(),
                 json!(left.clamp(5, SERVER_WAIT_SLICE_SECS)),
             );
+            if let Some(position) = &since {
+                args.insert("since".into(), json!(position));
+            }
             let result = self
                 .forward_bound(slice, host_ct.clone(), Some(started_under))
                 .await?;
@@ -1613,6 +1625,11 @@ impl Proxy {
             if woke || left <= SERVER_WAIT_SLICE_SECS || host_ct.is_cancelled() {
                 return Ok(result);
             }
+            since = result
+                .structured_content
+                .as_ref()
+                .and_then(|v| v["resume_from"].as_str().map(str::to_owned))
+                .or(since);
         }
     }
 

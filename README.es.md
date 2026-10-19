@@ -797,6 +797,14 @@ cuando pasa algo o se acaba el tiempo. El cliente tiene que permitir una
 llamada a herramienta tan larga; en Codex, con `tool_timeout_sec` en el
 servidor (ver `examples/codex-config.toml`).
 
+Tampoco se pierde nada entre dos esperas. Cada resultado de
+`wait_for_updates` lleva `resume_from`, su posición en el bus; pásalo como
+`since` y la siguiente espera informa enseguida de los cambios de tareas,
+locks y notas que ocurrieron entre medias (los mensajes nunca lo necesitaron:
+su estado de no leído está en la base de datos). El proxy lo encadena de un
+tramo de una espera larga al siguiente. El bus guarda esos eventos alrededor
+de un día (`bus_event_log`, migración 0020).
+
 El proxy hace todo esto por ti: registra la sesión al conectar, reenvía cada
 llamada con la credencial y el epoch, renueva la credencial a mitad de su
 vida tanto si la ventana está ocupada como ociosa (`BUS_SESSION_TTL_SECS` y

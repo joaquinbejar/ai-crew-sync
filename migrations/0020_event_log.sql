@@ -1,0 +1,100 @@
+-- A short replayable log of task, lock and note events (#211).
+--
+-- NOTIFY is fire-and-forget: an event published while nobody is listening is
+-- gone, and a lock release deletes the very row that could have told a
+-- latecomer about it. wait_for_updates subscribes per call, so a client that
+-- waits again (or the proxy covering one long wait with several requests)
+-- could miss a task, lock or note change landing between two calls. Messages
+-- never had the problem: their unread state is in the database.
+--
+-- Each of those events is now also appended here with the transaction that
+-- wrote it. A wait returns the snapshot it read from (`pg_current_snapshot()`)
+-- and the next one replays the rows that snapshot could not see. Positions
+-- are snapshots rather than row ids because ids are allocated before commit:
+-- a slow transaction can commit a lower id after a higher one was already
+-- reported, and an id watermark would skip it for good. Rows hold the same
+-- ids-only payload the NOTIFY always carried, scoped by team, and are kept for
+-- a day.
+
+CREATE TABLE bus_event_log (
+    id      BIGSERIAL   PRIMARY KEY,
+    team_id UUID        NOT NULL,
+    -- When the row was written, not when its transaction began: a long
+    -- transaction must not log rows that are already due for trimming.
+    at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    -- The writing transaction, for snapshot visibility on replay.
+    tx      XID8        NOT NULL DEFAULT pg_current_xact_id(),
+    payload JSONB       NOT NULL
+);
+
+CREATE INDEX bus_event_log_team_idx ON bus_event_log (team_id, id);
+CREATE INDEX bus_event_log_at_idx ON bus_event_log (at);
+
+COMMENT ON TABLE bus_event_log IS
+    'Replayable copy of task, lock and note events for wait_for_updates (#211). '
+    'Ids-only payloads, team-scoped, kept for about a day.';
+
+-- Append, then notify exactly as before. Roughly one call in a hundred also
+-- trims a batch of rows older than a day, which keeps the table small without
+-- a scheduler. The trim skips rows another trim holds (SKIP LOCKED) and is
+-- bounded, so two writers never wait on, or deadlock over, each other's
+-- housekeeping. A `since` older than a day replays only what is left.
+CREATE FUNCTION bus_emit(p JSONB) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO bus_event_log (team_id, payload)
+        VALUES ((p ->> 'team_id')::uuid, p);
+    PERFORM pg_notify('bus_events', p::text);
+    IF random() < 0.01 THEN
+        DELETE FROM bus_event_log
+         WHERE id IN (SELECT id FROM bus_event_log
+                       WHERE at < clock_timestamp() - interval '1 day'
+                       ORDER BY id
+                       LIMIT 500
+                       FOR UPDATE SKIP LOCKED);
+    END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION notify_task() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM bus_emit(jsonb_build_object(
+        'kind', 'task',
+        'team_id', NEW.team_id,
+        'key', NEW.key,
+        'status', NEW.status,
+        'claimed_by', NEW.claimed_by
+    ));
+    RETURN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION notify_lock() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        PERFORM bus_emit(jsonb_build_object(
+            'kind', 'lock',
+            'event', 'released',
+            'team_id', OLD.team_id,
+            'name', OLD.name
+        ));
+        RETURN NULL;
+    END IF;
+    PERFORM bus_emit(jsonb_build_object(
+        'kind', 'lock',
+        'event', 'acquired',
+        'team_id', NEW.team_id,
+        'name', NEW.name,
+        'holder_agent_id', NEW.holder_agent_id
+    ));
+    RETURN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION notify_note() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM bus_emit(jsonb_build_object(
+        'kind', 'note',
+        'team_id', NEW.team_id,
+        'scope', NEW.scope,
+        'key', NEW.key,
+        'updated_by', NEW.updated_by
+    ));
+    RETURN NULL;
+END $$;

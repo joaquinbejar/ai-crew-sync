@@ -434,6 +434,10 @@ pub struct WaitResult {
     pub unread_direct_messages: i64,
     /// What to do next, e.g. which tool to call to fetch the details.
     pub suggestion: String,
+    /// Position reached on the bus. Pass it as `since` to the next
+    /// wait_for_updates so a task, lock or note change that lands between the
+    /// two calls is reported instead of lost. Opaque.
+    pub resume_from: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

@@ -38,6 +38,11 @@ pub struct WaitArgs {
     /// and notes always wake you either way.
     #[serde(default)]
     pub all_channels: bool,
+    /// `resume_from` from your previous wait_for_updates. Task, lock and note
+    /// changes after that position are reported at once, so waiting again
+    /// never loses what happened between two calls. Omit on a first wait.
+    #[serde(default)]
+    pub since: Option<String>,
 }
 
 async fn unread_dms(pool: &PgPool, auth: &AuthCtx) -> Result<i64, sqlx::Error> {
@@ -218,6 +223,99 @@ fn suggestion_for(events: &[WaitEvent], unread: i64) -> String {
     }
 }
 
+/// Longest `since` accepted: a snapshot of a busy server is a few hundred
+/// bytes; anything longer is not one this bus returned.
+const MAX_SINCE_LEN: usize = 4096;
+/// Task, lock and note events described in one answer; the rest are
+/// summarised so nothing is skipped silently.
+const REPLAY_LIMIT: i64 = 50;
+
+/// What the log holds for a caller between two positions.
+struct Replay {
+    /// The snapshot this read used: the next position.
+    position: String,
+    /// Up to REPLAY_LIMIT events, oldest first.
+    events: Vec<BusEvent>,
+    /// How many there were in all.
+    total: i64,
+}
+
+/// Task, lock and note events of the caller's team, of the wanted kinds,
+/// written by transactions `since` could not see and visible now. One
+/// statement, so the events and the returned snapshot agree exactly: a
+/// transaction still running is neither reported nor skipped, it is simply
+/// still invisible in the returned position and comes back next time. With
+/// no `since`, only the position is read.
+async fn replay(
+    pool: &PgPool,
+    auth: &AuthCtx,
+    since: Option<&str>,
+    kinds: Option<&[String]>,
+) -> Result<Replay, ErrorData> {
+    let row: (String, i64, serde_json::Value) = sqlx::query_as(
+        r#"
+        WITH ev AS (
+            SELECT e.id, e.payload
+            FROM bus_event_log e
+            WHERE $2::pg_snapshot IS NOT NULL
+              AND e.team_id = $1
+              AND NOT pg_visible_in_snapshot(e.tx, $2::pg_snapshot)
+              AND ($3::text[] IS NULL OR e.payload ->> 'kind' = ANY($3))
+        )
+        SELECT pg_current_snapshot()::text,
+               (SELECT count(*) FROM ev),
+               COALESCE((SELECT json_agg(payload ORDER BY id)
+                           FROM (SELECT id, payload FROM ev ORDER BY id LIMIT $4) first),
+                        '[]'::json)
+        "#,
+    )
+    .bind(auth.team_id)
+    .bind(since)
+    .bind(kinds)
+    .bind(REPLAY_LIMIT)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::Database(db) = &e
+            && db.code().is_some_and(|c| c.starts_with("22"))
+        {
+            return ErrorData::invalid_params(
+                "since is not a resume_from this bus returned. Pass resume_from from the \
+                 previous wait_for_updates exactly, or omit since to start fresh.",
+                None,
+            );
+        }
+        tracing::error!(error = %e, "event replay failed");
+        ErrorData::internal_error("database error", None)
+    })?;
+    let (position, total, payloads) = row;
+    let events = payloads
+        .as_array()
+        .map(|a| a.iter().cloned().map(BusEvent).collect())
+        .unwrap_or_default();
+    Ok(Replay {
+        position,
+        events,
+        total,
+    })
+}
+
+/// Say how many logged changes were left out of the answer, and how to
+/// re-sync, rather than drop them.
+fn push_overflow(events: &mut Vec<WaitEvent>, replay: &Replay) {
+    let shown = replay.events.len() as i64;
+    if replay.total > shown {
+        events.push(WaitEvent {
+            kind: "backlog".into(),
+            summary: format!(
+                "{} more task, lock or note change(s) since your last wait; call list_tasks, \
+                 list_locks or list_notes to see the current state",
+                replay.total - shown
+            ),
+        });
+    }
+}
+
 #[tool_router(router = events_router, vis = "pub")]
 impl Bus {
     #[tool(
@@ -258,9 +356,35 @@ impl Bus {
                 .map(|(id, _)| id),
         };
 
+        if args
+            .since
+            .as_deref()
+            .is_some_and(|v| v.len() > MAX_SINCE_LEN)
+        {
+            return Err(ErrorData::invalid_params(
+                "since is not a resume_from this bus returned. Pass resume_from from the \
+                 previous wait_for_updates exactly, or omit since to start fresh.",
+                None,
+            ));
+        }
+        let kind_list: Option<Vec<String>> = kind_filter.clone();
+
         // Subscribe before checking the database so nothing slips between the
         // check and the wait.
         let mut rx = self.hub.subscribe();
+
+        // Task, lock and note changes the caller has not seen: committed after
+        // the snapshot it last read from, and visible now. The answer carries
+        // the snapshot this read used, which is the next position.
+        let first = replay(&self.db, &auth, args.since.as_deref(), kind_list.as_deref()).await?;
+        let mut position = first.position.clone();
+        let mut events: Vec<WaitEvent> = Vec::new();
+        for event in &first.events {
+            if let Some(d) = describe(&self.db, event).await {
+                events.push(d);
+            }
+        }
+        push_overflow(&mut events, &first);
 
         // Same rule as the wake filter below: reporting a backlog the wait
         // would not have woken for is a lie the caller cannot act on.
@@ -269,34 +393,45 @@ impl Bus {
             ErrorData::internal_error("database error", None)
         })?;
         if pending > 0 && wants("message") {
+            events.insert(
+                0,
+                WaitEvent {
+                    kind: "message".into(),
+                    summary: format!("{pending} unread message(s) already waiting"),
+                },
+            );
+        }
+        if !events.is_empty() {
             let dms = unread_dms(&self.db, &auth).await.unwrap_or(0);
             return Ok(Json(WaitResult {
                 woke: true,
                 timed_out: false,
-                events: vec![WaitEvent {
-                    kind: "message".into(),
-                    summary: format!("{pending} unread message(s) already waiting"),
-                }],
+                suggestion: suggestion_for(&events, dms),
+                events,
                 unread_direct_messages: dms,
-                suggestion: "Call read_messages to fetch them.".into(),
+                resume_from: position,
             }));
         }
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64);
-        let mut events: Vec<WaitEvent> = Vec::new();
-
+        // Messages are described as they arrive (their unread state is the
+        // record). Task, lock and note events only wake the wait: what is
+        // reported for them is read back from the log below, so nothing that
+        // committed meanwhile is skipped or counted twice.
         while events.is_empty() {
             let event = tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
                 recv = rx.recv() => match recv {
                     Ok(ev) => ev,
-                    // Lagged: we missed events; report a generic wake so the
-                    // caller re-syncs from the database.
+                    // Lagged: we missed notifications. The log read below
+                    // recovers tasks, locks and notes; say so for messages.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        events.push(WaitEvent {
-                            kind: "unknown".into(),
-                            summary: "event stream lagged; re-check the bus".into(),
-                        });
+                        if wants("message") {
+                            events.push(WaitEvent {
+                                kind: "unknown".into(),
+                                summary: "event stream lagged; re-check the bus".into(),
+                            });
+                        }
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -309,27 +444,42 @@ impl Bus {
             {
                 continue;
             }
+            if event.kind() != "message" {
+                // A notification is only a hint: it may be for a change the
+                // replay above already reported, or one that committed before
+                // this wait's starting position. Ask the log; wake only for
+                // something new, and otherwise keep waiting from the newer
+                // position.
+                let fresh = replay(&self.db, &auth, Some(&position), kind_list.as_deref()).await?;
+                position = fresh.position.clone();
+                for e in &fresh.events {
+                    if let Some(d) = describe(&self.db, e).await {
+                        events.push(d);
+                    }
+                }
+                push_overflow(&mut events, &fresh);
+                continue;
+            }
             // Your own messages are not news to you — but "you" is this
             // session, not the person. Excluding by agent alone meant an
             // announcement from your general window never woke the repository
             // windows it was written for, which is the coordination pattern
             // sessions exist to enable.
-            if event.kind() == "message"
-                && event.sender_agent_id() == Some(auth.agent_id)
+            if event.sender_agent_id() == Some(auth.agent_id)
                 && event.sender_session().unwrap_or("") == auth.session
             {
                 continue;
             }
             if let Some(described) = describe(&self.db, &event).await {
                 events.push(described);
-                // Grace window: batch events that arrive together.
+                // Grace window: batch messages that arrive together.
                 let grace = tokio::time::Instant::now() + Duration::from_millis(150);
                 while let Ok(Ok(more)) = tokio::time::timeout_at(grace, rx.recv()).await {
-                    if more.visible_to(auth.team_id, auth.agent_id, &auth.session)
+                    if more.kind() == "message"
+                        && more.visible_to(auth.team_id, auth.agent_id, &auth.session)
                         && in_focus(&more, focus)
-                        && wants(more.kind())
-                        && !(more.kind() == "message"
-                            && more.sender_agent_id() == Some(auth.agent_id))
+                        && wants("message")
+                        && more.sender_agent_id() != Some(auth.agent_id)
                         && let Some(d) = describe(&self.db, &more).await
                     {
                         events.push(d);
@@ -337,6 +487,19 @@ impl Bus {
                 }
             }
         }
+
+        // Everything logged since the position this wait started from, read
+        // in one statement whose snapshot becomes the next position. Run on
+        // every exit, a timeout included: a notification can be missed, the
+        // log cannot.
+        let last = replay(&self.db, &auth, Some(&position), kind_list.as_deref()).await?;
+        position = last.position.clone();
+        for event in &last.events {
+            if let Some(d) = describe(&self.db, event).await {
+                events.push(d);
+            }
+        }
+        push_overflow(&mut events, &last);
 
         let unread = unread_dms(&self.db, &auth).await.unwrap_or(0);
         let woke = !events.is_empty();
@@ -346,6 +509,7 @@ impl Bus {
             suggestion: suggestion_for(&events, unread),
             events,
             unread_direct_messages: unread,
+            resume_from: position,
         }))
     }
 }
