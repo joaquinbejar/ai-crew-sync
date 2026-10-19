@@ -12353,12 +12353,6 @@ async fn a_lapsed_lease_reads_as_open_everywhere() {
     h.shutdown().await;
 }
 
-/// Revoking an agent token takes its session credentials with it. Auth
-/// already refused them, but their rows still read as live: recovery
-/// counted a window that could not answer and the label stayed reserved
-/// for a credential that no longer worked, until it expired a day later
-/// (#137). A genuinely live window under another token still protects.
-
 /// Revoking a session ends that credential, not the label (#207): the agent
 /// token speaks for every window of the agent, so its holder can register the
 /// label again and gets a fresh credential, while the revoked one stays dead.
@@ -12399,6 +12393,11 @@ async fn revoking_a_session_ends_the_credential_not_the_label() {
     h.shutdown().await;
 }
 
+/// Revoking an agent token takes its session credentials with it. Auth
+/// already refused them, but their rows still read as live: recovery
+/// counted a window that could not answer and the label stayed reserved
+/// for a credential that no longer worked, until it expired a day later
+/// (#137). A genuinely live window under another token still protects.
 #[tokio::test]
 async fn a_revoked_token_takes_its_sessions_with_it() {
     use ai_crew_sync::auth::{generate_token, hash_token, token_prefix};
