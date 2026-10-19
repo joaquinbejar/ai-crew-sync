@@ -357,15 +357,109 @@ pub async fn get_task(pool: &PgPool, auth: &AuthCtx, key: &str) -> BusResult<Tas
 
 // -------------------------------------------------------------------- list --
 
+/// One page of `list_tasks`.
+pub struct TaskPageQuery {
+    pub status: Option<String>,
+    pub mine_only: bool,
+    pub limit: i64,
+    /// Only tasks whose key starts with this, e.g. `api#`.
+    pub project_prefix: Option<String>,
+    /// `next_cursor` from the previous page.
+    pub cursor: Option<String>,
+}
+
+/// Where a page ended, in the list's order: status rank (claimed, open,
+/// then the rest), most recently updated first, then key. Encoded opaque for
+/// the caller; it carries no secret because it grants nothing: the team and
+/// every filter are re-applied from the caller's token on each page, so the
+/// most a crafted cursor can do is start somewhere else in a list the caller
+/// may read anyway. The fingerprint only catches a cursor reused under other
+/// filters (or another team), which would silently skip or repeat tasks.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PageCursor {
+    v: u8,
+    /// Status rank of the last task returned.
+    r: i32,
+    /// Its `updated_at`, in microseconds.
+    u: i64,
+    /// Its key.
+    k: String,
+    /// Fingerprint of the team and filters the cursor was issued for.
+    f: String,
+}
+
+fn status_rank(status: &str) -> i32 {
+    match status {
+        "claimed" => 0,
+        "open" => 1,
+        _ => 2,
+    }
+}
+
+fn page_fingerprint(
+    auth: &AuthCtx,
+    status: Option<&str>,
+    mine_only: bool,
+    prefix: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    // `mine_only` lists this window's claims, so the window is part of the
+    // filter: another window's cursor would page through a different list.
+    let window = if mine_only {
+        format!("{}/{}", auth.agent_id, auth.session)
+    } else {
+        String::new()
+    };
+    let digest = Sha256::digest(format!(
+        "{}\u{1f}{}\u{1f}{mine_only}\u{1f}{}\u{1f}{window}",
+        auth.team_id,
+        status.unwrap_or(""),
+        prefix.unwrap_or("")
+    ));
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn encode_cursor(cursor: &PageCursor) -> BusResult<String> {
+    use base64::Engine as _;
+    let json = serde_json::to_vec(cursor)
+        .map_err(|e| BusError::invalid(format!("could not encode the page cursor: {e}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
+}
+
+fn decode_cursor(raw: &str, fingerprint: &str) -> BusResult<PageCursor> {
+    use base64::Engine as _;
+    let unusable = || {
+        BusError::invalid(
+            "cursor is not one list_tasks issued. Pass next_cursor exactly as returned, or \
+             call list_tasks without a cursor to start from the first page.",
+        )
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw.trim())
+        .map_err(|_| unusable())?;
+    let cursor: PageCursor = serde_json::from_slice(&bytes).map_err(|_| unusable())?;
+    if cursor.v != 1 {
+        return Err(unusable());
+    }
+    if cursor.f != fingerprint {
+        return Err(BusError::invalid(
+            "this cursor was issued for different filters (status, mine_only or \
+             project_prefix) or, with mine_only, for another window. Repeat the call from \
+             the same window with the same filters as the page it came from, or call \
+             list_tasks without a cursor to start again.",
+        ));
+    }
+    Ok(cursor)
+}
+
 pub async fn list_tasks(
     pool: &PgPool,
     auth: &AuthCtx,
-    status: Option<String>,
-    mine_only: bool,
-    limit: i64,
+    query: TaskPageQuery,
 ) -> BusResult<TaskList> {
-    let limit = limit.clamp(1, MAX_LIMIT);
-    let status = status
+    let limit = query.limit.clamp(1, MAX_LIMIT);
+    let status = query
+        .status
         .map(|s| s.trim().to_lowercase())
         .filter(|s| s != "any");
     if let Some(s) = &status
@@ -375,8 +469,34 @@ pub async fn list_tasks(
             "status must be one of: open, claimed, done, cancelled, any",
         ));
     }
+    let prefix = query
+        .project_prefix
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty());
+    if prefix.as_deref().is_some_and(|p| p.len() > 200) {
+        return Err(BusError::invalid(
+            "project_prefix is longer than a task key can be (200 bytes); shorten it",
+        ));
+    }
+    let fingerprint = page_fingerprint(auth, status.as_deref(), query.mine_only, prefix.as_deref());
+    let after = match query.cursor.as_deref().filter(|c| !c.trim().is_empty()) {
+        Some(raw) => {
+            let c = decode_cursor(raw, &fingerprint)?;
+            let at =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_micros(c.u).ok_or_else(|| {
+                    BusError::invalid(
+                        "cursor is not one list_tasks issued. Call list_tasks without a cursor \
+                     to start from the first page.",
+                    )
+                })?;
+            Some((c.r, at, c.k))
+        }
+        None => None,
+    };
 
-    let rows: Vec<TaskRow> = sqlx::query_as(AssertSqlSafe(format!(
+    let rank =
+        format!("CASE ({EFFECTIVE_STATUS}) WHEN 'claimed' THEN 0 WHEN 'open' THEN 1 ELSE 2 END");
+    let mut rows: Vec<TaskRow> = sqlx::query_as(AssertSqlSafe(format!(
         r#"{TASK_SELECT}
            WHERE t.team_id = $1
              AND ($2::text IS NULL OR ({EFFECTIVE_STATUS}) = $2)
@@ -388,19 +508,45 @@ pub async fn list_tasks(
              AND (NOT $3::bool
                   OR (t.claimed_by = $4 AND COALESCE(t.claimed_session, '') = $6
                       AND COALESCE(t.lease_expires_at > now(), true)))
-           ORDER BY
-             CASE ({EFFECTIVE_STATUS}) WHEN 'claimed' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
-             t.updated_at DESC
+             AND ($7::text IS NULL OR left(t.key, char_length($7)) = $7)
+             -- Keyset: strictly after the last task of the previous page, in
+             -- exactly the order below.
+             AND ($8::int IS NULL
+                  OR ({rank}) > $8
+                  OR (({rank}) = $8 AND (t.updated_at < $9
+                      OR (t.updated_at = $9 AND t.key > $10))))
+           ORDER BY ({rank}), t.updated_at DESC, t.key ASC
            LIMIT $5"#
     )))
     .bind(auth.team_id)
     .bind(status.as_deref())
-    .bind(mine_only)
+    .bind(query.mine_only)
     .bind(auth.agent_id)
-    .bind(limit)
+    .bind(limit + 1)
     .bind(&auth.session)
+    .bind(prefix.as_deref())
+    .bind(after.as_ref().map(|a| a.0))
+    .bind(after.as_ref().map(|a| a.1))
+    .bind(after.as_ref().map(|a| a.2.as_str()))
     .fetch_all(pool)
     .await?;
+
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let last_position = rows
+        .last()
+        .map(|r| (r.updated_at.timestamp_micros(), r.key.clone()));
+    let tasks: Vec<TaskInfo> = rows.into_iter().map(Into::into).collect();
+    let next_cursor = match (has_more, last_position, tasks.last()) {
+        (true, Some((u, k)), Some(info)) => Some(encode_cursor(&PageCursor {
+            v: 1,
+            r: status_rank(&info.status),
+            u,
+            k,
+            f: fingerprint,
+        })?),
+        _ => None,
+    };
 
     let (open, claimed): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
         r#"
@@ -414,9 +560,11 @@ pub async fn list_tasks(
     .await?;
 
     Ok(TaskList {
-        tasks: rows.into_iter().map(Into::into).collect(),
+        tasks,
         open,
         claimed,
+        next_cursor,
+        has_more,
     })
 }
 

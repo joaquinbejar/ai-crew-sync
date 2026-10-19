@@ -46,9 +46,16 @@ pub struct ListTasksArgs {
     /// Only return tasks this session currently holds a live claim on.
     #[serde(default)]
     pub mine_only: bool,
-    /// Maximum tasks to return (1-200).
+    /// Maximum tasks per page (1-200).
     #[serde(default = "default_limit")]
     pub limit: i64,
+    /// Only tasks whose key starts with this, e.g. "api#" for one repository.
+    #[serde(default)]
+    pub project_prefix: Option<String>,
+    /// `next_cursor` from the previous page, to continue the list. Repeat the
+    /// same status, mine_only and project_prefix, or the cursor is refused.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -109,7 +116,9 @@ impl Bus {
 
     #[tool(
         description = "List the team's tasks with who holds each one. Check this before \
-                       starting work so you do not duplicate a teammate's effort."
+                       starting work so you do not duplicate a teammate's effort. Results come \
+                       in pages: when has_more is true, call again with cursor = next_cursor \
+                       and the same filters to see the rest."
     )]
     async fn list_tasks(
         &self,
@@ -118,7 +127,18 @@ impl Bus {
     ) -> Result<Json<TaskList>, ErrorData> {
         let auth = auth_of(&ctx)?;
         Ok(Json(
-            tasks::list_tasks(&self.db, &auth, args.status, args.mine_only, args.limit).await?,
+            tasks::list_tasks(
+                &self.db,
+                &auth,
+                tasks::TaskPageQuery {
+                    status: args.status,
+                    mine_only: args.mine_only,
+                    limit: args.limit,
+                    project_prefix: args.project_prefix,
+                    cursor: args.cursor,
+                },
+            )
+            .await?,
         ))
     }
 

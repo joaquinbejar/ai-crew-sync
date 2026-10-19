@@ -164,9 +164,15 @@ pub fn to_call_with(
                 "ttl_seconds": ttl_seconds
             }),
         ),
-        ClientCmd::Tasks { status, mine } => {
-            ("list_tasks", json!({"status": status, "mine_only": mine}))
-        }
+        ClientCmd::Tasks {
+            status,
+            mine,
+            prefix,
+            cursor,
+        } => (
+            "list_tasks",
+            json!({"status": status, "mine_only": mine, "project_prefix": prefix, "cursor": cursor}),
+        ),
         ClientCmd::Wait {
             timeout_seconds,
             kinds,
@@ -319,6 +325,8 @@ mod tests {
             ClientCmd::Tasks {
                 status: None,
                 mine: false,
+                prefix: None,
+                cursor: None,
             },
             ClientCmd::Task(TaskCmd::Show { key: "k".into() }),
             ClientCmd::Notes {
@@ -394,7 +402,10 @@ mod tests {
         let (tool, args) = mapped(ClientCmd::Tasks {
             status: Some("open".into()),
             mine: true,
+            prefix: Some("api#".into()),
+            cursor: None,
         });
+        assert_eq!(args["project_prefix"], "api#");
         assert_eq!(tool, "list_tasks");
         assert_eq!(
             args["mine_only"], true,

@@ -51,7 +51,7 @@ Each agent — yours, each teammate's — connects with its own token and can:
 | Capability | MCP tools |
 |---|---|
 | Messaging (channels + DMs, read cursors, search) | `post_message`, `read_messages`, `search_messages`, `list_channels`, `create_channel` |
-| Task coordination with leases and **dependencies** (`depends_on`) | `create_task`, `claim_task`, `claim_next_task`, `renew_task_lease`, `release_task`, `complete_task`, `list_tasks`, `get_task` |
+| Task coordination with leases and **dependencies** (`depends_on`); `list_tasks` pages (`cursor`, `project_prefix`) | `create_task`, `claim_task`, `claim_next_task`, `renew_task_lease`, `release_task`, `complete_task`, `list_tasks`, `get_task` |
 | **Real time**: block until something relevant happens (LISTEN/NOTIFY) | `wait_for_updates` |
 | **Agent↔agent RPC**: ask a teammate and wait for their answer in one call | `ask_agent` |
 | **Attachments**: diffs, logs, small files (≤256 KiB) on messages and tasks | `attach_file`, `get_attachment` (+ `attachments` in `post_message`) |
@@ -1126,6 +1126,7 @@ ai-crew-sync client tools                         # what the bus offers this age
 ai-crew-sync client send --channel deploys --body "staging is on 1.4.2"
 ai-crew-sync client send --to marta --body "look at PR 421"
 ai-crew-sync client read --scope inbox
+ai-crew-sync client tasks --prefix api# --status open   # pages of 50; prints --cursor for the next
 ai-crew-sync client agents
 ai-crew-sync client sessions --project market-data --role review   # exact addresses
 ai-crew-sync client task create refactor-auth --title "Rewrite token refresh"

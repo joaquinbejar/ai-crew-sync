@@ -186,6 +186,12 @@ pub enum ClientCmd {
         status: Option<String>,
         #[arg(long)]
         mine: bool,
+        /// Only tasks whose key starts with this, e.g. `api#`.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// The cursor a previous page printed, to continue the list.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Operate on a single task.
     #[command(subcommand)]
