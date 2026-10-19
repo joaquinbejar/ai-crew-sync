@@ -218,6 +218,9 @@ pub(super) fn render(cmd: &ClientCmd, value: &Value) -> anyhow::Result<()> {
                 render_task_line(t);
             }
             println!("({} open, {} claimed)", value["open"], value["claimed"]);
+            if let Some(cursor) = value["next_cursor"].as_str() {
+                println!("(more: repeat with --cursor {cursor})");
+            }
         }
         ClientCmd::Task(TaskCmd::Show { .. }) => {
             render_task_line(&value["task"]);

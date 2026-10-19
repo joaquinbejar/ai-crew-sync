@@ -330,6 +330,11 @@ pub struct TaskList {
     pub tasks: Vec<TaskInfo>,
     pub open: i64,
     pub claimed: i64,
+    /// Pass this back as `cursor`, with the same filters, for the next page.
+    /// `null` on the last page.
+    pub next_cursor: Option<String>,
+    /// True when there are more tasks than this page returned.
+    pub has_more: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

@@ -2609,6 +2609,109 @@ async fn attachments_travel_with_messages_and_tasks() {
     let _ = pedro.cancel().await;
 }
 
+/// `list_tasks` pages through any number of tasks (#216): following
+/// next_cursor returns every task exactly once, in the list's order, and a
+/// cursor only works with the team and filters it was issued for.
+#[tokio::test]
+async fn list_tasks_pages_through_every_task_once() {
+    let h = require_db!("t_task_pages");
+    let joaquin = connect(&h.base, &seed_agent(&h.pool, "acme", "joaquin").await).await;
+    let eve = connect(&h.base, &seed_agent(&h.pool, "other", "eve").await).await;
+    for n in 0..7 {
+        call(
+            &joaquin,
+            "create_task",
+            json!({"key": format!("api#{n}"), "title": "t"}),
+        )
+        .await;
+    }
+    for n in 0..2 {
+        call(
+            &joaquin,
+            "create_task",
+            json!({"key": format!("web#{n}"), "title": "t"}),
+        )
+        .await;
+    }
+    call(
+        &eve,
+        "create_task",
+        json!({"key": "api#secret", "title": "theirs"}),
+    )
+    .await;
+
+    // Three at a time through the api# tasks only.
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let page = call(
+            &joaquin,
+            "list_tasks",
+            json!({"limit": 3, "project_prefix": "api#", "cursor": cursor}),
+        )
+        .await;
+        pages += 1;
+        for t in page["tasks"].as_array().unwrap() {
+            seen.push(t["key"].as_str().unwrap().to_owned());
+        }
+        match page["next_cursor"].as_str() {
+            Some(next) => {
+                assert_eq!(page["has_more"], true, "{page}");
+                cursor = Some(next.to_owned());
+            }
+            None => {
+                assert_eq!(page["has_more"], false, "{page}");
+                break;
+            }
+        }
+        assert!(pages < 10, "pagination never ended: {seen:?}");
+    }
+    assert_eq!(pages, 3, "{seen:?}");
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 7, "every api# task exactly once: {seen:?}");
+    assert!(seen.iter().all(|k| k.starts_with("api#")), "{seen:?}");
+
+    // The first page's cursor, then other filters: refused, not reinterpreted.
+    let first = call(
+        &joaquin,
+        "list_tasks",
+        json!({"limit": 3, "project_prefix": "api#"}),
+    )
+    .await;
+    let c = first["next_cursor"].as_str().unwrap();
+    let err = call_expect_error(
+        &joaquin,
+        "list_tasks",
+        json!({"limit": 3, "project_prefix": "web#", "cursor": c}),
+    )
+    .await;
+    assert!(err.contains("different filters"), "{err}");
+    // Another team's caller cannot use it either.
+    let err = call_expect_error(
+        &eve,
+        "list_tasks",
+        json!({"limit": 3, "project_prefix": "api#", "cursor": c}),
+    )
+    .await;
+    assert!(err.contains("different filters"), "{err}");
+    // Something that was never a cursor.
+    let err = call_expect_error(&joaquin, "list_tasks", json!({"cursor": "not-a-cursor"})).await;
+    assert!(err.contains("not one list_tasks issued"), "{err}");
+
+    // Without paging arguments the answer is today's, plus has_more.
+    let all = call(&joaquin, "list_tasks", json!({})).await;
+    assert_eq!(all["tasks"].as_array().unwrap().len(), 9);
+    assert_eq!(all["has_more"], false);
+    assert!(all["next_cursor"].is_null());
+
+    let _ = joaquin.cancel().await;
+    let _ = eve.cancel().await;
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn blocked_tasks_wait_for_their_dependencies() {
     let h = require_db!("t_deps");
