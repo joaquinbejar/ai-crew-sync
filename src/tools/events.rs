@@ -445,7 +445,20 @@ impl Bus {
                 continue;
             }
             if event.kind() != "message" {
-                break;
+                // A notification is only a hint: it may be for a change the
+                // replay above already reported, or one that committed before
+                // this wait's starting position. Ask the log; wake only for
+                // something new, and otherwise keep waiting from the newer
+                // position.
+                let fresh = replay(&self.db, &auth, Some(&position), kind_list.as_deref()).await?;
+                position = fresh.position.clone();
+                for e in &fresh.events {
+                    if let Some(d) = describe(&self.db, e).await {
+                        events.push(d);
+                    }
+                }
+                push_overflow(&mut events, &fresh);
+                continue;
             }
             // Your own messages are not news to you — but "you" is this
             // session, not the person. Excluding by agent alone meant an

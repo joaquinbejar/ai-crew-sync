@@ -19,7 +19,9 @@
 CREATE TABLE bus_event_log (
     id      BIGSERIAL   PRIMARY KEY,
     team_id UUID        NOT NULL,
-    at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- When the row was written, not when its transaction began: a long
+    -- transaction must not log rows that are already due for trimming.
+    at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     -- The writing transaction, for snapshot visibility on replay.
     tx      XID8        NOT NULL DEFAULT pg_current_xact_id(),
     payload JSONB       NOT NULL
@@ -33,15 +35,22 @@ COMMENT ON TABLE bus_event_log IS
     'Ids-only payloads, team-scoped, kept for about a day.';
 
 -- Append, then notify exactly as before. Roughly one call in a hundred also
--- trims what is older than a day, which keeps the table small without a
--- scheduler.
+-- trims a batch of rows older than a day, which keeps the table small without
+-- a scheduler. The trim skips rows another trim holds (SKIP LOCKED) and is
+-- bounded, so two writers never wait on, or deadlock over, each other's
+-- housekeeping. A `since` older than a day replays only what is left.
 CREATE FUNCTION bus_emit(p JSONB) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
     INSERT INTO bus_event_log (team_id, payload)
         VALUES ((p ->> 'team_id')::uuid, p);
     PERFORM pg_notify('bus_events', p::text);
     IF random() < 0.01 THEN
-        DELETE FROM bus_event_log WHERE at < now() - interval '1 day';
+        DELETE FROM bus_event_log
+         WHERE id IN (SELECT id FROM bus_event_log
+                       WHERE at < clock_timestamp() - interval '1 day'
+                       ORDER BY id
+                       LIMIT 500
+                       FOR UPDATE SKIP LOCKED);
     END IF;
 END $$;
 
