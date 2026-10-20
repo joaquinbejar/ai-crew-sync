@@ -85,20 +85,25 @@ async fn unread_dms(pool: &PgPool, auth: &AuthCtx) -> Result<i64, sqlx::Error> {
 /// read returns.
 fn in_scope(event: &BusEvent, scope: &Scope, focus: Option<Uuid>, auth: &AuthCtx) -> bool {
     match scope {
-        // A direct message counts only when it is addressed to this agent:
-        // another window of yours writing to a teammate is visible to you,
-        // but it is nothing for you to read, and the backlog count agrees.
+        // A direct message counts only when it is for this window: the
+        // same rule as the backlog count and the inbox read.
         Scope::All => {
-            (!event.is_direct_message() || event.recipient_agent_id() == Some(auth.agent_id))
-                && in_focus(event, focus)
+            (!event.is_direct_message() || for_this_window(event, auth)) && in_focus(event, focus)
         }
-        // `visible_to` has already kept a direct message to another window
-        // out; here only ones addressed to this agent remain.
-        Scope::Inbox => {
-            event.is_direct_message() && event.recipient_agent_id() == Some(auth.agent_id)
-        }
+        Scope::Inbox => event.is_direct_message() && for_this_window(event, auth),
         Scope::Channel { id, .. } => event.channel_id() == Some(*id),
     }
+}
+
+/// A direct message addressed to this window, or to the person. `visible_to`
+/// also lets through every message this agent *sent*, so a message between
+/// two other windows of yours (general to web) would otherwise wake a third
+/// window's inbox wait that has nothing to read (#226 review).
+fn for_this_window(event: &BusEvent, auth: &AuthCtx) -> bool {
+    event.recipient_agent_id() == Some(auth.agent_id)
+        && event
+            .recipient_session()
+            .is_none_or(|addressed| addressed == auth.session)
 }
 
 /// Is this event inside the session's channel focus?

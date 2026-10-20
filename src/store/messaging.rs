@@ -570,7 +570,9 @@ impl Scope {
         match self {
             Scope::All => r#"read_messages {"scope": "all"}"#.into(),
             Scope::Inbox => r#"read_messages {"scope": "inbox"}"#.into(),
-            Scope::Channel { name, .. } => format!(r#"read_messages {{"scope": "{name}"}}"#),
+            // With the '#': a channel may be named like a scope keyword
+            // (inbox, all, dm, direct), and only "#inbox" reads the channel.
+            Scope::Channel { name, .. } => format!(r##"read_messages {{"scope": "#{name}"}}"##),
         }
     }
 }

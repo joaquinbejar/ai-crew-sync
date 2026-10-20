@@ -17363,3 +17363,79 @@ async fn a_sibling_windows_outgoing_message_does_not_wake_a_wait() {
     let _ = web.cancel().await;
     h.shutdown().await;
 }
+
+/// A direct message between two other windows of the same agent is not for
+/// this window: it must not wake an inbox wait (#226 review).
+#[tokio::test]
+async fn a_dm_between_two_other_windows_does_not_wake_an_inbox_wait() {
+    let h = require_db!("t_wait_inbox_siblings");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let general = connect_with_session(&h.base, &token, "general").await;
+    let waiter = {
+        let (base, token) = (h.base.clone(), token.clone());
+        tokio::spawn(async move {
+            let api = connect_with_session(&base, &token, "api").await;
+            let r = call(
+                &api,
+                "wait_for_updates",
+                json!({"timeout_seconds": 5, "scope": "inbox", "kinds": ["message"]}),
+            )
+            .await;
+            let _ = api.cancel().await;
+            r
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    call(
+        &general,
+        "post_message",
+        json!({"to": "joaquin/web", "body": "for the web window only"}),
+    )
+    .await;
+    let r = waiter.await.unwrap();
+    assert_eq!(r["timed_out"], true, "{r}");
+    assert_eq!(r["unread_in_scope"], 0, "{r}");
+    let _ = general.cancel().await;
+    h.shutdown().await;
+}
+
+/// A channel named like a scope keyword is read back with its '#', and
+/// following `read_with` drains exactly what the wait reported (#226 review).
+#[tokio::test]
+async fn read_with_names_a_keyword_channel_unambiguously() {
+    let h = require_db!("t_wait_keyword_channel");
+    let joaquin = connect(&h.base, &seed_agent(&h.pool, "acme", "joaquin").await).await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    call(&marta, "create_channel", json!({"name": "inbox"})).await;
+    call(
+        &marta,
+        "post_message",
+        json!({"channel": "inbox", "body": "in the channel"}),
+    )
+    .await;
+    let r = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 5, "scope": "#inbox", "kinds": ["message"]}),
+    )
+    .await;
+    assert_eq!(r["message_scope"], "#inbox", "{r}");
+    assert_eq!(r["unread_in_scope"], 1, "{r}");
+    let read_with = r["read_with"].as_str().unwrap();
+    assert!(read_with.contains("\"#inbox\""), "{read_with}");
+    // Follow it literally.
+    let args: Value = serde_json::from_str(read_with.trim_start_matches("read_messages ")).unwrap();
+    let read = call(&joaquin, "read_messages", args).await;
+    assert_eq!(read["messages"].as_array().unwrap().len(), 1, "{read}");
+    let again = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 5, "scope": "#inbox", "kinds": ["message"]}),
+    )
+    .await;
+    assert_eq!(again["timed_out"], true, "{again}");
+    for c in [joaquin, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
