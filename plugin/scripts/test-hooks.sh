@@ -699,7 +699,7 @@ fi
 # seconds, commands run from the plugin root). A typo in either is a hook
 # that silently never runs.
 PLUGIN_DIR="$(cd "$ROOT/.." && pwd)"
-PLUGIN_DIR="$PLUGIN_DIR" python3 - <<'PY' 2>/dev/null && ok "both hosts' hooks files name existing executable scripts" \
+PLUGIN_DIR="$PLUGIN_DIR" python3 - <<'PY' && ok "both hosts' hooks files name existing executable scripts" \
     || bad "hook files" "a hook names a missing script or a bad timeout"
 import json, os, shlex
 root = os.environ["PLUGIN_DIR"]

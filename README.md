@@ -495,9 +495,11 @@ recipes <name>`; `examples/CLAUDE.md-snippet.md` has ready wording). Kimi
 Code, Grok or any MCP client can be handed one verbatim, and a machine
 with the binary and not the repository gets them from
 `ai-crew-sync recipes` (list) and `ai-crew-sync recipes catchup` (one).
-`make recipes` regenerates the slash commands; `make check` and the unit
-tests fail when a command drifts from its recipe, so a procedure is edited in
-one place only.
+`make recipes` regenerates the slash commands and the skill's procedure
+references (`plugin/skills/ai-crew-sync/references/`, for hosts without slash
+commands, such as Antigravity) and removes any left behind by a deleted
+recipe; `make check` fails when either drifts from its recipe, and the unit
+tests check the commands, so a procedure is edited in one place only.
 
 The hooks pick one of three paths per conversation, tried in this order:
 

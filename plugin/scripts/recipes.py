@@ -38,7 +38,11 @@ def render_reference(recipe_path):
     if not m:
         sys.exit(f"{recipe_path}: first line must be <!-- slash: description=\"…\" hint=\"…\" -->")
     name = os.path.basename(recipe_path)[:-3]
-    body = text[m.end():].replace("{{input}}", "the user's request, in their words")
+    # `Input: {{input}}` introduces what the user asked; anywhere else the
+    # placeholder stands for a value inside a sentence ("the last {{input}}
+    # hours"), where a whole phrase would garble it.
+    body = text[m.end():].replace("Input: {{input}}", "Input: the user's request, in their words")
+    body = body.replace("{{input}}", "<the user's arguments>")
     return (
         f"<!-- Generated from recipes/{name}.md by `make recipes`; edit the recipe. -->\n"
         f"# {name}: {m.group(1)}\n\n"
@@ -77,6 +81,12 @@ def main(mode):
         os.makedirs(REFERENCES, exist_ok=True)
         for path, text in wanted.items():
             open(path, "w").write(text)
+        # A renamed or deleted recipe leaves its generated files behind; the
+        # check names them as strays, so generating removes them.
+        for d in (COMMANDS, REFERENCES):
+            for p in glob.glob(os.path.join(d, "*.md")):
+                if p not in wanted:
+                    os.remove(p)
         return
     drift = [
         os.path.relpath(path, ROOT)

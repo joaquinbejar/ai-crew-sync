@@ -513,9 +513,12 @@ a ellos (`ai-crew-sync recipes <nombre>`; `examples/CLAUDE.md-snippet.md` trae
 la redacción lista). A Kimi Code, Grok o cualquier cliente MCP se le
 pega uno tal cual, y una máquina con el binario pero sin el repositorio los
 obtiene con `ai-crew-sync recipes` (lista) y `ai-crew-sync recipes catchup`
-(uno). `make recipes` regenera los slash commands; `make check` y los tests
-unitarios fallan si un comando se aparta de su receta, así que cada
-procedimiento se edita en un solo sitio.
+(uno). `make recipes` regenera los slash commands y las referencias de
+procedimientos de la skill (`plugin/skills/ai-crew-sync/references/`, para
+hosts sin slash commands, como Antigravity) y borra las que deje una receta
+eliminada; `make check` falla si alguno se aparta de su receta, y los tests
+unitarios comprueban los comandos, así que cada procedimiento se edita en un
+solo sitio.
 
 Los hooks eligen una de tres vías por conversación, probadas en este orden:
 
