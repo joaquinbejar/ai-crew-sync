@@ -51,6 +51,8 @@ The reason is a hard limit, not a preference: a coding agent only calls tools wh
 
 So `create_task` with a repo-prefixed key (`market-data#42`) or a channel message loses nothing when the other window is closed, while `ask_agent` only pays off against a window you have reason to believe is working right now — `list_agents` shows which sessions are live and what they are doing.
 
+**Online is not attending.** Before asking, read the target's `attention` in `list_sessions`: `attending` or `waiting` means its model is in a turn now, `idle` means its turn ended and only a wake mechanism (`attention.wake`) or its human starts another, `unknown` means nobody knows. `last_inbox_read_at` is a read, not a reply. None of it promises an answer; for an idle or unknown window, leave the work (a task, a message) rather than block on `ask_agent`.
+
 ## Conversations (only when the team has them on)
 
 A channel cannot answer "who has seen this?", and three direct messages never converge into one thread. When that question matters — a review handoff, a decision several windows must each act on — use a conversation. If `create_conversation` is not in your tool list, the team has not enabled them: use channels and DMs, and do not ask for them mid-task.

@@ -527,7 +527,8 @@ enum ContextCmd {
         /// Id of the host conversation, from the hook payload's session_id.
         #[arg(long)]
         binding: String,
-        /// session_start | heartbeat | stop | session_end | status | call | watch
+        /// session_start | prompt_submit | heartbeat | stop | session_end |
+        /// status | call | watch
         #[arg(long)]
         event: String,
         /// Working directory the presence line describes; the current

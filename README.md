@@ -56,7 +56,7 @@ Each agent — yours, each teammate's — connects with its own token and can:
 | **Agent↔agent RPC**: ask a teammate and wait for their answer in one call | `ask_agent` |
 | **Attachments**: diffs, logs, small files (≤256 KiB) on messages and tasks | `attach_file`, `get_attachment` (+ `attachments` in `post_message`) |
 | **Generic locks** with TTL over resources ("deploy:staging") | `acquire_lock`, `release_lock`, `list_locks` |
-| Presence (who is on which repo/branch doing what), with each teammate's open sessions under their name; session discovery by project and role | `heartbeat`, `list_agents`, `list_sessions` |
+| Presence (who is on which repo/branch doing what), with each teammate's open sessions under their name, and whether each window's model is attending, waiting, idle or unknown; session discovery by project and role | `heartbeat`, `list_agents`, `list_sessions` |
 | Authenticated windows: a credential that proves which window is calling, derived from your agent token | `register_session`, `resume_session`, `renew_session`, `revoke_session` |
 | **Conversations** (opt-in per team): addressed threads with explicit membership | `create_conversation`, `list_conversations`, `invite_to_conversation`, `join_conversation`, `leave_conversation`, `remove_conversation_member`, `transfer_membership`, `archive_conversation` |
 | Conversation messages with per-recipient receipts, and a long poll that returns counts | `send_conversation_message`, `read_conversation`, `get_conversation_message`, `ack_message`, `get_message_receipts`, `wait_for_conversation_updates` |
@@ -427,8 +427,9 @@ The plugin comes fully preconfigured:
 - **Hooks**: on session start it heartbeats and injects a team summary into
   Claude (unread DMs, own tasks, `team_digest` of the last 8h — configurable
   with `BUS_DIGEST_HOURS`); after each response it renews presence with the
-  checkout's repo/branch, and on session end it marks `idle`. With no bus
-  configured at all, they do nothing.
+  checkout's repo/branch and reports the model `idle`, when a prompt is
+  submitted it reports the model `attending`, and on session end it marks
+  `idle`. With no bus configured at all, they do nothing.
 - **Waking an idle window**: a window parked at the prompt calls no tools, so
   a message for it used to wait until its human typed. From session start and
   after every response, a background hook (`watch.sh`, Claude Code's
@@ -852,9 +853,39 @@ Like the proxy itself, this authenticated hook mode needs the `ai-crew-sync`
 binary on the PATH; the legacy mode still needs only `curl` and `python3`.
 
 Presence is the proxy's own: a heartbeat on connect with the repo and branch
-of the project directory, a keep-alive every five minutes, `idle` on exit. Nothing is pushed into an idle turn: incoming messages are read with
+of the project directory, a keep-alive every five minutes that renews the
+lease without touching the status, `idle` on exit. Nothing is pushed into an idle turn: incoming messages are read with
 `read_messages` or awaited with `wait_for_updates`, as with a direct
 connection.
+
+#### Connected is not attending
+
+A live proxy proves that a process is running, not that a model is reading
+the bus. A window whose turn has ended stays connected, and before 0.7.7 it
+looked exactly like one at work. `list_sessions`, `list_agents` and the
+dashboard now report each window's `attention` apart from `online`:
+
+| Field | What it is | Who observes it |
+|---|---|---|
+| `attention.state` | `attending` (a turn is running), `waiting` (the turn is blocked in `wait_for_updates` or `ask_agent`), `idle` (the turn ended), `unknown` | the proxy (tool calls), the plugin hooks (UserPromptSubmit, Stop, SessionEnd) |
+| `attention.observed_at` | when that was observed | |
+| `attention.last_tool_at` | the window's last tool call | the proxy |
+| `attention.last_inbox_read_at` | the window's last inbox read; a read is not a reply | the bus |
+| `attention.wake`, `wake_until` | how the window can be woken while idle (`claude-watcher`), as the mechanism announced it, or `unknown` | the watcher hook |
+
+Nothing is inferred. `attending` and `waiting` stand for ten minutes without
+a newer observation and only while the window is online; `idle` stands until
+something observes a new turn; whatever nobody observed is `unknown`. The
+proxy's keepalive renews the lease and the credential with `refresh_only`
+and never touches `status` or `attention`, so an idle window stays idle. The
+proxy cannot see a turn end: hosts without hooks (Codex) show `attending`
+after a tool call, which turns `unknown` once it is old. `wake` is
+descriptive, never proof that a wake will succeed. None of these fields
+promises an answer.
+
+`heartbeat` takes the observations as optional arguments (`attention`,
+`tool_activity`, `wake`, `wake_ttl_seconds`, `refresh_only`); omitted keeps,
+`""` clears. They are additive: existing callers see only new fields.
 
 ### Sessions: one agent, several windows
 
@@ -1827,7 +1858,7 @@ One binary, four kinds of command, told apart by what they need. `ai-crew-sync
 **As an agent**: `client …` is the console client (see [Console client](#console-client));
 `mcp proxy` is the per-conversation MCP server a client starts; `context
 verify` asks the bus who the resolved token really is; `context hook
---binding ID --event session_start|heartbeat|stop|session_end|status|call` is
+--binding ID --event session_start|prompt_submit|heartbeat|stop|session_end|status|call` is
 what the plugin's authenticated hooks run (`call` serves only `whoami`,
 `read_messages`, `team_digest` and `heartbeat`).
 
@@ -1958,7 +1989,7 @@ recipes/         16 host-neutral procedures: the source of plugin/commands
 plugin/          Claude Code plugin (MCP + hooks + commands + skill)
   .claude-plugin/plugin.json
   .mcp.json      starts `ai-crew-sync mcp proxy`; carries no credential
-  hooks/         SessionStart (catch-up + heartbeat), Stop and SessionEnd
+  hooks/         SessionStart (catch-up + heartbeat), UserPromptSubmit, Stop and SessionEnd
   scripts/       bus-call.sh, heartbeat.sh, session-start.sh, stop-drain.sh
                  (authenticated via the binary, local profiles, or curl + python3)
   commands/      generated from recipes/: /ai-crew-sync:standup|catchup|announce|ask|

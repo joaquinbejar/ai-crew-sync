@@ -290,10 +290,172 @@ impl Drop for InFlight {
     }
 }
 
+/// Tools whose call blocks on the bus waiting for teammates: while one is
+/// in flight the model's turn is waiting, not working.
+const WAITING_TOOLS: &[&str] = &["wait_for_updates", "ask_agent"];
+/// A tool call is reported at most this often while the reported state is
+/// unchanged. Short, because the bus may hold a newer observation this
+/// proxy cannot see (a Stop hook's `idle`): a call more than this long after
+/// the last report always goes out.
+const ATTENTION_REPORT_EVERY: Duration = Duration::from_secs(15);
+/// Least time between two attempts to flush a deferred call.
+const FLUSH_RETRY: Duration = Duration::from_secs(2);
+
+/// What this proxy has seen of its model's turn (#221). The host's tool
+/// calls are the only evidence: a call proves a turn is running, a call to a
+/// waiting tool proves it is blocked on the bus. Nothing here can see a turn
+/// end; hooks report that where the host has them, so an observation older
+/// than [`ATTENTION_REPORT_EVERY`] is never sent late as if it were current.
+#[derive(Default)]
+struct Attention {
+    /// Host tool calls in flight.
+    calls: usize,
+    /// Of those, the ones blocked in a bus wait.
+    waits: usize,
+    /// The latest tool call not yet reported.
+    unreported_call: Option<std::time::Instant>,
+    /// What the bus last accepted from this proxy, and when.
+    reported: Option<(&'static str, std::time::Instant)>,
+}
+
+/// One attention report to send. It is committed with [`Attention::sent`]
+/// only once the bus took it, so a failed send is retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttentionReport {
+    state: &'static str,
+    /// The call this report covers, which also stamps `last_tool_at`.
+    call: Option<std::time::Instant>,
+}
+
+impl AttentionReport {
+    fn tool_activity(&self) -> bool {
+        self.call.is_some()
+    }
+
+    /// The heartbeat fields for this report. A call reported late says how
+    /// long ago it happened, so the bus can keep a newer observation (a Stop
+    /// hook's idle) rather than let a late report overwrite it.
+    fn fields(&self) -> Value {
+        let mut v = json!({
+            "refresh_only": true,
+            "attention": self.state,
+            "tool_activity": self.tool_activity(),
+        });
+        if self.state == "attending"
+            && let Some(at) = self.call
+        {
+            v["attention_observed_ms_ago"] = json!(at.elapsed().as_millis() as i64);
+        }
+        v
+    }
+}
+
+impl Attention {
+    /// What to report now, if anything. `refresh` is the keepalive: it
+    /// re-reports a wait still in flight so that observation stays fresh,
+    /// and it never sends a call that has gone stale: once the model has
+    /// been quiet that long, its turn may have ended, and saying
+    /// `attending` would overwrite what a Stop hook observed.
+    fn due(&mut self, refresh: bool) -> Option<AttentionReport> {
+        let now = std::time::Instant::now();
+        let recent = |at: std::time::Instant| now.duration_since(at) < ATTENTION_REPORT_EVERY * 2;
+        if self.unreported_call.is_some_and(|at| !recent(at)) && self.calls == 0 {
+            self.unreported_call = None;
+        }
+        let reported_age = self.reported.map(|(_, at)| now.duration_since(at));
+        let (state, call) = if self.waits > 0 {
+            let changed = self.reported.is_none_or(|(s, _)| s != "waiting");
+            if !(changed || refresh) {
+                return None;
+            }
+            ("waiting", self.unreported_call)
+        } else if let Some(call) = self.unreported_call {
+            let changed = self.reported.is_none_or(|(s, _)| s != "attending");
+            let old = reported_age.is_none_or(|age| age >= ATTENTION_REPORT_EVERY);
+            if !(changed || old || (refresh && self.calls > 0)) {
+                return None;
+            }
+            ("attending", Some(call))
+        } else if refresh && self.calls > 0 {
+            // A long call still running: the turn is too.
+            ("attending", None)
+        } else {
+            return None;
+        };
+        Some(AttentionReport { state, call })
+    }
+
+    /// When a call deferred by the throttle must be flushed, if one is
+    /// waiting: as soon as the throttle allows, so the window does not read
+    /// stale until the next keepalive.
+    fn flush_at(&self) -> Option<std::time::Instant> {
+        // A wait in flight is reported on its own terms (and re-reported by
+        // the keepalive); nothing to flush meanwhile.
+        if self.waits > 0 {
+            return None;
+        }
+        self.unreported_call?;
+        self.reported.map(|(_, at)| at + ATTENTION_REPORT_EVERY)
+    }
+
+    /// The bus accepted `report`.
+    fn sent(&mut self, report: AttentionReport) {
+        self.reported = Some((report.state, std::time::Instant::now()));
+        // Only the call this report covered; a newer one is still pending.
+        if self.unreported_call.is_some() && self.unreported_call == report.call {
+            self.unreported_call = None;
+        }
+    }
+}
+
+/// One host tool call, counted for attention while it runs.
+struct ToolTurn {
+    attention: Arc<std::sync::Mutex<Attention>>,
+    changed: Arc<tokio::sync::Notify>,
+    waits: bool,
+}
+
+impl ToolTurn {
+    fn enter(proxy: &Proxy, tool: &str) -> Self {
+        let waits = WAITING_TOOLS.contains(&tool);
+        if let Ok(mut a) = proxy.attention.lock() {
+            a.calls += 1;
+            a.waits += usize::from(waits);
+            a.unreported_call = Some(std::time::Instant::now());
+        }
+        proxy.attention_changed.notify_one();
+        Self {
+            attention: proxy.attention.clone(),
+            changed: proxy.attention_changed.clone(),
+            waits,
+        }
+    }
+}
+
+impl Drop for ToolTurn {
+    fn drop(&mut self) {
+        if let Ok(mut a) = self.attention.lock() {
+            a.calls = a.calls.saturating_sub(1);
+            if self.waits {
+                a.waits = a.waits.saturating_sub(1);
+                // Back from a wait: the turn is working again.
+                a.unreported_call = Some(std::time::Instant::now());
+            }
+        }
+        // Also the trailing edge of a throttled burst: a call that ended
+        // after the throttle window reports what it was not allowed to.
+        self.changed.notify_one();
+    }
+}
+
 #[derive(Clone)]
 pub struct Proxy {
     state: Arc<RwLock<State>>,
     in_flight: Arc<AtomicUsize>,
+    /// The model's turn as this proxy has seen it, and a ping for the
+    /// keepalive to report a change.
+    attention: Arc<std::sync::Mutex<Attention>>,
+    attention_changed: Arc<tokio::sync::Notify>,
     /// Serialises context switches.
     switch: Arc<Mutex<()>>,
     /// Pinged whenever the connected context changes, so the keepalive
@@ -351,6 +513,14 @@ pub struct Status {
     pub binding: Binding,
     pub project_root: Option<String>,
     pub bus: Option<String>,
+    /// What this proxy last reported about the model's turn: `attending`
+    /// (it saw a tool call), `waiting` (a bus wait is in flight), or absent
+    /// when it has seen no call yet. The proxy cannot see a turn end; the
+    /// host's hooks report `idle` where they exist, and list_sessions shows
+    /// the combined observation.
+    pub attention: Option<String>,
+    /// Seconds since that report.
+    pub attention_reported_seconds_ago: Option<u64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1085,6 +1255,8 @@ impl Proxy {
                 stranded: None,
             })),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            attention: Arc::new(std::sync::Mutex::new(Attention::default())),
+            attention_changed: Arc::new(tokio::sync::Notify::new()),
             switch: Arc::new(Mutex::new(())),
             wake: Arc::new(tokio::sync::Notify::new()),
             opts: Arc::new(opts),
@@ -1249,13 +1421,49 @@ impl Proxy {
     /// Presence for this window: status, repo/branch from the checkout, and
     /// the discovery labels. Best effort.
     async fn heartbeat(&self, status: &str) {
+        self.publish_presence(json!({"status": status})).await;
+    }
+
+    /// Keep this window's presence alive without saying anything about its
+    /// status: a live process is not news about the model (#221). Carries
+    /// the model's attention when something new was seen, or re-reports a
+    /// wait still in flight.
+    async fn refresh_presence(&self) {
+        let due = self.attention.lock().ok().and_then(|mut a| a.due(true));
+        let args = match due {
+            Some(report) => report.fields(),
+            None => json!({"refresh_only": true}),
+        };
+        if self.publish_presence(args).await
+            && let Some(report) = due
+            && let Ok(mut a) = self.attention.lock()
+        {
+            a.sent(report);
+        }
+    }
+
+    /// Report attention now if something new was seen; nothing otherwise.
+    async fn report_attention(&self) {
+        let due = self.attention.lock().ok().and_then(|mut a| a.due(false));
+        let Some(report) = due else { return };
+        if self.publish_presence(report.fields()).await
+            && let Ok(mut a) = self.attention.lock()
+        {
+            a.sent(report);
+        }
+    }
+
+    /// One heartbeat with `fields`, plus repo/branch and this window's
+    /// labels. True when the bus accepted it.
+    async fn publish_presence(&self, fields: Value) -> bool {
         let (remote, project, role) = {
             let st = self.state.read().await;
-            let Some(c) = &st.connected else { return };
+            let Some(c) = &st.connected else { return false };
             (c.remote.clone(), st.project.clone(), st.role.clone())
         };
         let (repo, branch) = git_place(&self.project_dir);
-        let mut args = json!({"status": status, "ttl_seconds": PRESENCE_TTL_SECS});
+        let mut args = fields;
+        args["ttl_seconds"] = json!(PRESENCE_TTL_SECS);
         if let Some(r) = repo {
             args["repo"] = Value::String(r);
         }
@@ -1265,8 +1473,12 @@ impl Proxy {
         // Omitted keeps, "" clears: send exactly what this window knows.
         args["project"] = Value::String(project.unwrap_or_default());
         args["role"] = Value::String(role.unwrap_or_default());
-        if let Err(e) = call_remote(&remote, "heartbeat", args).await {
-            tracing::warn!(error = %e, "heartbeat failed");
+        match call_remote(&remote, "heartbeat", args).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "heartbeat failed");
+                false
+            }
         }
     }
 
@@ -1333,6 +1545,7 @@ impl Proxy {
     }
 
     async fn status(&self) -> Status {
+        let reported = self.attention.lock().ok().and_then(|a| a.reported);
         let st = self.state.read().await;
         let c = st.connected.as_ref();
         Status {
@@ -1352,6 +1565,8 @@ impl Proxy {
                 .and_then(|c| c.resolved.project_root.as_ref())
                 .map(|p| p.display().to_string()),
             bus: c.map(|c| c.resolved.mcp_url.clone()),
+            attention: reported.map(|(s, _)| s.to_owned()),
+            attention_reported_seconds_ago: reported.map(|(_, at)| at.elapsed().as_secs()),
         }
     }
 
@@ -2014,6 +2229,7 @@ impl Proxy {
     /// renewed exactly as a busy one.
     pub async fn keepalive(self, ct: CancellationToken) {
         let mut next_heartbeat = tokio::time::Instant::now() + KEEPALIVE_EVERY;
+        let mut last_flush = tokio::time::Instant::now() - FLUSH_RETRY;
         // Earliest next renewal attempt, whatever the deadline says: keeps a
         // deadline already in the past (a bus that will not renew, a reply
         // without an expiry) from becoming a tight loop. Tied to the context
@@ -2027,6 +2243,19 @@ impl Proxy {
                 Some((for_generation, nb)) if for_generation == generation => at.max(nb),
                 _ => at,
             });
+            // A call the throttle deferred is flushed once it may be.
+            // Never sooner than a moment after the last attempt: a bus that
+            // refuses the report must not turn this into a busy loop.
+            let flush_at = self
+                .attention
+                .lock()
+                .ok()
+                .and_then(|a| a.flush_at())
+                .map(tokio::time::Instant::from_std)
+                .map(|at| at.max(last_flush + FLUSH_RETRY));
+            let flush_sleep = tokio::time::sleep_until(
+                flush_at.unwrap_or_else(|| tokio::time::Instant::now() + KEEPALIVE_EVERY),
+            );
             let renew_sleep = tokio::time::sleep_until(
                 renew_at.unwrap_or_else(|| tokio::time::Instant::now() + KEEPALIVE_EVERY),
             );
@@ -2035,8 +2264,17 @@ impl Proxy {
                 // A new context: go round and schedule for its credential.
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep_until(next_heartbeat) => {
-                    self.heartbeat("active").await;
+                    // Renew, never re-assert "active": the window's hooks
+                    // may have said its turn ended (#221).
+                    self.refresh_presence().await;
                     next_heartbeat = tokio::time::Instant::now() + KEEPALIVE_EVERY;
+                }
+                _ = self.attention_changed.notified() => {
+                    self.report_attention().await;
+                }
+                _ = flush_sleep, if flush_at.is_some() => {
+                    last_flush = tokio::time::Instant::now();
+                    self.report_attention().await;
                 }
                 _ = renew_sleep, if renew_at.is_some() => {
                     let pause = match self.renew_credential().await {
@@ -2230,7 +2468,10 @@ impl Proxy {
                 call_remote(
                     &remote,
                     "heartbeat",
-                    json!({"status": "idle", "ttl_seconds": 120}),
+                    // The host closed this window: nothing will start a turn
+                    // in it.
+                    // Nor will anything wake it: withdraw any announcement.
+                    json!({"status": "idle", "ttl_seconds": 120, "attention": "idle", "wake": ""}),
                 ),
             )
             .await;
@@ -2439,6 +2680,8 @@ impl ServerHandler for Proxy {
     ) -> Result<CallToolResponse, ErrorData> {
         // The transport lifts `_meta` out of the params into the context.
         self.observe_meta(&context.meta).await?;
+        // Every host call is the model at work; a wait is the model blocked.
+        let _turn = ToolTurn::enter(self, request.name.as_ref());
         match request.name.as_ref() {
             STATUS_TOOL => {
                 let status = self.status().await;
@@ -2689,5 +2932,90 @@ mod unauthorized_tests {
         )));
         assert!(!unauthorized(&e));
         assert!(!unauthorized(&ServiceError::TransportClosed));
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::{ATTENTION_REPORT_EVERY, Attention, AttentionReport};
+    use std::time::{Duration, Instant};
+
+    fn ago(d: Duration) -> Instant {
+        Instant::now() - d
+    }
+
+    #[test]
+    fn nothing_seen_reports_nothing_even_on_a_refresh() {
+        let mut a = Attention::default();
+        assert_eq!(a.due(true), None, "a keepalive is not news about the model");
+    }
+
+    #[test]
+    fn a_call_reports_attending_and_a_burst_is_throttled() {
+        let call = Instant::now();
+        let mut a = Attention {
+            calls: 1,
+            unreported_call: Some(call),
+            ..Attention::default()
+        };
+        let r = a.due(false).expect("first call");
+        assert_eq!(r.state, "attending");
+        a.sent(r);
+        a.unreported_call = Some(Instant::now());
+        assert_eq!(a.due(false), None, "same state inside the window");
+        a.reported = Some(("attending", ago(ATTENTION_REPORT_EVERY)));
+        assert_eq!(a.due(false).map(|r| r.state), Some("attending"));
+    }
+
+    #[test]
+    fn a_keepalive_never_sends_a_stale_call() {
+        // A throttled call, then the turn ended (a Stop hook said idle).
+        // Minutes later the keepalive must not report it as current.
+        let mut a = Attention {
+            unreported_call: Some(ago(Duration::from_secs(120))),
+            reported: Some(("attending", ago(Duration::from_secs(130)))),
+            ..Attention::default()
+        };
+        assert_eq!(a.due(true), None);
+        assert_eq!(a.unreported_call, None, "the stale call is dropped");
+    }
+
+    #[test]
+    fn a_failed_send_is_retried() {
+        let mut a = Attention {
+            calls: 1,
+            unreported_call: Some(Instant::now()),
+            ..Attention::default()
+        };
+        let r = a.due(false).expect("due");
+        // Not committed: the bus refused it.
+        assert_eq!(a.due(false), Some(r));
+        a.sent(r);
+        assert_eq!(a.due(false), None);
+    }
+
+    #[test]
+    fn a_wait_reports_waiting_and_a_refresh_keeps_it_fresh() {
+        let mut a = Attention {
+            calls: 1,
+            waits: 1,
+            unreported_call: Some(Instant::now()),
+            ..Attention::default()
+        };
+        let r = a.due(false).expect("wait");
+        assert_eq!(r.state, "waiting");
+        a.sent(r);
+        assert_eq!(a.due(false), None);
+        assert_eq!(
+            a.due(true),
+            Some(AttentionReport {
+                state: "waiting",
+                call: None
+            })
+        );
+        // Back from the wait: attending again at once.
+        a.waits = 0;
+        a.unreported_call = Some(Instant::now());
+        assert_eq!(a.due(false).map(|r| r.state), Some("attending"));
     }
 }

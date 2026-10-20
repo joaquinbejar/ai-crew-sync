@@ -176,6 +176,39 @@ assert "activity" not in args, args
 ' 2>/dev/null && ok "a mid-session heartbeat leaves the activity alone" \
     || bad "plain heartbeat omits activity" "$(cut -f2 "$CAPTURE" | tail -1)"
 
+# stop and prompt are lifecycle observations (#221): status stays active and
+# the model's attention is reported as idle or attending.
+for pair in stop:idle prompt:attending; do
+    : > "$CAPTURE"
+    (cd "$REPO_DIR" && BUS_URL=x BUS_TOKEN=y sh "$WORK/bin/heartbeat.sh" "${pair%%:*}") >/dev/null 2>&1
+    cut -f2 "$CAPTURE" | tail -1 | WANT="${pair#*:}" python3 -c '
+import json, os, sys
+args = json.load(sys.stdin)
+assert args["status"] == "active", args
+assert args["attention"] == os.environ["WANT"], args
+' 2>/dev/null && ok "${pair%%:*} reports the model ${pair#*:}" \
+        || bad "${pair%%:*} attention" "$(cut -f2 "$CAPTURE" | tail -1)"
+done
+
+# Legacy SessionEnd (idle) reports the model idle and withdraws any wake;
+# SessionStart (reset) clears the previous session's attention (#227 review).
+: > "$CAPTURE"
+(cd "$REPO_DIR" && BUS_URL=x BUS_TOKEN=y sh "$WORK/bin/heartbeat.sh" idle) >/dev/null 2>&1
+cut -f2 "$CAPTURE" | tail -1 | python3 -c '
+import json, sys
+a = json.load(sys.stdin)
+assert a["attention"] == "idle" and a["wake"] == "", a
+' 2>/dev/null && ok "legacy SessionEnd reports idle and withdraws the wake" \
+    || bad "legacy idle attention" "$(cut -f2 "$CAPTURE" | tail -1)"
+: > "$CAPTURE"
+(cd "$REPO_DIR" && BUS_URL=x BUS_TOKEN=y sh "$WORK/bin/heartbeat.sh" active reset) >/dev/null 2>&1
+cut -f2 "$CAPTURE" | tail -1 | python3 -c '
+import json, sys
+a = json.load(sys.stdin)
+assert a["attention"] == "" and a["activity"] == "", a
+' 2>/dev/null && ok "legacy SessionStart clears the previous attention" \
+    || bad "legacy reset attention" "$(cut -f2 "$CAPTURE" | tail -1)"
+
 # --- the Stop drain: oldest unanswered question, once each -------------------
 cp "$ROOT/stop-drain.sh" "$WORK/bin/stop-drain.sh"
 
@@ -503,6 +536,14 @@ lifecycle missing active with-token
 grep -q '^heartbeat' "$CAPTURE" \
     && ok "a binding that never existed keeps the legacy heartbeat" \
     || bad "missing binding lost the legacy path" "$(cat "$CAPTURE" "$HOOKCALLS")"
+lifecycle authenticated stop with-token
+grep -q -- "--binding closed-window --event stop" "$HOOKCALLS" && [ ! -s "$CAPTURE" ] \
+    && ok "an authenticated Stop reports through the stop event" \
+    || bad "authenticated stop" "$(cat "$HOOKCALLS" "$CAPTURE")"
+lifecycle authenticated prompt with-token
+grep -q -- "--binding closed-window --event prompt_submit" "$HOOKCALLS" && [ ! -s "$CAPTURE" ] \
+    && ok "an authenticated prompt reports through the prompt_submit event" \
+    || bad "authenticated prompt" "$(cat "$HOOKCALLS" "$CAPTURE")"
 
 : > "$CAPTURE"; : > "$HOOKCALLS"; : > "$CURLCALLS"
 out="$(cd "$REPO_DIR" && printf '{"session_id":"closed-window"}' | env -u BUS_HOST_SESSION \

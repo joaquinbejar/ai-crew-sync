@@ -3,8 +3,77 @@ use sqlx::PgPool;
 use crate::{
     auth::AuthCtx,
     error::{BusError, BusResult},
-    model::{AgentInfo, AgentList, AgentSession, SessionEntry, SessionList, ts_opt},
+    model::{
+        AgentInfo, AgentList, AgentSession, SessionAttention, SessionEntry, SessionList, ts_opt,
+    },
 };
+
+/// How long an `attending` or `waiting` observation stands without a newer
+/// one. A proxy re-reports `waiting` on every keepalive (five minutes) while
+/// a wait is in flight, and `attending` on tool calls; a turn that has made
+/// no tool call for this long may well have ended without anyone seeing it.
+pub const ATTENTION_FRESH_SECS: i64 = 600;
+/// Default lifetime of a wake announcement, and its bounds.
+const DEFAULT_WAKE_TTL_SECS: i64 = 3600;
+const MAX_WAKE_TTL_SECS: i64 = 86_400;
+
+/// The attention columns of a presence row, as stored.
+#[derive(Debug, Default, sqlx::FromRow)]
+pub struct RawAttention {
+    pub attention: Option<String>,
+    pub attention_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_tool_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_inbox_read_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub wake: Option<String>,
+    pub wake_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// What the stored observations say now. `idle` stands until something
+/// observes otherwise; `attending` and `waiting` stand for
+/// [`ATTENTION_FRESH_SECS`] and only while the window is online. Anything
+/// else is `unknown`: never a guess from connectivity. A wake announcement
+/// counts only while it has not lapsed and the window is online.
+pub fn attention_of(raw: &RawAttention, online: bool) -> SessionAttention {
+    let now = chrono::Utc::now();
+    let fresh = raw
+        .attention_at
+        .is_some_and(|at| (now - at).num_seconds() <= ATTENTION_FRESH_SECS);
+    let state = match raw.attention.as_deref() {
+        Some("idle") => "idle",
+        Some(s @ ("attending" | "waiting")) if online && fresh => s,
+        _ => "unknown",
+    };
+    // An offline window is not running whatever announced the wake.
+    let wake = match (&raw.wake, raw.wake_until) {
+        (Some(w), Some(until)) if online && until > now => (w.clone(), Some(until)),
+        _ => ("unknown".to_owned(), None),
+    };
+    SessionAttention {
+        state: state.to_owned(),
+        observed_at: if state == "unknown" && raw.attention.is_none() {
+            None
+        } else {
+            ts_opt(raw.attention_at)
+        },
+        last_tool_at: ts_opt(raw.last_tool_at),
+        last_inbox_read_at: ts_opt(raw.last_inbox_read_at),
+        wake: wake.0,
+        wake_until: ts_opt(wake.1),
+    }
+}
+
+/// Validate an attention observation: one of the three states, or "" to
+/// clear it back to unknown.
+fn normalize_attention(raw: &str) -> BusResult<String> {
+    let value = raw.trim().to_lowercase();
+    match value.as_str() {
+        "" | "attending" | "waiting" | "idle" => Ok(value),
+        _ => Err(BusError::invalid(format!(
+            "attention must be one of: attending, waiting, idle, or \"\" to clear it \
+             (got '{raw}'); it is what you observe about the model's turn, not a status line"
+        ))),
+    }
+}
 
 const DEFAULT_TTL_SECS: i64 = 600; // 10 minutes
 const MAX_TTL_SECS: i64 = 86_400;
@@ -24,6 +93,44 @@ pub struct HeartbeatInput {
     pub project: Option<String>,
     pub role: Option<String>,
     pub ttl_seconds: Option<i64>,
+    /// Observed model attention: attending, waiting, idle; "" clears it to
+    /// unknown, `None` keeps it.
+    pub attention: Option<String>,
+    /// The window's model just made a tool call: stamp `last_tool_at`.
+    pub tool_activity: bool,
+    /// Wake mechanism announcement; "" withdraws it, `None` keeps it.
+    pub wake: Option<String>,
+    /// How long ago (ms) `attention` was observed. The bus keeps only the
+    /// newest observation, measured on its own clock, so a report sent late
+    /// never overwrites a newer one (a Stop hook's idle). `None`: now.
+    pub attention_observed_ms_ago: Option<i64>,
+    /// The announcer's token: stored with a `wake` announcement, and a
+    /// withdrawal (`wake: ""`) carrying one clears only an announcement made
+    /// with the same token, never a successor's.
+    pub wake_token: Option<String>,
+    pub wake_ttl_seconds: Option<i64>,
+    /// Renew the lease and the labels but keep `status` as it is: what a
+    /// process that is merely alive sends, so it never overwrites what the
+    /// window's hooks or its model said.
+    pub refresh_only: bool,
+}
+
+/// A presence row as `heartbeat` writes it and the lists read it.
+#[derive(sqlx::FromRow)]
+struct PresenceRow {
+    name: String,
+    display_name: Option<String>,
+    session: Option<String>,
+    status: Option<String>,
+    repo: Option<String>,
+    branch: Option<String>,
+    activity: Option<String>,
+    project: Option<String>,
+    role: Option<String>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    online: bool,
+    #[sqlx(flatten)]
+    attention: RawAttention,
 }
 
 /// Normalise a discovery label the way session labels are: trimmed and
@@ -121,6 +228,29 @@ pub async fn heartbeat(
         Some(v) => Some(normalize_label("role", v)?),
         None => None,
     };
+    let attention = match input.attention.as_deref() {
+        Some(v) => Some(normalize_attention(v)?),
+        None => None,
+    };
+    let wake = match input.wake.as_deref() {
+        Some(v) => Some(normalize_label("wake", v)?),
+        None => None,
+    };
+    let observed_ago_secs = input
+        .attention_observed_ms_ago
+        .map(|ms| ms.clamp(0, 86_400_000) as f64 / 1000.0);
+    let wake_token = match input.wake_token.as_deref() {
+        Some(t) if t.len() > 128 => {
+            return Err(BusError::invalid(
+                "wake_token is at most 128 bytes; it is an opaque marker, not a payload",
+            ));
+        }
+        other => other.map(str::to_owned),
+    };
+    let wake_ttl = input
+        .wake_ttl_seconds
+        .unwrap_or(DEFAULT_WAKE_TTL_SECS)
+        .clamp(30, MAX_WAKE_TTL_SECS);
 
     // The epoch is re-checked inside this transaction, so a request that was
     // already queued when its window was resumed cannot commit into the
@@ -131,31 +261,32 @@ pub async fn heartbeat(
     // Upsert on (agent_id, session), and report back the row just written.
     // Reading it from list_agents instead would pick whichever session came
     // first alphabetically once an agent has more than one.
-    let row: (
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<chrono::DateTime<chrono::Utc>>,
-        bool,
-    ) = sqlx::query_as(
+    let row: PresenceRow = sqlx::query_as(
         r#"
         WITH up AS (
             INSERT INTO agent_presence
                 (agent_id, session, status, repo, branch, activity, project, role,
-                 updated_at, expires_at)
+                 updated_at, expires_at,
+                 attention, attention_at, last_tool_at, wake, wake_until, wake_token)
             -- NULLIF on the insert path too: the CASE below only runs on
             -- conflict, so a first heartbeat for a new or freshly swept
             -- session stored '' and reported an empty string where the
             -- update path reports null.
             VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($8, ''), NULLIF($9, ''),
-                    now(), now() + make_interval(secs => $7))
+                    now(), now() + make_interval(secs => $7),
+                    NULLIF($10, ''),
+                    CASE WHEN NULLIF($10, '') IS NULL THEN NULL
+                         ELSE now() - make_interval(secs => COALESCE($15, 0)) END,
+                    CASE WHEN $11 THEN now() - make_interval(secs => COALESCE($15, 0)) END,
+                    NULLIF($12, ''),
+                    CASE WHEN NULLIF($12, '') IS NULL THEN NULL
+                         ELSE now() + make_interval(secs => $13) END,
+                    CASE WHEN NULLIF($12, '') IS NULL THEN NULL ELSE $16 END)
             ON CONFLICT (agent_id, session) DO UPDATE SET
-                status = EXCLUDED.status,
+                -- A refresh renews the lease and nothing a hook or the
+                -- model said: a live process is not news about the model.
+                status = CASE WHEN $14 THEN agent_presence.status
+                              ELSE EXCLUDED.status END,
                 -- keep the previous value when the caller omits a field
                 repo = COALESCE(EXCLUDED.repo, agent_presence.repo),
                 branch = COALESCE(EXCLUDED.branch, agent_presence.branch),
@@ -179,13 +310,57 @@ pub async fn heartbeat(
                                  WHEN $9 = '' THEN NULL
                                  ELSE COALESCE(EXCLUDED.role, agent_presence.role)
                              END,
+                -- Observations: omitted keeps, '' clears to unknown, a value
+                -- is stamped with the time it was observed. One older than
+                -- what is stored is history, not news: it changes nothing.
+                attention = CASE WHEN $10::text IS NULL THEN agent_presence.attention
+                                 WHEN agent_presence.attention_at IS NOT NULL
+                                  AND now() - make_interval(secs => COALESCE($15, 0))
+                                      < agent_presence.attention_at
+                                   THEN agent_presence.attention
+                                 WHEN $10 = '' THEN NULL
+                                 ELSE $10 END,
+                attention_at = CASE WHEN $10::text IS NULL THEN agent_presence.attention_at
+                                    WHEN agent_presence.attention_at IS NOT NULL
+                                     AND now() - make_interval(secs => COALESCE($15, 0))
+                                         < agent_presence.attention_at
+                                      THEN agent_presence.attention_at
+                                    WHEN $10 = '' THEN NULL
+                                    ELSE now() - make_interval(secs => COALESCE($15, 0)) END,
+                last_tool_at = CASE WHEN $11
+                                    THEN GREATEST(agent_presence.last_tool_at,
+                                                  now() - make_interval(secs => COALESCE($15, 0)))
+                                    ELSE agent_presence.last_tool_at END,
+                -- A withdrawal with a token clears only the announcement
+                -- made with that token: a retiring watcher cannot erase its
+                -- successor's, however late its request arrives.
+                wake = CASE WHEN $12::text IS NULL THEN agent_presence.wake
+                            WHEN $12 = '' AND $16::text IS NOT NULL
+                             AND agent_presence.wake_token IS DISTINCT FROM $16
+                              THEN agent_presence.wake
+                            WHEN $12 = '' THEN NULL
+                            ELSE $12 END,
+                wake_until = CASE WHEN $12::text IS NULL THEN agent_presence.wake_until
+                                  WHEN $12 = '' AND $16::text IS NOT NULL
+                                   AND agent_presence.wake_token IS DISTINCT FROM $16
+                                    THEN agent_presence.wake_until
+                                  WHEN $12 = '' THEN NULL
+                                  ELSE now() + make_interval(secs => $13) END,
+                wake_token = CASE WHEN $12::text IS NULL THEN agent_presence.wake_token
+                                  WHEN $12 = '' AND $16::text IS NOT NULL
+                                   AND agent_presence.wake_token IS DISTINCT FROM $16
+                                    THEN agent_presence.wake_token
+                                  WHEN $12 = '' THEN NULL
+                                  ELSE $16 END,
                 updated_at = now(),
                 expires_at = EXCLUDED.expires_at
-            RETURNING agent_id, status, repo, branch, activity, project, role,
-                      updated_at, expires_at
+            RETURNING agent_id, session, status, repo, branch, activity, project, role,
+                      updated_at, expires_at, attention, attention_at, last_tool_at,
+                      last_inbox_read_at, wake, wake_until
         )
         SELECT a.name,
                a.display_name,
+               up.session,
                up.status,
                up.repo,
                up.branch,
@@ -193,7 +368,9 @@ pub async fn heartbeat(
                up.project,
                up.role,
                up.updated_at,
-               up.expires_at > now() AS online
+               up.expires_at > now() AS online,
+               up.attention, up.attention_at, up.last_tool_at, up.last_inbox_read_at,
+               up.wake, up.wake_until
         FROM up
         JOIN agents a ON a.id = up.agent_id
         "#,
@@ -207,6 +384,13 @@ pub async fn heartbeat(
     .bind(ttl as f64)
     .bind(project.as_deref())
     .bind(role.as_deref())
+    .bind(attention.as_deref())
+    .bind(input.tool_activity)
+    .bind(wake.as_deref())
+    .bind(wake_ttl as f64)
+    .bind(input.refresh_only)
+    .bind(observed_ago_secs)
+    .bind(wake_token.as_deref())
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -229,20 +413,20 @@ pub async fn heartbeat(
     .execute(pool)
     .await;
 
-    let (name, display_name, status, repo, branch, activity, project, role, updated_at, online) =
-        row;
+    let online = row.online;
     Ok(AgentInfo {
-        name,
-        display_name,
+        name: row.name,
+        display_name: row.display_name,
         session: super::session_label(auth),
-        status,
-        repo,
-        branch,
-        activity,
-        project,
-        role,
-        last_seen: ts_opt(updated_at),
+        status: row.status.unwrap_or_else(|| "active".into()),
+        repo: row.repo,
+        branch: row.branch,
+        activity: row.activity,
+        project: row.project,
+        role: row.role,
+        last_seen: ts_opt(row.updated_at),
         online,
+        attention: attention_of(&row.attention, online),
         // The heartbeat reports the session it just wrote, not a survey of the
         // agent's other contexts; list_agents is where that belongs.
         sessions: Vec::new(),
@@ -271,19 +455,7 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
     // One row per (agent, session). An agent working in three repositories has
     // three presence rows and is still one person, so the rows are folded back
     // into one entry per agent below.
-    let rows: Vec<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<chrono::DateTime<chrono::Utc>>,
-        bool,
-    )> = sqlx::query_as(
+    let rows: Vec<PresenceRow> = sqlx::query_as(
         r#"
         SELECT a.name,
                a.display_name,
@@ -295,7 +467,9 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
                p.project,
                p.role,
                p.updated_at,
-               COALESCE(p.expires_at > now(), false) AS online
+               COALESCE(p.expires_at > now(), false) AS online,
+               p.attention, p.attention_at, p.last_tool_at, p.last_inbox_read_at,
+               p.wake, p.wake_until
         FROM agents a
         -- Every session, deliberately: the previous change picked a single
         -- presence row per agent so the flat output stayed correct while it
@@ -324,20 +498,21 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
     // Rows arrive grouped by agent and already in the order sessions should be
     // reported in, so one pass is enough.
     let mut agents: Vec<AgentInfo> = Vec::new();
-    for (
-        name,
-        display_name,
-        session,
-        status,
-        repo,
-        branch,
-        activity,
-        project,
-        role,
-        updated_at,
-        online,
-    ) in rows
-    {
+    for row in rows {
+        let PresenceRow {
+            name,
+            display_name,
+            session,
+            status,
+            repo,
+            branch,
+            activity,
+            project,
+            role,
+            updated_at,
+            online,
+            attention,
+        } = row;
         let entry = AgentSession {
             // '' in the database, null on the wire: the shared session has no
             // name, and reporting one would invent a context that is not there.
@@ -354,6 +529,7 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
             role,
             last_seen: ts_opt(updated_at),
             online,
+            attention: attention_of(&attention, online),
         };
 
         match agents.last_mut() {
@@ -375,6 +551,7 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
                 role: entry.role.clone(),
                 last_seen: entry.last_seen.clone(),
                 online: entry.online,
+                attention: entry.attention.clone(),
                 sessions: vec![entry],
             }),
         }
@@ -432,20 +609,10 @@ pub async fn list_sessions(
         .limit
         .unwrap_or(DEFAULT_SESSIONS)
         .clamp(1, MAX_SESSIONS);
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        chrono::DateTime<chrono::Utc>,
-        bool,
-    )> = sqlx::query_as(
+    let rows: Vec<PresenceRow> = sqlx::query_as(
         r#"
         SELECT a.name,
+               a.display_name,
                p.session,
                p.status,
                p.repo,
@@ -454,7 +621,9 @@ pub async fn list_sessions(
                p.project,
                p.role,
                p.updated_at,
-               (p.expires_at > now()) AS online
+               (p.expires_at > now()) AS online,
+               p.attention, p.attention_at, p.last_tool_at, p.last_inbox_read_at,
+               p.wake, p.wake_until
         FROM agent_presence p
         JOIN agents a ON a.id = p.agent_id
         WHERE a.team_id = $1
@@ -477,9 +646,9 @@ pub async fn list_sessions(
     .await?;
     let sessions: Vec<SessionEntry> = rows
         .into_iter()
-        .map(
-            |(
-                agent,
+        .map(|row| {
+            let PresenceRow {
+                name: agent,
                 session,
                 status,
                 repo,
@@ -489,33 +658,37 @@ pub async fn list_sessions(
                 role,
                 updated_at,
                 online,
-            )| {
-                // The shared session has no address of its own: the bare
-                // `agent` reaches every window that agent has. Reported
-                // as-is, because the row is real presence, and flagged, so a
-                // caller cannot mistake it for a private target.
-                let exact = !session.is_empty();
-                let address = if exact {
-                    format!("{agent}/{session}")
-                } else {
-                    agent.clone()
-                };
-                SessionEntry {
-                    address,
-                    exact,
-                    session: (!session.is_empty()).then_some(session),
-                    agent,
-                    project,
-                    role,
-                    repo,
-                    branch,
-                    activity,
-                    status: if online { status } else { "offline".into() },
-                    online,
-                    last_seen: ts_opt(Some(updated_at)),
-                }
-            },
-        )
+                attention,
+                ..
+            } = row;
+            let session = session.unwrap_or_default();
+            let status = status.unwrap_or_else(|| "active".into());
+            // The shared session has no address of its own: the bare
+            // `agent` reaches every window that agent has. Reported
+            // as-is, because the row is real presence, and flagged, so a
+            // caller cannot mistake it for a private target.
+            let exact = !session.is_empty();
+            let address = if exact {
+                format!("{agent}/{session}")
+            } else {
+                agent.clone()
+            };
+            SessionEntry {
+                address,
+                exact,
+                session: (!session.is_empty()).then_some(session),
+                agent,
+                project,
+                role,
+                repo,
+                branch,
+                activity,
+                status: if online { status } else { "offline".into() },
+                online,
+                last_seen: ts_opt(updated_at),
+                attention: attention_of(&attention, online),
+            }
+        })
         .collect();
     Ok(SessionList {
         count: sessions.len(),

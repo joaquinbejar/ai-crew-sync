@@ -723,6 +723,24 @@ pub async fn read_messages(
         tx.commit().await?;
     }
 
+    // An observation for teammates (#221): this window read its inbox.
+    // Recorded on every incremental read of a scope that holds its direct
+    // messages, whether or not anything new came back; it says nothing
+    // about answering. Best effort: a presence stamp must not fail the read.
+    if input.only_new
+        && matches!(scope, Scope::Inbox | Scope::All)
+        && let Err(e) = sqlx::query(
+            "UPDATE agent_presence SET last_inbox_read_at = now()
+              WHERE agent_id = $1 AND session = $2",
+        )
+        .bind(auth.agent_id)
+        .bind(&auth.session)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(error = %e, "could not record the inbox read");
+    }
+
     Ok(MessageList {
         messages,
         scope: scope.label(),
