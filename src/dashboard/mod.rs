@@ -274,9 +274,12 @@ async fn build_page(pool: &PgPool, auth: &AuthCtx) -> Result<String, sqlx::Error
                 esc(&a.session)
             )
         };
+        // The model's turn, as observed: connected is not attending (#221).
+        let model = crate::store::presence::attention_of(&a.attention, a.online).state;
         agent_rows.push_str(&format!(
-            "<tr><td>{who}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"muted\">{}</td></tr>",
+            "<tr><td>{who}</td><td>{} <span class=\"muted\">· model {}</span></td><td>{}</td><td>{}</td><td class=\"muted\">{}</td></tr>",
             dot,
+            esc(&model),
             place,
             esc(a.activity.as_deref().unwrap_or("")),
             a.updated_at.map(ago).unwrap_or_default(),

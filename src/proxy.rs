@@ -290,10 +290,103 @@ impl Drop for InFlight {
     }
 }
 
+/// Tools whose call blocks on the bus waiting for teammates: while one is
+/// in flight the model's turn is waiting, not working.
+const WAITING_TOOLS: &[&str] = &["wait_for_updates", "ask_agent"];
+/// Tool activity is re-reported at most this often while the state is
+/// unchanged: often enough that `attending` stays fresh, rarely enough that
+/// a busy model does not double the bus traffic.
+const ATTENTION_REPORT_EVERY: Duration = Duration::from_secs(60);
+
+/// What this proxy has seen of its model's turn (#221). The host's tool
+/// calls are the only evidence: a call proves a turn is running, a call to a
+/// waiting tool proves it is blocked on the bus. Nothing here can see a turn
+/// end; hooks report that where the host has them.
+#[derive(Default)]
+struct Attention {
+    /// Host tool calls in flight.
+    calls: usize,
+    /// Of those, the ones blocked in a bus wait.
+    waits: usize,
+    /// A tool call started since attention was last reported.
+    tool_since_report: bool,
+    /// What was last reported, and when.
+    reported: Option<(&'static str, std::time::Instant)>,
+}
+
+impl Attention {
+    /// What to report now, if anything, and whether it carries tool
+    /// activity. `refresh` re-reports a wait still in flight so its
+    /// observation stays fresh on the presence cadence.
+    fn due(&mut self, refresh: bool) -> Option<(&'static str, bool)> {
+        let state = if self.waits > 0 {
+            "waiting"
+        } else if self.tool_since_report {
+            "attending"
+        } else {
+            return None;
+        };
+        let changed = self.reported.is_none_or(|(s, _)| s != state);
+        let stale = self
+            .reported
+            .is_none_or(|(_, at)| at.elapsed() >= ATTENTION_REPORT_EVERY);
+        if !(changed || (stale && (self.tool_since_report || refresh))) {
+            return None;
+        }
+        let tool = std::mem::take(&mut self.tool_since_report);
+        self.reported = Some((state, std::time::Instant::now()));
+        Some((state, tool))
+    }
+}
+
+/// One host tool call, counted for attention while it runs.
+struct ToolTurn {
+    attention: Arc<std::sync::Mutex<Attention>>,
+    changed: Arc<tokio::sync::Notify>,
+    waits: bool,
+}
+
+impl ToolTurn {
+    fn enter(proxy: &Proxy, tool: &str) -> Self {
+        let waits = WAITING_TOOLS.contains(&tool);
+        if let Ok(mut a) = proxy.attention.lock() {
+            a.calls += 1;
+            a.waits += usize::from(waits);
+            a.tool_since_report = true;
+        }
+        proxy.attention_changed.notify_one();
+        Self {
+            attention: proxy.attention.clone(),
+            changed: proxy.attention_changed.clone(),
+            waits,
+        }
+    }
+}
+
+impl Drop for ToolTurn {
+    fn drop(&mut self) {
+        if let Ok(mut a) = self.attention.lock() {
+            a.calls = a.calls.saturating_sub(1);
+            if self.waits {
+                a.waits = a.waits.saturating_sub(1);
+                // Back from a wait: the turn is working again.
+                a.tool_since_report = true;
+            }
+        }
+        if self.waits {
+            self.changed.notify_one();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Proxy {
     state: Arc<RwLock<State>>,
     in_flight: Arc<AtomicUsize>,
+    /// The model's turn as this proxy has seen it, and a ping for the
+    /// keepalive to report a change.
+    attention: Arc<std::sync::Mutex<Attention>>,
+    attention_changed: Arc<tokio::sync::Notify>,
     /// Serialises context switches.
     switch: Arc<Mutex<()>>,
     /// Pinged whenever the connected context changes, so the keepalive
@@ -351,6 +444,14 @@ pub struct Status {
     pub binding: Binding,
     pub project_root: Option<String>,
     pub bus: Option<String>,
+    /// What this proxy last reported about the model's turn: `attending`
+    /// (it saw a tool call), `waiting` (a bus wait is in flight), or absent
+    /// when it has seen no call yet. The proxy cannot see a turn end; the
+    /// host's hooks report `idle` where they exist, and list_sessions shows
+    /// the combined observation.
+    pub attention: Option<String>,
+    /// Seconds since that report.
+    pub attention_reported_seconds_ago: Option<u64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1085,6 +1186,8 @@ impl Proxy {
                 stranded: None,
             })),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            attention: Arc::new(std::sync::Mutex::new(Attention::default())),
+            attention_changed: Arc::new(tokio::sync::Notify::new()),
             switch: Arc::new(Mutex::new(())),
             wake: Arc::new(tokio::sync::Notify::new()),
             opts: Arc::new(opts),
@@ -1249,13 +1352,45 @@ impl Proxy {
     /// Presence for this window: status, repo/branch from the checkout, and
     /// the discovery labels. Best effort.
     async fn heartbeat(&self, status: &str) {
+        self.publish_presence(json!({"status": status})).await;
+    }
+
+    /// Keep this window's presence alive without saying anything about its
+    /// status: a live process is not news about the model (#221). Carries
+    /// the model's attention when something new was seen, or `refresh`
+    /// re-reports a wait still in flight.
+    async fn refresh_presence(&self, refresh: bool) {
+        let due = self.attention.lock().ok().and_then(|mut a| a.due(refresh));
+        let mut args = json!({"refresh_only": true});
+        if let Some((state, tool)) = due {
+            args["attention"] = json!(state);
+            args["tool_activity"] = json!(tool);
+        }
+        self.publish_presence(args).await;
+    }
+
+    /// Report attention now if something new was seen; nothing otherwise.
+    async fn report_attention(&self) {
+        let due = self.attention.lock().ok().and_then(|mut a| a.due(false));
+        if let Some((state, tool)) = due {
+            self.publish_presence(
+                json!({"refresh_only": true, "attention": state, "tool_activity": tool}),
+            )
+            .await;
+        }
+    }
+
+    /// One heartbeat with `fields`, plus repo/branch and this window's
+    /// labels.
+    async fn publish_presence(&self, fields: Value) {
         let (remote, project, role) = {
             let st = self.state.read().await;
             let Some(c) = &st.connected else { return };
             (c.remote.clone(), st.project.clone(), st.role.clone())
         };
         let (repo, branch) = git_place(&self.project_dir);
-        let mut args = json!({"status": status, "ttl_seconds": PRESENCE_TTL_SECS});
+        let mut args = fields;
+        args["ttl_seconds"] = json!(PRESENCE_TTL_SECS);
         if let Some(r) = repo {
             args["repo"] = Value::String(r);
         }
@@ -1333,6 +1468,7 @@ impl Proxy {
     }
 
     async fn status(&self) -> Status {
+        let reported = self.attention.lock().ok().and_then(|a| a.reported);
         let st = self.state.read().await;
         let c = st.connected.as_ref();
         Status {
@@ -1352,6 +1488,8 @@ impl Proxy {
                 .and_then(|c| c.resolved.project_root.as_ref())
                 .map(|p| p.display().to_string()),
             bus: c.map(|c| c.resolved.mcp_url.clone()),
+            attention: reported.map(|(s, _)| s.to_owned()),
+            attention_reported_seconds_ago: reported.map(|(_, at)| at.elapsed().as_secs()),
         }
     }
 
@@ -2035,8 +2173,13 @@ impl Proxy {
                 // A new context: go round and schedule for its credential.
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep_until(next_heartbeat) => {
-                    self.heartbeat("active").await;
+                    // Renew, never re-assert "active": the window's hooks
+                    // may have said its turn ended (#221).
+                    self.refresh_presence(true).await;
                     next_heartbeat = tokio::time::Instant::now() + KEEPALIVE_EVERY;
+                }
+                _ = self.attention_changed.notified() => {
+                    self.report_attention().await;
                 }
                 _ = renew_sleep, if renew_at.is_some() => {
                     let pause = match self.renew_credential().await {
@@ -2230,7 +2373,9 @@ impl Proxy {
                 call_remote(
                     &remote,
                     "heartbeat",
-                    json!({"status": "idle", "ttl_seconds": 120}),
+                    // The host closed this window: nothing will start a turn
+                    // in it.
+                    json!({"status": "idle", "ttl_seconds": 120, "attention": "idle"}),
                 ),
             )
             .await;
@@ -2439,6 +2584,8 @@ impl ServerHandler for Proxy {
     ) -> Result<CallToolResponse, ErrorData> {
         // The transport lifts `_meta` out of the params into the context.
         self.observe_meta(&context.meta).await?;
+        // Every host call is the model at work; a wait is the model blocked.
+        let _turn = ToolTurn::enter(self, request.name.as_ref());
         match request.name.as_ref() {
             STATUS_TOOL => {
                 let status = self.status().await;
@@ -2689,5 +2836,53 @@ mod unauthorized_tests {
         )));
         assert!(!unauthorized(&e));
         assert!(!unauthorized(&ServiceError::TransportClosed));
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::Attention;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn nothing_seen_reports_nothing_even_on_a_refresh() {
+        let mut a = Attention::default();
+        assert_eq!(a.due(true), None, "a keepalive is not news about the model");
+    }
+
+    #[test]
+    fn a_tool_call_reports_attending_once_per_interval() {
+        let mut a = Attention {
+            calls: 1,
+            tool_since_report: true,
+            ..Attention::default()
+        };
+        assert_eq!(a.due(false), Some(("attending", true)));
+        a.tool_since_report = true;
+        assert_eq!(a.due(false), None, "same state within the interval");
+        a.reported = Some(("attending", Instant::now() - Duration::from_secs(61)));
+        a.tool_since_report = true;
+        assert_eq!(a.due(false), Some(("attending", true)));
+        // No new call: a refresh does not renew an attending observation.
+        a.reported = Some(("attending", Instant::now() - Duration::from_secs(61)));
+        assert_eq!(a.due(true), None);
+    }
+
+    #[test]
+    fn a_wait_reports_waiting_and_a_refresh_keeps_it_fresh() {
+        let mut a = Attention {
+            calls: 1,
+            waits: 1,
+            tool_since_report: true,
+            ..Attention::default()
+        };
+        assert_eq!(a.due(false), Some(("waiting", true)));
+        assert_eq!(a.due(false), None);
+        a.reported = Some(("waiting", Instant::now() - Duration::from_secs(301)));
+        assert_eq!(a.due(true), Some(("waiting", false)));
+        // Back from the wait: attending again at once.
+        a.waits = 0;
+        a.tool_since_report = true;
+        assert_eq!(a.due(false), Some(("attending", true)));
     }
 }

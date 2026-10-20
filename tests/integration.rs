@@ -17439,3 +17439,313 @@ async fn read_with_names_a_keyword_channel_unambiguously() {
     }
     h.shutdown().await;
 }
+
+// --------------------------------------------------- attention (#221) --
+
+/// The entry for `address` in a teammate's `list_sessions`.
+async fn session_entry(observer: &Client, address: &str) -> Value {
+    let list = call(observer, "list_sessions", json!({})).await;
+    list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["address"] == address)
+        .cloned()
+        .unwrap_or_else(|| panic!("no session {address} in {list}"))
+}
+
+/// Connectivity and attention are reported apart (#221). A connected
+/// session nobody observed is `unknown`, never "attending"; a renewal keeps
+/// what the hooks said; stale and offline observations fall back to
+/// unknown; an inbox read is recorded and says nothing about attention.
+#[tokio::test]
+async fn connectivity_and_attention_are_reported_apart() {
+    let h = require_db!("t_attention");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let api = connect_with_session(&h.base, &token, "api").await;
+    let web = connect_with_session(&h.base, &token, "web").await;
+    let state = |e: &Value| e["attention"]["state"].as_str().unwrap().to_owned();
+
+    // Connected, never observed: unknown, with no time attached.
+    call(&api, "heartbeat", json!({})).await;
+    call(&web, "heartbeat", json!({})).await;
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert_eq!(e["online"], true, "{e}");
+    assert_eq!(state(&e), "unknown", "{e}");
+    assert!(e["attention"].get("observed_at").is_none(), "{e}");
+    assert_eq!(e["attention"]["wake"], "unknown", "{e}");
+
+    // The turn ended (what the Stop hook reports), then a keepalive renews
+    // the lease: still idle, and the status the hook set survives.
+    call(
+        &api,
+        "heartbeat",
+        json!({"status": "blocked", "attention": "idle"}),
+    )
+    .await;
+    call(
+        &api,
+        "heartbeat",
+        json!({"refresh_only": true, "status": "active"}),
+    )
+    .await;
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert_eq!(state(&e), "idle", "a renewal claimed attention: {e}");
+    assert_eq!(
+        e["status"], "blocked",
+        "a renewal overwrote the status: {e}"
+    );
+    assert!(e["attention"]["observed_at"].is_string(), "{e}");
+
+    // A tool call: attending, with the call recorded. The sibling window
+    // keeps its own, unobserved state.
+    call(
+        &api,
+        "heartbeat",
+        json!({"refresh_only": true, "attention": "attending", "tool_activity": true}),
+    )
+    .await;
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert_eq!(state(&e), "attending", "{e}");
+    assert!(e["attention"]["last_tool_at"].is_string(), "{e}");
+    assert_eq!(
+        state(&session_entry(&marta, "joaquin/web").await),
+        "unknown"
+    );
+
+    // An old attending observation is not attention now; an old idle one
+    // still is idle, because nothing has started a turn since.
+    let age = |minutes: i32| {
+        let pool = h.pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE agent_presence SET attention_at = now() - make_interval(mins => $1)
+                  WHERE session = 'api'",
+            )
+            .bind(minutes)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    age(20).await;
+    assert_eq!(
+        state(&session_entry(&marta, "joaquin/api").await),
+        "unknown"
+    );
+    call(&api, "heartbeat", json!({"attention": "idle"})).await;
+    age(120).await;
+    assert_eq!(state(&session_entry(&marta, "joaquin/api").await), "idle");
+
+    // Offline: a fresh attending observation is not attention either.
+    call(&api, "heartbeat", json!({"attention": "attending"})).await;
+    sqlx::query(
+        "UPDATE agent_presence SET expires_at = now() - interval '1 minute' WHERE session = 'api'",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert_eq!(e["status"], "offline", "{e}");
+    assert_eq!(state(&e), "unknown", "{e}");
+
+    // Inbox reads are recorded; a channel read is not an inbox read, and a
+    // read changes no attention.
+    call(&api, "heartbeat", json!({"attention": "idle"})).await;
+    call(&marta, "create_channel", json!({"name": "dev"})).await;
+    call(&api, "read_messages", json!({"scope": "dev"})).await;
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert!(e["attention"].get("last_inbox_read_at").is_none(), "{e}");
+    call(&api, "read_messages", json!({"scope": "inbox"})).await;
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert!(e["attention"]["last_inbox_read_at"].is_string(), "{e}");
+    assert_eq!(state(&e), "idle", "a read is not attention: {e}");
+
+    // A wake announcement stands until it lapses, and is withdrawable.
+    call(
+        &api,
+        "heartbeat",
+        json!({"refresh_only": true, "wake": "claude-watcher", "wake_ttl_seconds": 60}),
+    )
+    .await;
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert_eq!(e["attention"]["wake"], "claude-watcher", "{e}");
+    assert!(e["attention"]["wake_until"].is_string(), "{e}");
+    sqlx::query(
+        "UPDATE agent_presence SET wake_until = now() - interval '1 second' WHERE session = 'api'",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert_eq!(
+        e["attention"]["wake"], "unknown",
+        "a lapsed wake still shown: {e}"
+    );
+
+    // list_agents carries it too, and nonsense is refused with the choices.
+    let agents = call(&marta, "list_agents", json!({})).await;
+    let joaquin = agents["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "joaquin")
+        .unwrap()
+        .clone();
+    assert!(joaquin["attention"]["state"].is_string(), "{joaquin}");
+    let err = call_expect_error(&api, "heartbeat", json!({"attention": "thinking"})).await;
+    assert!(err.contains("attending, waiting, idle"), "{err}");
+
+    for c in [api, web, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Poll a teammate's view of `address` until its attention is `want`.
+async fn attention_becomes(observer: &Client, address: &str, want: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let e = session_entry(observer, address).await;
+        if e["attention"]["state"] == want || std::time::Instant::now() > deadline {
+            return e;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Through the real proxy and plugin hooks (#221): tool calls report
+/// attending, a wait in flight reports waiting, the Stop hook reports idle
+/// and UserPromptSubmit attending again; the watcher announces itself as
+/// the window's wake mechanism and withdraws when it has woken the window.
+#[tokio::test]
+async fn the_proxy_and_hooks_report_the_models_turn() {
+    let h = require_db!("t_attention_proxy");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let window = spawn_proxy(&dir, &repo, &[], &[("BUS_HOST_SESSION", "conv-attn")]).await;
+    let address = call(&window, "session_status", json!({})).await["address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let payload = json!({"session_id": "conv-attn"}).to_string();
+
+    // A tool call is the model at work.
+    call(&window, "whoami", json!({})).await;
+    let e = attention_becomes(&marta, &address, "attending").await;
+    assert_eq!(e["attention"]["state"], "attending", "{e}");
+    assert!(e["attention"]["last_tool_at"].is_string(), "{e}");
+    let status = call(&window, "session_status", json!({})).await;
+    assert_eq!(status["attention"], "attending", "{status}");
+
+    // The turn ends: the Stop hook says idle, and the window stays online.
+    run_hook(
+        "heartbeat.sh",
+        &dir,
+        &repo,
+        &payload,
+        &["stop", "--from-payload"],
+    )
+    .await;
+    let e = session_entry(&marta, &address).await;
+    assert_eq!(e["attention"]["state"], "idle", "{e}");
+    assert_eq!(e["online"], true, "{e}");
+
+    // A new prompt: attending, before any tool call.
+    run_hook(
+        "heartbeat.sh",
+        &dir,
+        &repo,
+        &payload,
+        &["prompt", "--from-payload"],
+    )
+    .await;
+    assert_eq!(
+        session_entry(&marta, &address).await["attention"]["state"],
+        "attending"
+    );
+
+    // Blocked in a wait: waiting while it lasts, attending once back.
+    let waiting = {
+        let window = &window;
+        async move {
+            call(
+                window,
+                "wait_for_updates",
+                json!({"timeout_seconds": 8, "kinds": ["task"]}),
+            )
+            .await
+        }
+    };
+    let observe = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        attention_becomes(&marta, &address, "waiting").await
+    };
+    let (_, during) = tokio::join!(waiting, observe);
+    assert_eq!(during["attention"]["state"], "waiting", "{during}");
+    let after = attention_becomes(&marta, &address, "attending").await;
+    assert_eq!(after["attention"]["state"], "attending", "{after}");
+
+    // The watcher announces the wake mechanism while it watches, and
+    // withdraws it once it has woken the window.
+    run_hook(
+        "heartbeat.sh",
+        &dir,
+        &repo,
+        &payload,
+        &["stop", "--from-payload"],
+    )
+    .await;
+    let watcher = tokio::process::Command::new(env!("CARGO_BIN_EXE_ai-crew-sync"))
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("BUS_CONFIG_DIR", &dir)
+        .args([
+            "context",
+            "hook",
+            "--binding",
+            "conv-attn",
+            "--event",
+            "watch",
+        ])
+        .args(["--watch-secs", "120"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn watcher");
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let e = session_entry(&marta, &address).await;
+    assert_eq!(e["attention"]["wake"], "claude-watcher", "{e}");
+    assert_eq!(
+        e["attention"]["state"], "idle",
+        "the watcher is not attention: {e}"
+    );
+    call(
+        &marta,
+        "post_message",
+        json!({"to": address, "body": "ping"}),
+    )
+    .await;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        watcher.wait_with_output(),
+    )
+    .await
+    .expect("the watcher never woke")
+    .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let e = session_entry(&marta, &address).await;
+    assert_eq!(e["attention"]["wake"], "unknown", "{e}");
+
+    let _ = marta.cancel().await;
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}

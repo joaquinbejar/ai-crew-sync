@@ -93,6 +93,9 @@ pub struct AgentInfo {
     pub last_seen: Option<String>,
     /// True when *any* of this agent's sessions has a live presence lease.
     pub online: bool,
+    /// Whether the lead session's model is attending, as last observed.
+    /// Separate from `online`: a connected window can be idle.
+    pub attention: SessionAttention,
     /// Every working context this agent has open, most recently active first.
     /// Absent when there is only one — the fields above already describe it.
     /// A teammate with several entries here is working in several repositories
@@ -149,6 +152,41 @@ pub struct AgentSession {
     pub role: Option<String>,
     pub last_seen: Option<String>,
     pub online: bool,
+    pub attention: SessionAttention,
+}
+
+/// What is known about whether a window's model is reading the bus, kept
+/// apart from whether the window is connected (`online`). A connected proxy
+/// proves a process is alive, not that a model is working: these fields are
+/// observations by whoever saw them, with when they saw it, and what nobody
+/// observed is reported as unknown rather than guessed.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SessionAttention {
+    /// `attending` (a model turn is running), `waiting` (the turn is blocked
+    /// in a bus wait), `idle` (the turn ended; nothing reads the bus until
+    /// something starts a new one) or `unknown` (never observed, or the
+    /// observation is too old or the window is offline). None of these
+    /// promises an answer.
+    pub state: String,
+    /// When `state` was observed. Absent when unknown for lack of any
+    /// observation.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub observed_at: Option<String>,
+    /// The window's last tool call, as its proxy saw it. Keepalives never
+    /// move it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_tool_at: Option<String>,
+    /// The last read of this window's inbox. A read is not a reply, an
+    /// acknowledgement or a resolution.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_inbox_read_at: Option<String>,
+    /// How this window can be woken while idle, as the mechanism announced
+    /// it (`claude-watcher`, `codex-adapter`), or `unknown`. Descriptive
+    /// only: it is not proof that a wake will succeed.
+    pub wake: String,
+    /// When the wake announcement lapses unless renewed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub wake_until: Option<String>,
 }
 
 /// One session as `list_sessions` reports it: addressable, with its
@@ -175,10 +213,12 @@ pub struct SessionEntry {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub activity: Option<String>,
-    /// One of `active`, `idle`, `busy`, `blocked`, `offline`.
+    /// One of `active`, `idle`, `busy`, `blocked`, `offline`. What the
+    /// session or its hooks last said; `attention` is what was observed.
     pub status: String,
     pub online: bool,
     pub last_seen: Option<String>,
+    pub attention: SessionAttention,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

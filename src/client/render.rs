@@ -168,9 +168,10 @@ pub(super) fn render(cmd: &ClientCmd, value: &Value) -> anyhow::Result<()> {
                     _ => "-".to_owned(),
                 };
                 println!(
-                    "{:<36} {:<8} {:<28}{} {}",
+                    "{:<36} {:<8} {:<10} {:<28}{} {}",
                     field(s, "address"),
                     field(s, "status"),
+                    field(&s["attention"], "state"),
                     labels,
                     agent_place(s),
                     field(s, "activity"),
@@ -190,18 +191,20 @@ pub(super) fn render(cmd: &ClientCmd, value: &Value) -> anyhow::Result<()> {
                         println!("{name}");
                         for s in sessions {
                             println!(
-                                "  /{:<17} {:<8}{} {}",
+                                "  /{:<17} {:<8} {:<10}{} {}",
                                 s["session"].as_str().unwrap_or("(shared)"),
                                 field(s, "status"),
+                                field(&s["attention"], "state"),
                                 agent_place(s),
                                 field(s, "activity"),
                             );
                         }
                     }
                     _ => println!(
-                        "{:<20} {:<8}{} {}",
+                        "{:<20} {:<8} {:<10}{} {}",
                         name,
                         field(&a, "status"),
+                        field(&a["attention"], "state"),
                         agent_place(&a),
                         field(&a, "activity"),
                     ),

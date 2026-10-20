@@ -1,6 +1,12 @@
 #!/bin/sh
-# heartbeat.sh [active|idle|busy|blocked] [reset]
+# heartbeat.sh [active|idle|busy|blocked|stop|prompt] [reset]
 # Presence ping with repo/branch context from the current git checkout.
+#
+# `stop` and `prompt` are lifecycle observations, not statuses (#221): the
+# turn ended (Stop) or one started (UserPromptSubmit). Both publish status
+# active, since the window is still open, and report the model's attention
+# as idle or attending, so teammates can tell a connected window from one
+# whose model is reading.
 # Fire-and-forget: always exits 0, never blocks the session.
 #
 # `reset` clears the activity line. A session that has just started has not
@@ -14,6 +20,11 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # hook has none (the Stop keep-alive is invoked without stdin), the resolver
 # falls back to BUS_SESSION exactly as before.
 STATUS="${1:-active}"
+ATTENTION=""
+case "$STATUS" in
+    stop)   STATUS=active; ATTENTION=idle ;;
+    prompt) STATUS=active; ATTENTION=attending ;;
+esac
 # Clamped before it reaches a payload. The python path would encode a
 # surprising value safely, but the fallback below interpolates it straight
 # into JSON, where one quote is malformed output rather than a bad status.
@@ -43,9 +54,11 @@ fi
 # Authenticated mode: the helper publishes presence as the bound window, with
 # repo and branch read from this checkout. Silent when there is no binding.
 if [ -n "${BUS_HOST_SESSION:-}" ] && command -v ai-crew-sync >/dev/null 2>&1; then
-    case "$STATUS" in
-        idle) EVENT=session_end ;;
-        *)    EVENT=heartbeat ;;
+    case "$STATUS:$ATTENTION" in
+        *:idle)      EVENT=stop ;;
+        *:attending) EVENT=prompt_submit ;;
+        idle:*)      EVENT=session_end ;;
+        *)           EVENT=heartbeat ;;
     esac
     case "$(ai-crew-sync context hook --binding "$BUS_HOST_SESSION" --event status 2>/dev/null)" in
         *'"authenticated"'*)
@@ -77,10 +90,12 @@ BRANCH="$(git branch --show-current 2>/dev/null || true)"
 # string-concatenated. Without python3 we still publish presence, just without
 # repo/branch — degraded detail beats a malformed request.
 if command -v python3 >/dev/null 2>&1; then
-    ARGS="$(STATUS="$STATUS" TTL="$TTL" REPO="$REPO" BRANCH="$BRANCH" RESET="$RESET" python3 - <<'PY'
+    ARGS="$(STATUS="$STATUS" TTL="$TTL" REPO="$REPO" BRANCH="$BRANCH" RESET="$RESET" ATTENTION="$ATTENTION" python3 - <<'PY'
 import json, os
 
 args = {"status": os.environ["STATUS"], "ttl_seconds": int(os.environ["TTL"])}
+if os.environ.get("ATTENTION"):
+    args["attention"] = os.environ["ATTENTION"]
 for key in ("repo", "branch"):
     value = os.environ.get(key.upper(), "").strip()
     if value:
@@ -91,6 +106,8 @@ if os.environ.get("RESET") == "reset":
 print(json.dumps(args))
 PY
 )"
+elif [ -n "$ATTENTION" ]; then
+    ARGS="{\"status\":\"$STATUS\",\"ttl_seconds\":$TTL,\"attention\":\"$ATTENTION\"}"
 elif [ "$RESET" = "reset" ]; then
     ARGS="{\"status\":\"$STATUS\",\"ttl_seconds\":$TTL,\"activity\":\"\"}"
 else

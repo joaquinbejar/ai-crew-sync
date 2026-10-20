@@ -39,8 +39,11 @@ pub enum Event {
     SessionStart,
     /// Keep the window's presence alive mid-conversation.
     Heartbeat,
-    /// The turn ended; the window is still open.
+    /// The turn ended; the window is still open. Reports the model idle.
     Stop,
+    /// The user submitted a prompt: a turn is starting. Reports the model
+    /// attending.
+    PromptSubmit,
     /// The window is closing.
     SessionEnd,
     /// What this binding is, for troubleshooting. Never prints a secret.
@@ -74,13 +77,14 @@ impl std::str::FromStr for Event {
             "session_start" | "sessionstart" => Ok(Self::SessionStart),
             "heartbeat" => Ok(Self::Heartbeat),
             "stop" => Ok(Self::Stop),
+            "prompt_submit" | "userpromptsubmit" | "user_prompt_submit" => Ok(Self::PromptSubmit),
             "session_end" | "sessionend" => Ok(Self::SessionEnd),
             "status" => Ok(Self::Status),
             "call" => Ok(Self::Call),
             "watch" => Ok(Self::Watch),
             other => bail!(
-                "unknown hook event '{other}'; use session_start, heartbeat, stop, \
-                 session_end, status, call or watch"
+                "unknown hook event '{other}'; use session_start, prompt_submit, heartbeat, \
+                 stop, session_end, status, call or watch"
             ),
         }
     }
@@ -200,9 +204,15 @@ async fn publish_presence(
     status: &str,
     reset_activity: bool,
     ttl: i64,
+    attention: Option<&str>,
 ) -> anyhow::Result<()> {
     let (repo, branch) = git_place(cwd);
     let mut args = json!({ "status": status, "ttl_seconds": ttl });
+    // What the host's lifecycle says about the model's turn (#221). "" sets
+    // it back to unknown; omitted keeps whatever was observed last.
+    if let Some(attention) = attention {
+        args["attention"] = Value::String(attention.to_owned());
+    }
     if let Some(repo) = repo {
         args["repo"] = Value::String(repo);
     }
@@ -433,6 +443,25 @@ fn watch_step(seen: &WatchState, reading: Reading) -> (bool, WatchState) {
     )
 }
 
+/// The label a watcher announces as this window's wake mechanism (#221).
+/// The plugin runs the watcher only in Claude Code, as an `asyncRewake` hook.
+pub const WATCH_WAKE_LABEL: &str = "claude-watcher";
+
+/// Announce (`Some(ttl)`) or withdraw (`None`) the watcher as this window's
+/// wake mechanism. Best effort and descriptive: teammates read it to tell a
+/// window that can be woken from one that cannot, never as proof.
+async fn announce_wake(binding: &Binding, ttl: Option<u64>) {
+    let args = match ttl {
+        Some(secs) => json!({
+            "refresh_only": true,
+            "wake": WATCH_WAKE_LABEL,
+            "wake_ttl_seconds": secs.clamp(30, 86_400),
+        }),
+        None => json!({"refresh_only": true, "wake": ""}),
+    };
+    let _ = call_as_window(binding, "heartbeat", args).await;
+}
+
 /// `--event watch`: block until something new is addressed to this window,
 /// then return the text to wake it with. `None` when the deadline passes,
 /// the binding is closed or missing, or a newer watcher took over. Starting
@@ -476,7 +505,11 @@ pub async fn watch(
         Ok(prior.map(|_| claim))
     })?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
+    if let Resolution::Authenticated(b) = resolve_binding(config_dir, binding_id) {
+        announce_wake(&b, Some(max_secs)).await;
+    }
     loop {
+        // Replaced: the newer watcher owns the announcement now.
         if read_watch_state(&path).is_none_or(|s| s.token != token) {
             return Ok(None);
         }
@@ -486,6 +519,7 @@ pub async fn watch(
         };
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            announce_wake(&binding, None).await;
             return Ok(None);
         }
         match pending_for_window(&binding).await {
@@ -515,6 +549,9 @@ pub async fn watch(
                     return Ok(None);
                 }
                 if wake {
+                    // This watcher ends here; the next turn's Stop starts
+                    // another, which announces itself again.
+                    announce_wake(&binding, None).await;
                     return Ok(Some(wake_text(next.direct, next.inbox)));
                 }
                 seen = Some(next);
@@ -619,7 +656,8 @@ pub async fn run(
         Event::SessionStart => {
             // Presence first, with the activity line cleared: a session that
             // has just started has not done anything yet.
-            let _ = publish_presence(&binding, cwd, "active", true, 900).await;
+            // A new process knows nothing about the previous one's turn.
+            let _ = publish_presence(&binding, cwd, "active", true, 900, Some("")).await;
             let context = session_start_context(&binding, digest_hours).await?;
             Ok(Some(
                 json!({
@@ -631,12 +669,21 @@ pub async fn run(
                 .to_string(),
             ))
         }
-        Event::Heartbeat | Event::Stop => {
-            publish_presence(&binding, cwd, "active", false, 900).await?;
+        Event::Heartbeat => {
+            publish_presence(&binding, cwd, "active", false, 900, None).await?;
+            Ok(None)
+        }
+        // The window stays open and connected; its model has stopped.
+        Event::Stop => {
+            publish_presence(&binding, cwd, "active", false, 900, Some("idle")).await?;
+            Ok(None)
+        }
+        Event::PromptSubmit => {
+            publish_presence(&binding, cwd, "active", false, 900, Some("attending")).await?;
             Ok(None)
         }
         Event::SessionEnd => {
-            publish_presence(&binding, cwd, "idle", false, 120).await?;
+            publish_presence(&binding, cwd, "idle", false, 120, Some("idle")).await?;
             Ok(None)
         }
         Event::Watch => bail!("--event watch runs through hook::watch"),
@@ -662,6 +709,8 @@ mod tests {
             ("session-start", Event::SessionStart),
             ("heartbeat", Event::Heartbeat),
             ("Stop", Event::Stop),
+            ("UserPromptSubmit", Event::PromptSubmit),
+            ("prompt-submit", Event::PromptSubmit),
             ("session_end", Event::SessionEnd),
             ("status", Event::Status),
             ("call", Event::Call),

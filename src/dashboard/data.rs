@@ -28,6 +28,9 @@ pub struct AgentRow {
     pub activity: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub online: bool,
+    /// What was last observed about the model's turn (#221).
+    #[sqlx(flatten)]
+    pub attention: crate::store::presence::RawAttention,
 }
 
 #[derive(sqlx::FromRow)]
@@ -160,7 +163,9 @@ async fn load_agents(pool: &PgPool, team_id: Uuid) -> Result<Vec<AgentRow>, sqlx
                p.branch,
                p.activity,
                p.updated_at,
-               COALESCE(p.expires_at > now(), false) AS online
+               COALESCE(p.expires_at > now(), false) AS online,
+               p.attention, p.attention_at, p.last_tool_at, p.last_inbox_read_at,
+               p.wake, p.wake_until
         FROM agents a
         LEFT JOIN agent_presence p ON p.agent_id = a.id
         WHERE a.team_id = $1 AND a.disabled_at IS NULL

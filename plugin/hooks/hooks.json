@@ -18,12 +18,23 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/heartbeat.sh prompt --from-payload",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/heartbeat.sh active --from-payload",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/heartbeat.sh stop --from-payload",
             "timeout": 10000
           },
           {
