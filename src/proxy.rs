@@ -293,49 +293,86 @@ impl Drop for InFlight {
 /// Tools whose call blocks on the bus waiting for teammates: while one is
 /// in flight the model's turn is waiting, not working.
 const WAITING_TOOLS: &[&str] = &["wait_for_updates", "ask_agent"];
-/// Tool activity is re-reported at most this often while the state is
-/// unchanged: often enough that `attending` stays fresh, rarely enough that
-/// a busy model does not double the bus traffic.
-const ATTENTION_REPORT_EVERY: Duration = Duration::from_secs(60);
+/// A tool call is reported at most this often while the reported state is
+/// unchanged. Short, because the bus may hold a newer observation this
+/// proxy cannot see (a Stop hook's `idle`): a call more than this long after
+/// the last report always goes out.
+const ATTENTION_REPORT_EVERY: Duration = Duration::from_secs(15);
 
 /// What this proxy has seen of its model's turn (#221). The host's tool
 /// calls are the only evidence: a call proves a turn is running, a call to a
 /// waiting tool proves it is blocked on the bus. Nothing here can see a turn
-/// end; hooks report that where the host has them.
+/// end; hooks report that where the host has them, so an observation older
+/// than [`ATTENTION_REPORT_EVERY`] is never sent late as if it were current.
 #[derive(Default)]
 struct Attention {
     /// Host tool calls in flight.
     calls: usize,
     /// Of those, the ones blocked in a bus wait.
     waits: usize,
-    /// A tool call started since attention was last reported.
-    tool_since_report: bool,
-    /// What was last reported, and when.
+    /// The latest tool call not yet reported.
+    unreported_call: Option<std::time::Instant>,
+    /// What the bus last accepted from this proxy, and when.
     reported: Option<(&'static str, std::time::Instant)>,
 }
 
+/// One attention report to send. It is committed with [`Attention::sent`]
+/// only once the bus took it, so a failed send is retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttentionReport {
+    state: &'static str,
+    /// The call this report covers, which also stamps `last_tool_at`.
+    call: Option<std::time::Instant>,
+}
+
+impl AttentionReport {
+    fn tool_activity(&self) -> bool {
+        self.call.is_some()
+    }
+}
+
 impl Attention {
-    /// What to report now, if anything, and whether it carries tool
-    /// activity. `refresh` re-reports a wait still in flight so its
-    /// observation stays fresh on the presence cadence.
-    fn due(&mut self, refresh: bool) -> Option<(&'static str, bool)> {
-        let state = if self.waits > 0 {
-            "waiting"
-        } else if self.tool_since_report {
-            "attending"
+    /// What to report now, if anything. `refresh` is the keepalive: it
+    /// re-reports a wait still in flight so that observation stays fresh,
+    /// and it never sends a call that has gone stale: once the model has
+    /// been quiet that long, its turn may have ended, and saying
+    /// `attending` would overwrite what a Stop hook observed.
+    fn due(&mut self, refresh: bool) -> Option<AttentionReport> {
+        let now = std::time::Instant::now();
+        let recent = |at: std::time::Instant| now.duration_since(at) < ATTENTION_REPORT_EVERY * 2;
+        if self.unreported_call.is_some_and(|at| !recent(at)) && self.calls == 0 {
+            self.unreported_call = None;
+        }
+        let reported_age = self.reported.map(|(_, at)| now.duration_since(at));
+        let (state, call) = if self.waits > 0 {
+            let changed = self.reported.is_none_or(|(s, _)| s != "waiting");
+            if !(changed || refresh) {
+                return None;
+            }
+            ("waiting", self.unreported_call)
+        } else if let Some(call) = self.unreported_call {
+            let changed = self.reported.is_none_or(|(s, _)| s != "attending");
+            let old = reported_age.is_none_or(|age| age >= ATTENTION_REPORT_EVERY);
+            if !(changed || old || (refresh && self.calls > 0)) {
+                return None;
+            }
+            ("attending", Some(call))
+        } else if refresh && self.calls > 0 {
+            // A long call still running: the turn is too.
+            ("attending", None)
         } else {
             return None;
         };
-        let changed = self.reported.is_none_or(|(s, _)| s != state);
-        let stale = self
-            .reported
-            .is_none_or(|(_, at)| at.elapsed() >= ATTENTION_REPORT_EVERY);
-        if !(changed || (stale && (self.tool_since_report || refresh))) {
-            return None;
+        Some(AttentionReport { state, call })
+    }
+
+    /// The bus accepted `report`.
+    fn sent(&mut self, report: AttentionReport) {
+        self.reported = Some((report.state, std::time::Instant::now()));
+        // Only the call this report covered; a newer one is still pending.
+        if self.unreported_call.is_some() && self.unreported_call == report.call {
+            self.unreported_call = None;
         }
-        let tool = std::mem::take(&mut self.tool_since_report);
-        self.reported = Some((state, std::time::Instant::now()));
-        Some((state, tool))
     }
 }
 
@@ -352,7 +389,7 @@ impl ToolTurn {
         if let Ok(mut a) = proxy.attention.lock() {
             a.calls += 1;
             a.waits += usize::from(waits);
-            a.tool_since_report = true;
+            a.unreported_call = Some(std::time::Instant::now());
         }
         proxy.attention_changed.notify_one();
         Self {
@@ -370,12 +407,12 @@ impl Drop for ToolTurn {
             if self.waits {
                 a.waits = a.waits.saturating_sub(1);
                 // Back from a wait: the turn is working again.
-                a.tool_since_report = true;
+                a.unreported_call = Some(std::time::Instant::now());
             }
         }
-        if self.waits {
-            self.changed.notify_one();
-        }
+        // Also the trailing edge of a throttled burst: a call that ended
+        // after the throttle window reports what it was not allowed to.
+        self.changed.notify_one();
     }
 }
 
@@ -1357,35 +1394,45 @@ impl Proxy {
 
     /// Keep this window's presence alive without saying anything about its
     /// status: a live process is not news about the model (#221). Carries
-    /// the model's attention when something new was seen, or `refresh`
-    /// re-reports a wait still in flight.
-    async fn refresh_presence(&self, refresh: bool) {
-        let due = self.attention.lock().ok().and_then(|mut a| a.due(refresh));
+    /// the model's attention when something new was seen, or re-reports a
+    /// wait still in flight.
+    async fn refresh_presence(&self) {
+        let due = self.attention.lock().ok().and_then(|mut a| a.due(true));
         let mut args = json!({"refresh_only": true});
-        if let Some((state, tool)) = due {
-            args["attention"] = json!(state);
-            args["tool_activity"] = json!(tool);
+        if let Some(report) = due {
+            args["attention"] = json!(report.state);
+            args["tool_activity"] = json!(report.tool_activity());
         }
-        self.publish_presence(args).await;
+        if self.publish_presence(args).await
+            && let Some(report) = due
+            && let Ok(mut a) = self.attention.lock()
+        {
+            a.sent(report);
+        }
     }
 
     /// Report attention now if something new was seen; nothing otherwise.
     async fn report_attention(&self) {
         let due = self.attention.lock().ok().and_then(|mut a| a.due(false));
-        if let Some((state, tool)) = due {
-            self.publish_presence(
-                json!({"refresh_only": true, "attention": state, "tool_activity": tool}),
-            )
-            .await;
+        let Some(report) = due else { return };
+        let args = json!({
+            "refresh_only": true,
+            "attention": report.state,
+            "tool_activity": report.tool_activity(),
+        });
+        if self.publish_presence(args).await
+            && let Ok(mut a) = self.attention.lock()
+        {
+            a.sent(report);
         }
     }
 
     /// One heartbeat with `fields`, plus repo/branch and this window's
-    /// labels.
-    async fn publish_presence(&self, fields: Value) {
+    /// labels. True when the bus accepted it.
+    async fn publish_presence(&self, fields: Value) -> bool {
         let (remote, project, role) = {
             let st = self.state.read().await;
-            let Some(c) = &st.connected else { return };
+            let Some(c) = &st.connected else { return false };
             (c.remote.clone(), st.project.clone(), st.role.clone())
         };
         let (repo, branch) = git_place(&self.project_dir);
@@ -1400,8 +1447,12 @@ impl Proxy {
         // Omitted keeps, "" clears: send exactly what this window knows.
         args["project"] = Value::String(project.unwrap_or_default());
         args["role"] = Value::String(role.unwrap_or_default());
-        if let Err(e) = call_remote(&remote, "heartbeat", args).await {
-            tracing::warn!(error = %e, "heartbeat failed");
+        match call_remote(&remote, "heartbeat", args).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "heartbeat failed");
+                false
+            }
         }
     }
 
@@ -2175,7 +2226,7 @@ impl Proxy {
                 _ = tokio::time::sleep_until(next_heartbeat) => {
                     // Renew, never re-assert "active": the window's hooks
                     // may have said its turn ended (#221).
-                    self.refresh_presence(true).await;
+                    self.refresh_presence().await;
                     next_heartbeat = tokio::time::Instant::now() + KEEPALIVE_EVERY;
                 }
                 _ = self.attention_changed.notified() => {
@@ -2375,7 +2426,8 @@ impl Proxy {
                     "heartbeat",
                     // The host closed this window: nothing will start a turn
                     // in it.
-                    json!({"status": "idle", "ttl_seconds": 120, "attention": "idle"}),
+                    // Nor will anything wake it: withdraw any announcement.
+                    json!({"status": "idle", "ttl_seconds": 120, "attention": "idle", "wake": ""}),
                 ),
             )
             .await;
@@ -2841,8 +2893,12 @@ mod unauthorized_tests {
 
 #[cfg(test)]
 mod attention_tests {
-    use super::Attention;
+    use super::{ATTENTION_REPORT_EVERY, Attention, AttentionReport};
     use std::time::{Duration, Instant};
+
+    fn ago(d: Duration) -> Instant {
+        Instant::now() - d
+    }
 
     #[test]
     fn nothing_seen_reports_nothing_even_on_a_refresh() {
@@ -2851,21 +2907,47 @@ mod attention_tests {
     }
 
     #[test]
-    fn a_tool_call_reports_attending_once_per_interval() {
+    fn a_call_reports_attending_and_a_burst_is_throttled() {
+        let call = Instant::now();
         let mut a = Attention {
             calls: 1,
-            tool_since_report: true,
+            unreported_call: Some(call),
             ..Attention::default()
         };
-        assert_eq!(a.due(false), Some(("attending", true)));
-        a.tool_since_report = true;
-        assert_eq!(a.due(false), None, "same state within the interval");
-        a.reported = Some(("attending", Instant::now() - Duration::from_secs(61)));
-        a.tool_since_report = true;
-        assert_eq!(a.due(false), Some(("attending", true)));
-        // No new call: a refresh does not renew an attending observation.
-        a.reported = Some(("attending", Instant::now() - Duration::from_secs(61)));
+        let r = a.due(false).expect("first call");
+        assert_eq!(r.state, "attending");
+        a.sent(r);
+        a.unreported_call = Some(Instant::now());
+        assert_eq!(a.due(false), None, "same state inside the window");
+        a.reported = Some(("attending", ago(ATTENTION_REPORT_EVERY)));
+        assert_eq!(a.due(false).map(|r| r.state), Some("attending"));
+    }
+
+    #[test]
+    fn a_keepalive_never_sends_a_stale_call() {
+        // A throttled call, then the turn ended (a Stop hook said idle).
+        // Minutes later the keepalive must not report it as current.
+        let mut a = Attention {
+            unreported_call: Some(ago(Duration::from_secs(120))),
+            reported: Some(("attending", ago(Duration::from_secs(130)))),
+            ..Attention::default()
+        };
         assert_eq!(a.due(true), None);
+        assert_eq!(a.unreported_call, None, "the stale call is dropped");
+    }
+
+    #[test]
+    fn a_failed_send_is_retried() {
+        let mut a = Attention {
+            calls: 1,
+            unreported_call: Some(Instant::now()),
+            ..Attention::default()
+        };
+        let r = a.due(false).expect("due");
+        // Not committed: the bus refused it.
+        assert_eq!(a.due(false), Some(r));
+        a.sent(r);
+        assert_eq!(a.due(false), None);
     }
 
     #[test]
@@ -2873,16 +2955,23 @@ mod attention_tests {
         let mut a = Attention {
             calls: 1,
             waits: 1,
-            tool_since_report: true,
+            unreported_call: Some(Instant::now()),
             ..Attention::default()
         };
-        assert_eq!(a.due(false), Some(("waiting", true)));
+        let r = a.due(false).expect("wait");
+        assert_eq!(r.state, "waiting");
+        a.sent(r);
         assert_eq!(a.due(false), None);
-        a.reported = Some(("waiting", Instant::now() - Duration::from_secs(301)));
-        assert_eq!(a.due(true), Some(("waiting", false)));
+        assert_eq!(
+            a.due(true),
+            Some(AttentionReport {
+                state: "waiting",
+                call: None
+            })
+        );
         // Back from the wait: attending again at once.
         a.waits = 0;
-        a.tool_since_report = true;
-        assert_eq!(a.due(false), Some(("attending", true)));
+        a.unreported_call = Some(Instant::now());
+        assert_eq!(a.due(false).map(|r| r.state), Some("attending"));
     }
 }

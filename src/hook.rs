@@ -208,6 +208,10 @@ async fn publish_presence(
 ) -> anyhow::Result<()> {
     let (repo, branch) = git_place(cwd);
     let mut args = json!({ "status": status, "ttl_seconds": ttl });
+    // A window that is closing can no longer be woken.
+    if status == "idle" {
+        args["wake"] = Value::String(String::new());
+    }
     // What the host's lifecycle says about the model's turn (#221). "" sets
     // it back to unknown; omitted keeps whatever was observed last.
     if let Some(attention) = attention {
@@ -462,6 +466,14 @@ async fn announce_wake(binding: &Binding, ttl: Option<u64>) {
     let _ = call_as_window(binding, "heartbeat", args).await;
 }
 
+/// Is `token` still the watcher that owns this window? Read under the
+/// configuration lock, like every other read-check-write of the state.
+fn owns_watch(config_dir: &Path, path: &Path, token: &str) -> anyhow::Result<bool> {
+    context::with_config_lock(config_dir, || {
+        Ok(read_watch_state(path).is_some_and(|s| s.token == token))
+    })
+}
+
 /// `--event watch`: block until something new is addressed to this window,
 /// then return the text to wake it with. `None` when the deadline passes,
 /// the binding is closed or missing, or a newer watcher took over. Starting
@@ -519,7 +531,9 @@ pub async fn watch(
         };
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            announce_wake(&binding, None).await;
+            if owns_watch(config_dir, &path, &token)? {
+                announce_wake(&binding, None).await;
+            }
             return Ok(None);
         }
         match pending_for_window(&binding).await {
@@ -550,8 +564,11 @@ pub async fn watch(
                 }
                 if wake {
                     // This watcher ends here; the next turn's Stop starts
-                    // another, which announces itself again.
-                    announce_wake(&binding, None).await;
+                    // another, which announces itself again. Withdrawn only
+                    // while still the owner, or it would erase a successor's.
+                    if owns_watch(config_dir, &path, &token)? {
+                        announce_wake(&binding, None).await;
+                    }
                     return Ok(Some(wake_text(next.direct, next.inbox)));
                 }
                 seen = Some(next);

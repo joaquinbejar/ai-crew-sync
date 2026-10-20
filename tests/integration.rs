@@ -17572,6 +17572,19 @@ async fn connectivity_and_attention_are_reported_apart() {
     let e = session_entry(&marta, "joaquin/api").await;
     assert_eq!(e["attention"]["wake"], "claude-watcher", "{e}");
     assert!(e["attention"]["wake_until"].is_string(), "{e}");
+    // An offline window is not running whatever announced the wake.
+    sqlx::query(
+        "UPDATE agent_presence SET expires_at = now() - interval '1 second' WHERE session = 'api'",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert_eq!(
+        e["attention"]["wake"], "unknown",
+        "an offline window kept its wake: {e}"
+    );
+    call(&api, "heartbeat", json!({"refresh_only": true})).await;
     sqlx::query(
         "UPDATE agent_presence SET wake_until = now() - interval '1 second' WHERE session = 'api'",
     )

@@ -31,7 +31,8 @@ pub struct RawAttention {
 /// What the stored observations say now. `idle` stands until something
 /// observes otherwise; `attending` and `waiting` stand for
 /// [`ATTENTION_FRESH_SECS`] and only while the window is online. Anything
-/// else is `unknown`: never a guess from connectivity.
+/// else is `unknown`: never a guess from connectivity. A wake announcement
+/// counts only while it has not lapsed and the window is online.
 pub fn attention_of(raw: &RawAttention, online: bool) -> SessionAttention {
     let now = chrono::Utc::now();
     let fresh = raw
@@ -42,8 +43,9 @@ pub fn attention_of(raw: &RawAttention, online: bool) -> SessionAttention {
         Some(s @ ("attending" | "waiting")) if online && fresh => s,
         _ => "unknown",
     };
+    // An offline window is not running whatever announced the wake.
     let wake = match (&raw.wake, raw.wake_until) {
-        (Some(w), Some(until)) if until > now => (w.clone(), Some(until)),
+        (Some(w), Some(until)) if online && until > now => (w.clone(), Some(until)),
         _ => ("unknown".to_owned(), None),
     };
     SessionAttention {
