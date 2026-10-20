@@ -931,6 +931,41 @@ funcionar. Ninguno de estos campos promete una respuesta.
 `refresh_only`); omitido conserva, `""` borra. Son aditivos: quien ya
 llamaba solo ve campos nuevos.
 
+#### El contrato de hooks de Antigravity
+
+Los mismos scripts sirven a Google Antigravity, que pasa su payload con un
+`conversationId` en camelCase y lee como JSON la respuesta de cada hook.
+Cada script distingue los hosts por el payload (y si no por
+`ANTIGRAVITY_CONVERSATION_ID`, que Antigravity exporta a sus hooks) y
+responde en el contrato de ese host:
+
+- **SessionStart**: `{"injectSteps": [{"systemMessage": {"systemMessage": …}}]}`
+  en vez de `hookSpecificOutput`.
+- **Drenaje en Stop**: `{"decision": "continue", "reason": …}` con toda la
+  instrucción en el motivo, una vez por pregunta, en vez de `block`. Solo tras
+  un turno que terminó con normalidad (`terminationReason: NO_TOOL_CALL`): un
+  turno cancelado nunca se fuerza a seguir, y su pregunta espera al siguiente
+  Stop.
+- **Cuando no hay nada que decir**: `{}`.
+
+Antigravity ejecuta los hooks desde el directorio del plugin, así que los
+scripts se mueven a la primera entrada de `workspacePaths` del payload antes
+de leer el repo y la rama.
+
+`ai-crew-sync context hook --host antigravity` elige el formato a mano; sin
+él, el ayudante detecta Antigravity por su variable de entorno. Verificado
+con `agy` 1.4.3:
+
+- SessionStart inyectó el contexto de la ventana en una conversación nueva.
+- Una pregunta pendiente para una conversación reanudada se respondió
+  (con `reply_to`) después de que el drenaje en Stop continuara el bucle.
+
+Hay un límite que pone el host: agy nombra la conversación a los servidores
+MCP solo en `tools/call`. En una conversación reanudada el proxy nuevo no
+queda vinculado hasta que el modelo llama a una herramienta de ai-crew-sync,
+así que hasta entonces los hooks encuentran el binding cerrado del proceso
+anterior y se callan. Nunca actúan como una ventana supuesta.
+
 #### Despertar un hilo de Codex inactivo (opcional)
 
 Codex no tiene un hook en segundo plano que pueda empezar un turno, así que

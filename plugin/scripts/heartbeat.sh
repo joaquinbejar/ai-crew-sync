@@ -40,19 +40,25 @@ RESET="${2:-}"
 # `--from-payload` in the second slot: the hook was given the host payload on
 # stdin, so read the conversation id from it exactly as the other hooks do.
 # (Kept distinct from `reset`, which is the legacy second argument.)
+# The payload names the host too: Antigravity reads a JSON object from every
+# hook's stdout, so under it this hook answers `{}` on its way out.
+HOOK_HOST=claude
 if [ "$RESET" = "--from-payload" ]; then
     RESET=""
-    if [ -z "${BUS_HOST_SESSION:-}" ] && command -v python3 >/dev/null 2>&1; then
-        PAYLOAD="$(cat 2>/dev/null || true)"
-        HOST_SESSION="$(PAYLOAD="$PAYLOAD" python3 -c 'import json,os,sys
-try:
-    v = json.loads(os.environ.get("PAYLOAD") or "{}").get("session_id")
-except Exception:
-    v = None
-sys.stdout.write(str(v) if v else "")' 2>/dev/null || true)"
-        [ -n "$HOST_SESSION" ] && export BUS_HOST_SESSION="$HOST_SESSION"
+    # Without python3 the payload cannot be read; the environment still says
+    # whether Antigravity is asking.
+    [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ] && HOOK_HOST=antigravity
+    if command -v python3 >/dev/null 2>&1; then
+        . "$DIR/host-payload.sh"
+        [ -z "${BUS_HOST_SESSION:-}" ] && [ -n "$HOST_SESSION" ] \
+            && export BUS_HOST_SESSION="$HOST_SESSION"
     fi
 fi
+# Quiet by contract: nothing a host should read, except Antigravity's `{}`.
+done_quietly() {
+    [ "$HOOK_HOST" = antigravity ] && printf '{}\n'
+    exit 0
+}
 
 # Authenticated mode: the helper publishes presence as the bound window, with
 # repo and branch read from this checkout. Silent when there is no binding.
@@ -67,7 +73,7 @@ if [ -n "${BUS_HOST_SESSION:-}" ] && command -v ai-crew-sync >/dev/null 2>&1; th
         *'"authenticated"'*)
             ai-crew-sync context hook --binding "$BUS_HOST_SESSION" --event "$EVENT" \
                 >/dev/null 2>&1 || true
-            exit 0
+            done_quietly
             ;;
         *'"no-credential"'*)
             # This window WAS authenticated and its state is now unusable.
@@ -76,7 +82,7 @@ if [ -n "${BUS_HOST_SESSION:-}" ] && command -v ai-crew-sync >/dev/null 2>&1; th
             # legacy identity another window may be using. Stay quiet, as
             # session-start.sh does. A binding that never existed ("missing")
             # still takes the legacy path below.
-            exit 0
+            done_quietly
             ;;
     esac
 fi
@@ -126,4 +132,4 @@ else
 fi
 
 "$DIR/bus-call.sh" heartbeat "$ARGS" >/dev/null 2>&1 || true
-exit 0
+done_quietly

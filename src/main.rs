@@ -548,6 +548,11 @@ enum ContextCmd {
         /// in seconds (60-86400). Keep it under the host's hook timeout.
         #[arg(long, env = "BUS_WATCH_SECS", default_value_t = 14_000)]
         watch_secs: u64,
+        /// Which host's hook contract to answer in: claude (Claude Code,
+        /// Codex) or antigravity. Detected when omitted: antigravity when
+        /// ANTIGRAVITY_CONVERSATION_ID is set, claude otherwise.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Wake an idle Codex thread when the bus has something new for its
     /// window, through the local Codex app-server (`turn/start`). Opt-in and
@@ -1432,8 +1437,13 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
             tool,
             args,
             watch_secs,
+            host,
         } => {
             let event: hook::Event = event.parse()?;
+            let host = match host {
+                Some(h) => h.parse()?,
+                None => hook::HookHost::detect(),
+            };
             if event == hook::Event::Watch {
                 // Exit 2 with the text on stderr is how a rewaking hook wakes
                 // its host (Claude Code's asyncRewake); anything else, an
@@ -1473,7 +1483,17 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                 }
                 _ => None,
             };
-            match hook::run(&context::config_dir()?, &binding, event, &cwd, hours, call).await {
+            match hook::run_as(
+                host,
+                &context::config_dir()?,
+                &binding,
+                event,
+                &cwd,
+                hours,
+                call,
+            )
+            .await
+            {
                 Ok(Some(out)) => println!("{out}"),
                 Ok(None) => {}
                 // A hook must never break the host's session: report the

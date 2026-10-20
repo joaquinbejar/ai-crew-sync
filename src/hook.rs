@@ -64,6 +64,56 @@ pub enum Event {
     Watch,
 }
 
+/// Which host's hook contract to answer in (#229). The events are the same;
+/// what a host reads back from a hook differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookHost {
+    /// Claude Code (and Codex, which uses the same contract):
+    /// `hookSpecificOutput.additionalContext` at SessionStart.
+    Claude,
+    /// Google Antigravity: `injectSteps` with a `systemMessage` at
+    /// SessionStart. Its payloads name the conversation `conversationId`.
+    Antigravity,
+}
+
+impl HookHost {
+    /// Without `--host`: Antigravity exports `ANTIGRAVITY_CONVERSATION_ID` to
+    /// every hook it runs (verified with agy 1.4.3); anything else answers
+    /// in Claude Code's contract, as before.
+    pub fn detect() -> Self {
+        match std::env::var("ANTIGRAVITY_CONVERSATION_ID") {
+            Ok(v) if !v.trim().is_empty() => Self::Antigravity,
+            _ => Self::Claude,
+        }
+    }
+
+    /// What a SessionStart hook prints to hand `context` to the model.
+    pub fn session_start_output(self, context: &str) -> Value {
+        match self {
+            Self::Claude => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": context,
+                }
+            }),
+            Self::Antigravity => json!({
+                "injectSteps": [{"systemMessage": {"systemMessage": context}}]
+            }),
+        }
+    }
+}
+
+impl std::str::FromStr for HookHost {
+    type Err = anyhow::Error;
+    fn from_str(raw: &str) -> anyhow::Result<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "claude" | "claude-code" | "codex" => Ok(Self::Claude),
+            "antigravity" | "agy" => Ok(Self::Antigravity),
+            other => bail!("unknown hook host '{other}'; use claude or antigravity"),
+        }
+    }
+}
+
 /// The tools `--event call` serves: exactly what the hook scripts call
 /// through `bus-call.sh`. Anything else is refused before the binding is
 /// even read, so `resume_session` through a hook cannot rotate the proxy's
@@ -622,6 +672,28 @@ pub async fn run(
     digest_hours: i64,
     call: Option<(String, Value)>,
 ) -> anyhow::Result<Option<String>> {
+    run_as(
+        HookHost::Claude,
+        config_dir,
+        binding_id,
+        event,
+        cwd,
+        digest_hours,
+        call,
+    )
+    .await
+}
+
+/// [`run`], answering in `host`'s hook contract.
+pub async fn run_as(
+    host: HookHost,
+    config_dir: &Path,
+    binding_id: &str,
+    event: Event,
+    cwd: &Path,
+    digest_hours: i64,
+    call: Option<(String, Value)>,
+) -> anyhow::Result<Option<String>> {
     // Refused before anything is read or contacted: the allowlist is the
     // contract, not the binding's state.
     if event == Event::Call
@@ -684,15 +756,7 @@ pub async fn run(
             // A new process knows nothing about the previous one's turn.
             let _ = publish_presence(&binding, cwd, "active", true, 900, Some("")).await;
             let context = session_start_context(&binding, digest_hours).await?;
-            Ok(Some(
-                json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "SessionStart",
-                        "additionalContext": context,
-                    }
-                })
-                .to_string(),
-            ))
+            Ok(Some(host.session_start_output(&context).to_string()))
         }
         Event::Heartbeat => {
             publish_presence(&binding, cwd, "active", false, 900, None).await?;
@@ -725,6 +789,28 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_start_answers_in_each_hosts_contract() {
+        let claude = HookHost::Claude.session_start_output("hello");
+        assert_eq!(claude["hookSpecificOutput"]["additionalContext"], "hello");
+        assert_eq!(
+            claude["hookSpecificOutput"]["hookEventName"],
+            "SessionStart"
+        );
+        let agy = HookHost::Antigravity.session_start_output("hello");
+        assert_eq!(
+            agy["injectSteps"][0]["systemMessage"]["systemMessage"],
+            "hello"
+        );
+        assert!(agy.get("hookSpecificOutput").is_none());
+        assert_eq!(
+            "antigravity".parse::<HookHost>().unwrap(),
+            HookHost::Antigravity
+        );
+        assert_eq!("claude".parse::<HookHost>().unwrap(), HookHost::Claude);
+        assert!("cursor".parse::<HookHost>().is_err());
+    }
 
     #[test]
     fn event_names_are_forgiving_but_bounded() {

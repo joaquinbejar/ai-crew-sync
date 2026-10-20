@@ -14,29 +14,27 @@
 # unreachable, or when the bus is not configured at all.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-command -v python3 >/dev/null 2>&1 || exit 0
+if ! command -v python3 >/dev/null 2>&1; then
+    [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ] && printf '{}\n'
+    exit 0
+fi
+
+# The host delivers the payload on stdin; its conversation id (Claude Code's
+# session_id, Antigravity's conversationId) keys both the loop guard and the
+# binding, and HOOK_HOST says which Stop contract to answer in.
+. "$DIR/host-payload.sh"
 
 # Configured in one of two ways, and neither is assumed: the authenticated
 # path needs the binary and a binding (resolved below, from the payload), the
 # legacy path needs BUS_URL and BUS_TOKEN. With neither, the hook is silent —
 # a window whose bus is not set up must not block on a question.
 if [ -z "${BUS_TOKEN:-}" ] && ! command -v ai-crew-sync >/dev/null 2>&1; then
-    exit 0
+    acs_quiet_exit
 fi
-[ -n "${BUS_TOKEN:-}" ] && [ -z "${BUS_URL:-}" ] && exit 0
-
-# Claude Code delivers the hook payload on stdin; session_id keys the loop
-# guard so two sessions in different repositories do not share one.
-PAYLOAD="$(cat 2>/dev/null || true)"
+[ -n "${BUS_TOKEN:-}" ] && [ -z "${BUS_URL:-}" ] && acs_quiet_exit
 
 # Same conversation id as the proxy and the other hooks of this window: the
 # drain must look at this window's inbox, never a sibling's.
-HOST_SESSION="$(PAYLOAD="$PAYLOAD" python3 -c 'import json,os,sys
-try:
-    v = json.loads(os.environ.get("PAYLOAD") or "{}").get("session_id")
-except Exception:
-    v = None
-sys.stdout.write(str(v) if v else "")' 2>/dev/null || true)"
 [ -n "$HOST_SESSION" ] && export BUS_HOST_SESSION="$HOST_SESSION"
 
 # A window that was authenticated and lost its credential reads nothing on
@@ -44,7 +42,7 @@ sys.stdout.write(str(v) if v else "")' 2>/dev/null || true)"
 # inbox with the parent token, which is another window's, not this one's.
 if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
     case "$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)" in
-        *'"no-credential"'*) exit 0 ;;
+        *'"no-credential"'*) acs_quiet_exit ;;
     esac
 fi
 
@@ -57,11 +55,11 @@ fi
 # about to make to answer it.
 FEED="$("$DIR/bus-call.sh" read_messages \
     '{"scope":"all","only_new":false,"limit":50}' 2>/dev/null || true)"
-[ -n "$FEED" ] || exit 0
+[ -n "$FEED" ] || acs_quiet_exit
 WHO="$("$DIR/bus-call.sh" whoami 2>/dev/null || true)"
 
 STATE_DIR="${TMPDIR:-/tmp}"
-export PAYLOAD FEED WHO STATE_DIR
+export PAYLOAD FEED WHO STATE_DIR HOOK_HOST HOST_SESSION
 # Which session this window is, as the server reports it: with the proxy the
 # label is derived from the conversation id, not exported in BUS_SESSION.
 MY_SESSION="$(WHO="$WHO" python3 -c 'import json,os,sys
@@ -75,6 +73,28 @@ export BUS_SESSION="${MY_SESSION:-${BUS_SESSION:-}}"
 python3 - <<'PY' 2>/dev/null || true
 import json, os, re
 
+def quiet():
+    # Antigravity reads a JSON object from every hook; Claude Code wants
+    # nothing when there is nothing to say.
+    if os.environ.get("HOOK_HOST") == "antigravity":
+        print("{}")
+    raise SystemExit(0)
+
+# An unexpected error still answers in the host's contract.
+import sys
+sys.excepthook = lambda *_: os.environ.get("HOOK_HOST") == "antigravity" and print("{}")
+
+# Antigravity also runs Stop when the user cancelled, on errors and at its
+# invocation limits. Only a turn that ended normally is held open: forcing
+# the loop on past a cancel is not this hook's call, and the question waits
+# for the next normal stop.
+try:
+    _reason = json.loads(os.environ.get("PAYLOAD") or "{}").get("terminationReason")
+except Exception:
+    _reason = None
+if os.environ.get("HOOK_HOST") == "antigravity" and _reason not in (None, "", "NO_TOOL_CALL"):
+    quiet()
+
 def sc(raw):
     try:
         return json.loads(raw)["result"]["structuredContent"]
@@ -86,7 +106,7 @@ who = sc(os.environ.get("WHO", "")) or {}
 me = who.get("agent")
 messages = (feed or {}).get("messages")
 if not messages or not me:
-    raise SystemExit(0)
+    quiet()
 
 # Addressed to this window, or to the person. `agent/session` narrows who a
 # message is for, so it has to narrow who sees it too — otherwise a question
@@ -142,7 +162,7 @@ def is_question(m):
 # ask_agent marks it, and post_message can too.
 questions = [m for m in messages if is_question(m)]
 if not questions:
-    raise SystemExit(0)
+    quiet()
 
 # Answered already: metadata says "this is a question", never "this one is
 # still open". Anything this agent has replied to is settled, so a question
@@ -174,8 +194,7 @@ def already_answered(m):
 # does not answer, the hook does not nag. Kept as a set rather than a
 # high-water mark: with two questions queued, remembering only the newest id
 # would suppress the older one for good and leave its caller blocked.
-payload = json.loads(os.environ.get("PAYLOAD") or "{}") if os.environ.get("PAYLOAD") else {}
-session_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(payload.get("session_id") or "default"))[:64]
+session_key = re.sub(r"[^A-Za-z0-9_.-]", "_", os.environ.get("HOST_SESSION") or "default")[:64]
 state = os.path.join(os.environ["STATE_DIR"], f"ai-crew-sync-drain-{session_key}")
 
 try:
@@ -187,7 +206,7 @@ except Exception:
 # Oldest first: the caller who has been blocked longest is the one to unblock.
 pending = sorted(q["id"] for q in questions if not already_answered(q) and q["id"] not in seen)
 if not pending:
-    raise SystemExit(0)
+    quiet()
 message_id = pending[0]
 latest = next(q for q in questions if q["id"] == message_id)
 
@@ -198,7 +217,7 @@ try:
 except Exception:
     # Without a durable marker the guard cannot hold, and blocking anyway
     # risks the loop this exists to prevent.
-    raise SystemExit(0)
+    quiet()
 
 sender = latest.get("from") or "a teammate"
 if latest.get("from_session"):
@@ -210,21 +229,27 @@ if len(body) > 1500:
 waiting = len(pending) - 1
 more = f" {waiting} other question(s) are also waiting." if waiting else ""
 
-print(json.dumps({
-    "decision": "block",
-    "reason": f"{sender} is blocked waiting on an answer from you.",
-    "hookSpecificOutput": {
-        "hookEventName": "Stop",
-        "additionalContext": (
-            f"[ai-crew-sync] {sender} asked you a question and their agent is "
-            f"blocked waiting for the reply:\n\n{body}\n\n"
-            f"Answer it now with post_message (to: \"{sender}\", "
-            f"reply_to: {message_id}), then finish. Address the sender's "
-            "session, not just their name, or the answer reaches a different "
-            "window from the one that is waiting. If you genuinely cannot "
-            f"answer, say so in the reply rather than leaving them blocked.{more}"
-        ),
-    },
-}))
+instruction = (
+    f"[ai-crew-sync] {sender} asked you a question and their agent is "
+    f"blocked waiting for the reply:\n\n{body}\n\n"
+    f"Answer it now with post_message (to: \"{sender}\", "
+    f"reply_to: {message_id}), then finish. Address the sender's "
+    "session, not just their name, or the answer reaches a different "
+    "window from the one that is waiting. If you genuinely cannot "
+    f"answer, say so in the reply rather than leaving them blocked.{more}"
+)
+if os.environ.get("HOOK_HOST") == "antigravity":
+    # Antigravity: "continue" re-enters the loop and injects `reason` as a
+    # system message, so the reason carries the whole instruction.
+    print(json.dumps({"decision": "continue", "reason": instruction}))
+else:
+    print(json.dumps({
+        "decision": "block",
+        "reason": f"{sender} is blocked waiting on an answer from you.",
+        "hookSpecificOutput": {
+            "hookEventName": "Stop",
+            "additionalContext": instruction,
+        },
+    }))
 PY
 exit 0
