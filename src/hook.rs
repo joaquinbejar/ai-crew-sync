@@ -530,7 +530,9 @@ pub async fn watch(
         let waited = call_as_window(
             &binding,
             "wait_for_updates",
-            json!({"timeout_seconds": wait, "kinds": ["message"]}),
+            // The inbox, which is what the counts above read: unread channel
+            // chatter must not return every wait at once (#223).
+            json!({"timeout_seconds": wait, "kinds": ["message"], "scope": "inbox"}),
         )
         .await;
         // An answer that comes back at once (something unread is already

@@ -17327,3 +17327,39 @@ async fn a_long_inbox_wait_through_the_proxy_keeps_its_scope_across_slices() {
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
 }
+
+/// Another window of yours writing to a teammate is visible to you, but it
+/// is nothing for you to read: it must not wake a wait whose backlog count
+/// would then report nothing (#223 review).
+#[tokio::test]
+async fn a_sibling_windows_outgoing_message_does_not_wake_a_wait() {
+    let h = require_db!("t_wait_sibling_outgoing");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    seed_agent(&h.pool, "acme", "marta").await;
+    let web = connect_with_session(&h.base, &token, "web").await;
+    let waiter = {
+        let (base, token) = (h.base.clone(), token.clone());
+        tokio::spawn(async move {
+            let api = connect_with_session(&base, &token, "api").await;
+            let r = call(
+                &api,
+                "wait_for_updates",
+                json!({"timeout_seconds": 5, "kinds": ["message"]}),
+            )
+            .await;
+            let _ = api.cancel().await;
+            r
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    call(
+        &web,
+        "post_message",
+        json!({"to": "marta", "body": "from my other window"}),
+    )
+    .await;
+    let r = waiter.await.unwrap();
+    assert_eq!(r["timed_out"], true, "{r}");
+    let _ = web.cancel().await;
+    h.shutdown().await;
+}
