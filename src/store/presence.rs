@@ -4,7 +4,8 @@ use crate::{
     auth::AuthCtx,
     error::{BusError, BusResult},
     model::{
-        AgentInfo, AgentList, AgentSession, SessionAttention, SessionEntry, SessionList, ts_opt,
+        AgentInfo, AgentList, AgentSession, RecipientState, RecipientWindow, SessionAttention,
+        SessionEntry, SessionList, ts_opt,
     },
 };
 
@@ -64,6 +65,67 @@ pub fn attention_of(raw: &RawAttention, online: bool) -> SessionAttention {
         last_wake: raw.wake_result.clone(),
         last_wake_at: ts_opt(raw.wake_result_at),
     }
+}
+
+/// The windows an address reaches, with what is known about each (#224).
+/// `session` narrows to one window (`agent/session`); `None` is the person,
+/// every window of theirs. Scoped by the caller's team through `agent_id`,
+/// which the caller resolved by name within its own team; exposes only what
+/// `list_sessions` already shows teammates. The asking window itself is left
+/// out: when you ask yourself as a person, the window blocked on the
+/// question is not one that can answer it.
+pub async fn recipient_state(
+    pool: &PgPool,
+    auth: &AuthCtx,
+    agent_id: uuid::Uuid,
+    agent_name: &str,
+    session: Option<&str>,
+) -> BusResult<RecipientState> {
+    let rows: Vec<WindowRow> = sqlx::query_as(
+        r#"
+        SELECT p.session,
+               (p.expires_at > now()) AS online,
+               p.attention, p.attention_at, p.last_tool_at, p.last_inbox_read_at,
+               p.wake, p.wake_until, p.wake_result, p.wake_result_at
+        FROM agent_presence p
+        WHERE p.agent_id = $1
+          AND ($2::text IS NULL OR p.session = $2)
+          AND NOT (p.agent_id = $3 AND p.session = $4)
+        ORDER BY (p.expires_at > now()) DESC, p.updated_at DESC
+        LIMIT 20
+        "#,
+    )
+    .bind(agent_id)
+    .bind(session)
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .fetch_all(pool)
+    .await?;
+    let windows = rows
+        .into_iter()
+        .map(|row| RecipientWindow {
+            address: if row.session.is_empty() {
+                agent_name.to_owned()
+            } else {
+                format!("{agent_name}/{}", row.session)
+            },
+            online: row.online,
+            attention: attention_of(&row.attention, row.online),
+        })
+        .collect();
+    Ok(RecipientState {
+        routing: if session.is_some() { "exact" } else { "agent" }.to_owned(),
+        windows,
+    })
+}
+
+/// One window of `recipient_state`.
+#[derive(sqlx::FromRow)]
+struct WindowRow {
+    session: String,
+    online: bool,
+    #[sqlx(flatten)]
+    attention: RawAttention,
 }
 
 /// Validate an attention observation: one of the three states, or "" to

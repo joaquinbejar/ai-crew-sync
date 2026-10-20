@@ -1051,6 +1051,28 @@ waiting for it.
 A question from one of your **own** windows is surfaced like anyone else's:
 the unit the bus reasons about is the window, not the person.
 
+**A timeout is not a failed delivery.** Every `ask_agent` result carries
+`question_stored: true` and a `recipient` object, which says who the address
+reached and what is known about each window it reaches:
+
+- `routing`: `exact` for one window, `agent` for the bare name, which reaches
+  every window of theirs;
+- `windows`: for each window, `online` and its `attention` (see "Connected is
+  not attending").
+
+On a timeout the `suggestion` uses it:
+
+- no window connected: nothing is reading the question now;
+- a window `attending` or `waiting`: an answer may still come, so resume;
+- idle with a wake mechanism: it may be woken, and the suggestion says so if
+  the last wake failed;
+- idle with no way to be woken: the question will likely wait for the human,
+  so do other work instead of waiting in a loop.
+
+Resuming with `resume_message_id` keeps the same question id and never sends
+another message. None of these states promises an answer, and the result
+never carries anyone's message bodies beyond the answer itself.
+
 Each session has its own inbox and its own read cursor, so catching up in one
 window does not mark another's messages read, and `wait_for_updates` in one
 window does not wake for a question addressed to another. Nothing is hidden

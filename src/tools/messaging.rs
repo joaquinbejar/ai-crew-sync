@@ -145,6 +145,73 @@ pub struct AskAgentArgs {
     pub resume_message_id: Option<i64>,
 }
 
+/// What to tell an asker whose question was not answered in time (#224):
+/// the question is stored either way, and what is known about the recipient
+/// decides whether waiting longer is likely to help. Never a promise.
+fn timeout_suggestion(
+    to: &str,
+    timeout: i64,
+    question_id: i64,
+    recipient: &crate::model::RecipientState,
+) -> String {
+    let resume = format!(
+        "ask_agent again with resume_message_id={question_id} (it does not re-send the question)"
+    );
+    let stored = format!(
+        "{to} has not answered within {timeout}s. Your question (message {question_id}) is \
+         stored and stays in their inbox"
+    );
+    let live = recipient.windows.iter().filter(|w| w.online).count();
+    let reach = match recipient.routing.as_str() {
+        "agent" if live > 1 => format!(
+            " The bare name reaches every window of theirs ({live} connected); ask one \
+             window by its `agent/session` address (see list_sessions) to know which will \
+             read it."
+        ),
+        _ => String::new(),
+    };
+    let online: Vec<&crate::model::RecipientWindow> =
+        recipient.windows.iter().filter(|w| w.online).collect();
+    if online.is_empty() {
+        return format!(
+            "{stored}, but no window of theirs is connected: nothing is reading it now. Do \
+             other work and check read_messages later, or {resume} once list_sessions shows \
+             them online.{reach}"
+        );
+    }
+    if let Some(w) = online
+        .iter()
+        .find(|w| matches!(w.attention.state.as_str(), "attending" | "waiting"))
+    {
+        return format!(
+            "{stored}. {} is {} (observed {}), so an answer may still come: {resume}.{reach}",
+            w.address,
+            w.attention.state,
+            w.attention.observed_at.as_deref().unwrap_or("recently"),
+        );
+    }
+    if let Some(w) = online.iter().find(|w| w.attention.wake != "unknown") {
+        let last = match w.attention.last_wake.as_deref() {
+            Some("failed") => " Its last wake attempt failed, so it may need its human.",
+            _ => "",
+        };
+        return format!(
+            "{stored}. {} is connected but its model is {}; it announces a wake mechanism \
+             ({}), which may start a turn for your question.{last} {resume}, or do other \
+             work and check read_messages later.{reach}",
+            w.address, w.attention.state, w.attention.wake,
+        );
+    }
+    let w = online[0];
+    format!(
+        "{stored}, but {} is connected with its model {} and announces no way to be woken: \
+         the question will likely wait until its human starts a turn. Do not wait in a \
+         loop: do other work (or leave the work as a task) and check read_messages later.\
+         {reach}",
+        w.address, w.attention.state,
+    )
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchMessagesArgs {
     /// Full-text search terms.
@@ -246,8 +313,12 @@ impl Bus {
                        their reply, so one call replaces post_message + wait_for_updates + \
                        read_messages. On timeout, call it again with `resume_message_id` set \
                        to the returned question_message_id to keep waiting without asking \
-                       twice. If you receive a question yourself, answer with post_message \
-                       (`to` the asker, `reply_to` the question id)."
+                       twice. The result's `recipient` says whether the window is connected, \
+                       whether its model is attending, idle or unknown, and how it can be \
+                       woken; on a timeout the suggestion says whether waiting more is likely \
+                       to help. A stored question is not a delivered answer. If you receive a \
+                       question yourself, answer with post_message (`to` the asker, \
+                       `reply_to` the question id)."
     )]
     async fn ask_agent(
         &self,
@@ -263,10 +334,6 @@ impl Bus {
 
         let (target_name, target_session) = messaging::parse_address(&to)?;
         let target_id = agent_id_by_name(&self.db, auth.team_id, &target_name).await?;
-        // Asking another of your own sessions is the point of session
-        // addressing — a coordinating window handing work to the one with the
-        // repository open. Only asking *this* window is impossible: nothing
-        // would ever read the question, and the call would block until timeout.
         // Asking another of your own sessions is the point of session
         // addressing. What cannot work is an address only *this* window can
         // read, because the call blocks until something answers it.
@@ -350,6 +417,14 @@ impl Bus {
             )
             .await?
             {
+                let recipient = crate::store::presence::recipient_state(
+                    &self.db,
+                    &auth,
+                    target_id,
+                    &target_name,
+                    target_session.as_deref(),
+                )
+                .await?;
                 return Ok(Json(AskResult {
                     answered: true,
                     to,
@@ -358,6 +433,8 @@ impl Bus {
                     suggestion: "The answer also sits unread in your inbox; read_messages \
                                  will mark it read."
                         .into(),
+                    question_stored: true,
+                    recipient,
                 }));
             }
 
@@ -399,6 +476,14 @@ impl Bus {
                 )
                 .await?;
                 let answered = answer.is_some();
+                let recipient = crate::store::presence::recipient_state(
+                    &self.db,
+                    &auth,
+                    target_id,
+                    &target_name,
+                    target_session.as_deref(),
+                )
+                .await?;
                 return Ok(Json(AskResult {
                     answered,
                     suggestion: if answered {
@@ -406,15 +491,13 @@ impl Bus {
                          mark it read."
                             .into()
                     } else {
-                        format!(
-                            "{to} has not answered within {timeout}s. Call ask_agent again \
-                             with resume_message_id={question_id} to keep waiting without \
-                             re-sending, or do other work and check read_messages later."
-                        )
+                        timeout_suggestion(&to, timeout, question_id, &recipient)
                     },
                     to,
                     question_message_id: question_id,
                     answer,
+                    question_stored: true,
+                    recipient,
                 }));
             }
         }

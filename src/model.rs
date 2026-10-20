@@ -520,6 +520,37 @@ pub struct AskResult {
     pub answer: Option<MessageInfo>,
     /// What to do next.
     pub suggestion: String,
+    /// The question is on the bus and stays there whether or not anyone
+    /// answers in time: a timeout is not a failed delivery.
+    pub question_stored: bool,
+    /// Who the question reached and what is known about whether anything
+    /// will read it soon. Observations, never a promise of an answer.
+    pub recipient: RecipientState,
+}
+
+/// What is known about the window(s) a question went to (#224): who the
+/// address reaches and, for each window, whether it is connected, what was
+/// last observed about its model, and how it can be woken. Observations,
+/// never a promise: none of it means an answer will come.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RecipientState {
+    /// `exact` when `to` named one window (`agent/session`), `agent` when it
+    /// named the person: then it reaches every window of theirs, and any of
+    /// them may answer, or none.
+    pub routing: String,
+    /// The windows the address reaches that have presence, live first.
+    /// Empty when none has ever connected.
+    pub windows: Vec<RecipientWindow>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RecipientWindow {
+    /// This window's address: `agent/session` reaches exactly it; a bare
+    /// `agent` is the shared window, and that address reaches every window
+    /// of theirs.
+    pub address: String,
+    pub online: bool,
+    pub attention: SessionAttention,
 }
 
 // ----------------------------------------------------------------- digest --

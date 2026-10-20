@@ -1080,6 +1080,30 @@ ventana que se dé cuenta primero en vez de a la que está bloqueada esperándol
 Una pregunta de una ventana **tuya** aparece igual que la de cualquier otro:
 la unidad de la que habla el bus es la ventana, no la persona.
 
+**Un tiempo agotado no es una entrega fallida.** Cada resultado de
+`ask_agent` lleva `question_stored: true` y un objeto `recipient`, que dice a
+quién llegó la dirección y qué se sabe de cada ventana a la que llega:
+
+- `routing`: `exact` para una ventana, `agent` para el nombre a secas, que
+  llega a todas sus ventanas;
+- `windows`: para cada ventana, `online` y su `attention` (ver «Conectada no
+  es atendiendo»).
+
+Cuando se agota el tiempo, la `suggestion` lo usa:
+
+- ninguna ventana conectada: nadie está leyendo la pregunta ahora;
+- una ventana `attending` o `waiting`: aún puede llegar una respuesta, así
+  que reanuda;
+- inactiva con un mecanismo para despertarla: puede despertarse, y la
+  sugerencia avisa si el último intento falló;
+- inactiva y sin forma de despertarla: la pregunta probablemente esperará a
+  su humano, así que haz otro trabajo en vez de esperar en bucle.
+
+Reanudar con `resume_message_id` conserva el mismo id de pregunta y nunca
+envía otro mensaje. Ninguno de estos estados promete una respuesta, y el
+resultado nunca lleva cuerpos de mensajes de nadie más allá de la propia
+respuesta.
+
 Cada sesión tiene su propio inbox y su propio cursor de lectura, así que ponerse
 al día en una ventana no marca como leídos los mensajes de otra, y
 `wait_for_updates` en una no se despierta por una pregunta dirigida a otra. Nada
