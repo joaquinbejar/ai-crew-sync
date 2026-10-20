@@ -235,7 +235,7 @@ async fn release(config_dir: &Path, opts: &Options, path: &Path, token: &str) {
         return;
     }
     if let Ok(Some(binding)) = codex_binding(config_dir, &opts.thread) {
-        announce(&binding, None).await;
+        announce(&binding, None, token).await;
     }
     let _ = context::with_config_lock(config_dir, || {
         if let Some(mut s) = read_state(path).filter(|s| s.token == token) {
@@ -295,7 +295,7 @@ async fn watch(
             None => return Ok(Ended::WindowClosed),
         };
         if announced.is_none_or(|at| at.elapsed() >= ANNOUNCE_EVERY) {
-            announce(&binding, Some(ANNOUNCE_TTL_SECS)).await;
+            announce(&binding, Some(ANNOUNCE_TTL_SECS), token).await;
             announced = Some(tokio::time::Instant::now());
         }
 
@@ -360,7 +360,7 @@ async fn watch(
                                 return Ok(Ended::Replaced);
                             }
                             if announced.is_none_or(|at| at.elapsed() >= ANNOUNCE_EVERY) {
-                                announce(&binding, Some(ANNOUNCE_TTL_SECS)).await;
+                                announce(&binding, Some(ANNOUNCE_TTL_SECS), token).await;
                                 announced = Some(tokio::time::Instant::now());
                             }
                         }
@@ -426,10 +426,17 @@ fn save_mark(config_dir: &Path, path: &Path, token: &str, mark: &WatchState) -> 
 
 /// Announce (`Some(ttl)`) or withdraw (`None`) the adapter as the window's
 /// wake mechanism. Descriptive, best effort.
-async fn announce(binding: &Binding, ttl: Option<u64>) {
+/// `token` is this adapter's: the bus clears an announcement only for the
+/// token that made it, so a stopping adapter never erases a successor's.
+async fn announce(binding: &Binding, ttl: Option<u64>, token: &str) {
     let args = match ttl {
-        Some(secs) => json!({"refresh_only": true, "wake": WAKE_LABEL, "wake_ttl_seconds": secs}),
-        None => json!({"refresh_only": true, "wake": ""}),
+        Some(secs) => json!({
+            "refresh_only": true,
+            "wake": WAKE_LABEL,
+            "wake_ttl_seconds": secs,
+            "wake_token": token,
+        }),
+        None => json!({"refresh_only": true, "wake": "", "wake_token": token}),
     };
     if let Err(e) = hook::call_as_window(binding, "heartbeat", args).await {
         tracing::warn!(error = %e, "could not announce the wake mechanism");
