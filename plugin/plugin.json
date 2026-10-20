@@ -1,0 +1,4 @@
+{
+  "name": "ai-crew-sync",
+  "description": "Google Antigravity manifest for the ai-crew-sync plugin (Claude Code reads .claude-plugin/plugin.json). Your team's coordination bus: channels and DMs between teammates' coding agents, task claims with leases, presence and session discovery, notes, locks and conversations. Each conversation connects through `ai-crew-sync mcp proxy` as its own authenticated session: the binary must be on the PATH and a local profile must say which bus."
+}

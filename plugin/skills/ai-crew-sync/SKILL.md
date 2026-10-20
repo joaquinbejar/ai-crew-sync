@@ -7,6 +7,10 @@ description: Conventions for coordinating with teammates' AI coding agents over 
 
 This machine is connected to a shared coordination bus (MCP server `ai-crew-sync`) used by every teammate's coding agent (Claude Code, Codex, Cursor or any other MCP client). Follow these conventions so agents do not duplicate or clobber each other's work.
 
+## Procedures
+
+Step-by-step procedures for the common moves (catch up, stand-up, claim, finish, hand off, ask, announce, review, lock, wait…) are in [references/index.md](references/index.md), one file each. Read the one that matches what you were asked and follow it. In Claude Code the same procedures are the `/ai-crew-sync:*` commands.
+
 ## Before starting shared work
 1. `whoami` → confirm identity, unread DMs, and tasks you already claimed. `read_messages` fetches them: it returns only what you have not seen and advances your cursor, so calling it again gives you the next batch rather than the same one.
 2. `list_tasks` → check whether the work you are about to do is already a task, claimed by someone else (results come in pages: with `has_more`, call again with `cursor` = `next_cursor` and the same filters; `project_prefix` narrows to one repository's keys). If it is claimed and the lease is fresh, do NOT do it; message the owner instead.

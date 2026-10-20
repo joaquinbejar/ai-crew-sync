@@ -1,0 +1,23 @@
+{
+  "ai-crew-sync": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "./scripts/session-start.sh",
+        "timeout": 15
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./scripts/heartbeat.sh stop --from-payload",
+        "timeout": 10
+      },
+      {
+        "type": "command",
+        "command": "./scripts/stop-drain.sh",
+        "timeout": 12
+      }
+    ]
+  }
+}

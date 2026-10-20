@@ -1,0 +1,22 @@
+<!-- Generated from recipes/board.md by `make recipes`; edit the recipe. -->
+# board: Show the shared task board and the resource locks at a glance
+
+Arguments, when the user gives any: [open | claimed | blocked | done]
+
+Show me the state of the crew bus task queue.
+
+Input: the user's request, in their words
+
+Steps:
+1. Call `list_tasks` with `limit` 200 and `status` = the input when it is `open`, `claimed` or `done`; for `blocked`, or no input, use `any` (`blocked` is not a status the bus filters on; it is a flag on each row, so filter `blocked: true` here).
+2. Call `list_locks`.
+
+Then print a compact board:
+- **Claimed**: key, title, holder (`agent/session`), lease left. Flag anything with less than five minutes left.
+- **Lapsed**: tasks whose `lease_expired` is true, with `lapsed_holder`: they are open, anyone may take them.
+- **Blocked**: tasks with `blocked` true and what they depend on.
+- **Open**: key and title, oldest first.
+- **Done recently**: key, who, result (one line), at most ten.
+- **Locks**: name, holder, purpose, time left.
+
+Keep it to one screen; counts first, then rows. Do not claim, release or change anything from this command.
