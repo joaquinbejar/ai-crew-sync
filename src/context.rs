@@ -523,8 +523,8 @@ pub struct Binding {
     pub expires_at: Option<String>,
     pub closed_at: Option<String>,
     /// Where the proxy got the conversation id this record is keyed by:
-    /// `explicit`, `claude-code`, `request-meta` (Codex's `_meta.threadId`
-    /// on the host's own tool calls) or `instance`. Absent in records older
+    /// `explicit`, `claude-code`, `antigravity`, `request-meta` (Codex's
+    /// `_meta.threadId` on the host's own tool calls) or `instance`. Absent in records older
     /// than 0.7.7. The Codex wake adapter only accepts `request-meta`: the
     /// thread id must come from Codex, never from a guess.
     #[serde(default)]

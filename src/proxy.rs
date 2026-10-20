@@ -240,6 +240,10 @@ struct State {
     session: String,
     binding: Binding,
     host_id: Option<String>,
+    /// True when `host_id` came from a request's `_meta` rather than from
+    /// the environment or a flag: only then is a second id of the same kind
+    /// proof that the host multiplexes conversations over this process.
+    bound_by_request: bool,
     project: Option<String>,
     role: Option<String>,
     channel: Option<String>,
@@ -1266,6 +1270,7 @@ impl Proxy {
                 session,
                 binding,
                 host_id,
+                bound_by_request: false,
                 project: opts.project.clone(),
                 role: opts.role.clone(),
                 channel: opts.channel.clone(),
@@ -1669,23 +1674,13 @@ impl Proxy {
                 None => return Ok(()),
             },
         };
-        let (bound, current) = {
+        let (bound, current, by_request) = {
             let st = self.state.read().await;
-            (st.host_id.clone(), st.binding)
+            (st.host_id.clone(), st.binding, st.bound_by_request)
         };
-        // CLAUDE_CODE_SESSION_ID is inherited by anything started from a
-        // Claude Code terminal, Antigravity included. When Antigravity names
-        // its own conversation on the request, that is who is calling: the
-        // inherited Claude id must not merge this window into the Claude
-        // conversation it was launched from.
-        if bound.is_some() && current == Binding::ClaudeCode && source == Binding::Antigravity {
-            return self.rebind(thread.to_owned(), source).await.map_err(|e| {
-                ErrorData::internal_error(format!("could not bind the conversation: {e:#}"), None)
-            });
-        }
         match bound {
             Some(id) if id == thread => Ok(()),
-            Some(_) if current == source => Err(ErrorData::invalid_request(
+            Some(_) if by_request && current == source => Err(ErrorData::invalid_request(
                 "this proxy instance is bound to another conversation; a second one is using \
                  the same MCP process, which is not supported. Configure the host to start \
                  one `ai-crew-sync mcp proxy` per conversation",
@@ -1710,12 +1705,18 @@ impl Proxy {
         // and writing as another.
         let previous = {
             let st = self.state.read().await;
-            (st.host_id.clone(), st.binding, st.session.clone())
+            (
+                st.host_id.clone(),
+                st.binding,
+                st.session.clone(),
+                st.bound_by_request,
+            )
         };
         {
             let mut st = self.state.write().await;
             st.host_id = Some(host_id.clone());
             st.binding = source;
+            st.bound_by_request = true;
             st.session = session_for(&host_id);
         }
         // The profile this window speaks as, connected or not: a window off
@@ -1735,7 +1736,7 @@ impl Proxy {
             Ok(_) => Ok(()),
             Err(e) => {
                 let mut st = self.state.write().await;
-                (st.host_id, st.binding, st.session) = previous;
+                (st.host_id, st.binding, st.session, st.bound_by_request) = previous;
                 st.disconnected_reason = Some(format!("{e:#}"));
                 Err(e)
             }

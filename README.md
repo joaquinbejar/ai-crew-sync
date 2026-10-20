@@ -842,9 +842,13 @@ proxy per conversation. Verified with the Antigravity CLI (`agy` 1.4.3): it
 exports `ANTIGRAVITY_CONVERSATION_ID` to hooks but not to MCP servers, and
 sends the conversation id in `_meta` on every `tools/call`, so `session_status`
 reports `binding: antigravity` and hooks of the same conversation find its
-binding. Started from a Claude Code terminal, Antigravity's MCP servers inherit
-`CLAUDE_CODE_SESSION_ID`; the conversation id Antigravity sends on the request
-then wins over that inherited one, so the two windows are never merged.
+binding.
+
+One known limitation: a host started from inside a Claude Code session (its
+terminal, or a tool it runs) inherits `CLAUDE_CODE_SESSION_ID`, and so do the
+proxies that host starts. They then bind to the Claude conversation, taking
+over its session. Start other hosts from a plain terminal, or clear the
+variable when launching them (`env -u CLAUDE_CODE_SESSION_ID agy`).
 
 The `initialize` result's `instructions` tell the model who and where this
 window is (agent, team, session address, project, role, channel) plus the

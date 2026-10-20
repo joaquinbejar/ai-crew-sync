@@ -867,11 +867,14 @@ host para que arranque un proxy por conversación. Verificado con la CLI de
 Antigravity (`agy` 1.4.3): exporta `ANTIGRAVITY_CONVERSATION_ID` a los hooks
 pero no a los servidores MCP, y manda el id de conversación en `_meta` en cada
 `tools/call`, así que `session_status` informa `binding: antigravity` y los
-hooks de la misma conversación encuentran su binding. Arrancado desde un
-terminal de Claude Code, los servidores MCP de Antigravity heredan
-`CLAUDE_CODE_SESSION_ID`; el id de conversación que manda Antigravity en la
-petición gana entonces sobre el heredado, así que las dos ventanas nunca se
-mezclan.
+hooks de la misma conversación encuentran su binding.
+
+Una limitación conocida: un host arrancado desde dentro de una sesión de
+Claude Code (su terminal, o una herramienta que ejecuta) hereda
+`CLAUDE_CODE_SESSION_ID`, y también lo heredan los proxies que ese host
+arranca. Se vinculan entonces a la conversación de Claude y se quedan con su
+sesión. Arranca los demás hosts desde un terminal normal, o borra la variable
+al lanzarlos (`env -u CLAUDE_CODE_SESSION_ID agy`).
 
 El campo `instructions` del resultado de `initialize` le dice al modelo quién
 es y dónde está esta ventana (agente, equipo, dirección de sesión, proyecto,

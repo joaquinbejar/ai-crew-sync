@@ -18508,8 +18508,10 @@ async fn a_timed_out_question_explains_the_recipients_state() {
 
 // ------------------------------------------------- antigravity (#228) --
 
-/// Google Antigravity exports `ANTIGRAVITY_CONVERSATION_ID` to its child
-/// processes (#228): the proxy binds the conversation to a stable session,
+/// Google Antigravity names its conversation in each tools/call's `_meta`
+/// (what agy 1.4.3 does) or, on a surface that exports it to MCP servers,
+/// in `ANTIGRAVITY_CONVERSATION_ID` (#228): the proxy binds it to a stable
+/// session,
 /// a restart of the same conversation resumes that authenticated session,
 /// and the documented precedence holds (`BUS_HOST_SESSION` >
 /// `CLAUDE_CODE_SESSION_ID` > `ANTIGRAVITY_CONVERSATION_ID` > `_meta`).
@@ -18609,18 +18611,24 @@ async fn proxy_binds_an_antigravity_conversation() {
         "claude-code"
     );
     let _ = both.cancel().await;
-    // Launched from a Claude Code terminal, Antigravity's MCP server inherits
-    // CLAUDE_CODE_SESSION_ID; the conversation id Antigravity sends wins.
-    let inherited = spawn_proxy(&dir, &repo, &[], &[("CLAUDE_CODE_SESSION_ID", "cc-parent")]).await;
-    let s5 = inherited
-        .call_tool(with("antigravity.google/conversation_id", "ag-child"))
+    // Bound from the environment, the binding wins: a differing
+    // Antigravity id on the wire is ignored, not refused.
+    let env_bound = spawn_proxy(
+        &dir,
+        &repo,
+        &[],
+        &[("ANTIGRAVITY_CONVERSATION_ID", "ag-env")],
+    )
+    .await;
+    let s5 = env_bound
+        .call_tool(with("antigravity.google/conversation_id", "ag-wire"))
         .await
         .unwrap()
         .structured_content
         .unwrap();
     assert_eq!(s5["binding"], "antigravity", "{s5}");
-    assert_eq!(s5["session"], session_for("ag-child"), "{s5}");
-    let _ = inherited.cancel().await;
+    assert_eq!(s5["session"], session_for("ag-env"), "{s5}");
+    let _ = env_bound.cancel().await;
     let explicit = spawn_proxy(
         &dir,
         &repo,
