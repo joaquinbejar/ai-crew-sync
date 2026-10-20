@@ -549,6 +549,27 @@ enum ContextCmd {
         #[arg(long, env = "BUS_WATCH_SECS", default_value_t = 14_000)]
         watch_secs: u64,
     },
+    /// Wake an idle Codex thread when the bus has something new for its
+    /// window, through the local Codex app-server (`turn/start`). Opt-in and
+    /// explicit: one thread per process, named by its id, which must be the
+    /// id Codex itself gave the window's proxy. Acts as that window with its
+    /// own credential; starts a turn only for news, never a second one while
+    /// the thread is busy. Runs until the window closes, or `--max-secs`.
+    CodexWake {
+        /// The Codex thread id (the conversation's `session_id` in Codex
+        /// hooks, `_meta.threadId` on its tool calls).
+        #[arg(long)]
+        thread: String,
+        /// The Codex app-server's Unix socket. Defaults to
+        /// $CODEX_HOME/app-server-control/app-server-control.sock (CODEX_HOME
+        /// defaults to ~/.codex), which `codex app-server daemon version`
+        /// reports as socketPath.
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+        /// Stop after this many seconds.
+        #[arg(long)]
+        max_secs: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -708,7 +729,10 @@ async fn main() -> anyhow::Result<()> {
     // Everything else keeps logging to stdout as before.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "ai_crew_sync=info,tower_http=info,warn".into());
-    if matches!(cli.command, Command::Mcp(_)) {
+    if matches!(
+        cli.command,
+        Command::Mcp(_) | Command::Context(ContextCmd::CodexWake { .. })
+    ) {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
@@ -1371,6 +1395,34 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                     f = context::PROJECT_FILE
                 );
             }
+        }
+        ContextCmd::CodexWake {
+            thread,
+            socket,
+            max_secs,
+        } => {
+            let socket = match socket {
+                Some(s) => s,
+                None => ai_crew_sync::codex::default_socket()?,
+            };
+            let ended = ai_crew_sync::codex_wake::run(
+                &context::config_dir()?,
+                &ai_crew_sync::codex_wake::Options {
+                    thread,
+                    socket,
+                    max_secs,
+                },
+            )
+            .await?;
+            eprintln!(
+                "ai-crew-sync codex-wake: {}",
+                match ended {
+                    ai_crew_sync::codex_wake::Ended::Deadline => "--max-secs reached",
+                    ai_crew_sync::codex_wake::Ended::WindowClosed => "the window closed",
+                    ai_crew_sync::codex_wake::Ended::Replaced => "another adapter took over",
+                    ai_crew_sync::codex_wake::Ended::Stopped => "stopped; the thread is released",
+                }
+            );
         }
         ContextCmd::Hook {
             binding,

@@ -522,7 +522,17 @@ pub struct Binding {
     pub epoch: Option<i64>,
     pub expires_at: Option<String>,
     pub closed_at: Option<String>,
+    /// Where the proxy got the conversation id this record is keyed by:
+    /// `explicit`, `claude-code`, `request-meta` (Codex's `_meta.threadId`
+    /// on the host's own tool calls) or `instance`. Absent in records older
+    /// than 0.7.7. The Codex wake adapter only accepts `request-meta`: the
+    /// thread id must come from Codex, never from a guess.
+    #[serde(default)]
+    pub binding: Option<String>,
 }
+
+/// The binding source that proves a record's key is a Codex thread id.
+pub const CODEX_THREAD_BINDING: &str = "request-meta";
 
 /// Directory holding one record per live conversation. Mode 0700: it is the
 /// only place a session credential is written, and `context hook` is the

@@ -24,3 +24,9 @@ tool_timeout_sec = 1900
 # setting goes on the plugin's server:
 # [plugins."ai-crew-sync@ai-crew-sync".mcp_servers.ai-crew-sync]
 # tool_timeout_sec = 1900
+
+# Waking an idle thread: Codex has no hook that can start a turn, so a message
+# for a thread whose turn ended waits for its human. The opt-in adapter starts
+# one through the local Codex app-server, for one thread, as that thread's own
+# window: `ai-crew-sync context codex-wake --thread <thread-id>`. Nothing here
+# turns it on; see docs/adapters/codex-wake.md.

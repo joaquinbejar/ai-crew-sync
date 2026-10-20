@@ -73,6 +73,11 @@ pub struct HeartbeatArgs {
     /// the same token clears only its own announcement.
     #[serde(default)]
     pub wake_token: Option<String>,
+    /// For a wake mechanism only: what its last attempt to wake this window
+    /// came to, "requested", "confirmed" or "failed". Never a message
+    /// receipt.
+    #[serde(default)]
+    pub wake_result: Option<String>,
     /// Renew the presence lease and labels but leave `status` as it is.
     /// For a process that is merely alive (a proxy keepalive), so it never
     /// overwrites what the window's hooks or model said.
@@ -131,6 +136,7 @@ impl Bus {
             wake_ttl_seconds: args.wake_ttl_seconds,
             attention_observed_ms_ago: args.attention_observed_ms_ago,
             wake_token: args.wake_token,
+            wake_result: args.wake_result,
             refresh_only: args.refresh_only,
         };
         Ok(Json(presence::heartbeat(&self.db, &auth, input).await?))

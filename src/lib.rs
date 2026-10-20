@@ -21,6 +21,8 @@ pub mod admin_api;
 pub mod admin_cli;
 pub mod auth;
 pub mod client;
+pub mod codex;
+pub mod codex_wake;
 pub mod context;
 pub mod dashboard;
 pub mod error;
