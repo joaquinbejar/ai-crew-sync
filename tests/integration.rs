@@ -17653,7 +17653,16 @@ async fn the_proxy_and_hooks_report_the_models_turn() {
     let e = attention_becomes(&marta, &address, "attending").await;
     assert_eq!(e["attention"]["state"], "attending", "{e}");
     assert!(e["attention"]["last_tool_at"].is_string(), "{e}");
-    let status = call(&window, "session_status", json!({})).await;
+    // The proxy records the report once the bus has accepted it, a moment
+    // after the bus shows it: look again briefly rather than race it.
+    let mut status = Value::Null;
+    for _ in 0..20 {
+        status = call(&window, "session_status", json!({})).await;
+        if status["attention"] == "attending" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert_eq!(status["attention"], "attending", "{status}");
 
     // The turn ends: the Stop hook says idle, and the window stays online.
