@@ -16,8 +16,11 @@
 //!
 //! - **Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
 //!   (any host that can set per-window environment), `CLAUDE_CODE_SESSION_ID`
-//!   (Claude Code exports it to MCP server processes), the `_meta.threadId`
-//!   Codex attaches to every `tools/call`, and otherwise the process itself
+//!   (Claude Code exports it to MCP server processes),
+//!   `ANTIGRAVITY_CONVERSATION_ID` (where an Antigravity surface exports it
+//!   to MCP servers), the conversation id a request carries in `_meta`
+//!   (`antigravity.google/conversation_id` from Antigravity, `threadId` from
+//!   Codex), and otherwise the process itself
 //!   — a random id that lives as long as this instance. A known conversation
 //!   id derives a **stable** session label, so a resumed conversation
 //!   reconnects to the same session and a forked one gets a new one.
@@ -111,6 +114,10 @@ const PROXY_MAX_WAIT_SECS: i64 = 1800;
 
 type Remote = RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>;
 
+/// The `_meta` key under which Antigravity names the conversation on every
+/// `tools/call`.
+pub const ANTIGRAVITY_META_KEY: &str = "antigravity.google/conversation_id";
+
 /// Where the conversation id came from, reported by `session_status`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -119,6 +126,11 @@ pub enum Binding {
     Explicit,
     /// `CLAUDE_CODE_SESSION_ID` in the environment.
     ClaudeCode,
+    /// Google Antigravity's conversation id: `_meta["antigravity.google/
+    /// conversation_id"]` on the first forwarded call, or
+    /// `ANTIGRAVITY_CONVERSATION_ID` in the environment where a surface
+    /// exports it to MCP servers.
+    Antigravity,
     /// `_meta.threadId` on the first forwarded call.
     RequestMeta,
     /// No conversation id: this process is the conversation.
@@ -1233,6 +1245,12 @@ impl Proxy {
             .filter(|s| !s.is_empty())
         {
             (Some(id), Binding::ClaudeCode)
+        } else if let Some(id) = std::env::var("ANTIGRAVITY_CONVERSATION_ID")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+        {
+            (Some(id), Binding::Antigravity)
         } else {
             (None, Binding::Instance)
         };
@@ -1633,22 +1651,41 @@ impl Proxy {
     /// the host multiplexes conversations over one process, which this proxy
     /// does not support and says so rather than mixing them.
     async fn observe_meta(&self, meta: &rmcp::model::RequestMetaObject) -> Result<(), ErrorData> {
-        let thread = meta
-            .0
-            .0
-            .get("threadId")
-            .or_else(|| meta.0.0.get("sessionId"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let Some(thread) = thread else { return Ok(()) };
+        let id_at = |key: &str| {
+            meta.0
+                .0
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        // Antigravity names the conversation under its own key on every
+        // tools/call (verified with agy 1.4.3, which does not export it to
+        // MCP servers' environment); Codex sends threadId.
+        let (thread, source) = match id_at(ANTIGRAVITY_META_KEY) {
+            Some(id) => (id, Binding::Antigravity),
+            None => match id_at("threadId").or_else(|| id_at("sessionId")) {
+                Some(id) => (id, Binding::RequestMeta),
+                None => return Ok(()),
+            },
+        };
         let (bound, current) = {
             let st = self.state.read().await;
             (st.host_id.clone(), st.binding)
         };
+        // CLAUDE_CODE_SESSION_ID is inherited by anything started from a
+        // Claude Code terminal, Antigravity included. When Antigravity names
+        // its own conversation on the request, that is who is calling: the
+        // inherited Claude id must not merge this window into the Claude
+        // conversation it was launched from.
+        if bound.is_some() && current == Binding::ClaudeCode && source == Binding::Antigravity {
+            return self.rebind(thread.to_owned(), source).await.map_err(|e| {
+                ErrorData::internal_error(format!("could not bind the conversation: {e:#}"), None)
+            });
+        }
         match bound {
             Some(id) if id == thread => Ok(()),
-            Some(_) if current == Binding::RequestMeta => Err(ErrorData::invalid_request(
+            Some(_) if current == source => Err(ErrorData::invalid_request(
                 "this proxy instance is bound to another conversation; a second one is using \
                  the same MCP process, which is not supported. Configure the host to start \
                  one `ai-crew-sync mcp proxy` per conversation",
@@ -1657,7 +1694,7 @@ impl Proxy {
             // Bound by environment or flag: the request's id is informative
             // only, the operator's binding wins.
             Some(_) => Ok(()),
-            None => self.rebind(thread.to_owned()).await.map_err(|e| {
+            None => self.rebind(thread.to_owned(), source).await.map_err(|e| {
                 ErrorData::internal_error(format!("could not bind the conversation: {e:#}"), None)
             }),
         }
@@ -1666,7 +1703,7 @@ impl Proxy {
     /// Adopt a conversation id discovered on the wire: derive the stable
     /// session and reconnect so every forwarded call, this one included,
     /// carries it.
-    async fn rebind(&self, host_id: String) -> anyhow::Result<()> {
+    async fn rebind(&self, host_id: String, source: Binding) -> anyhow::Result<()> {
         // Staged, not committed: if the new session cannot connect, the
         // previous one must keep serving. Advertising the new identity over
         // the old connection is how a window ends up reporting one session
@@ -1678,7 +1715,7 @@ impl Proxy {
         {
             let mut st = self.state.write().await;
             st.host_id = Some(host_id.clone());
-            st.binding = Binding::RequestMeta;
+            st.binding = source;
             st.session = session_for(&host_id);
         }
         // The profile this window speaks as, connected or not: a window off

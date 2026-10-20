@@ -18505,3 +18505,142 @@ async fn a_timed_out_question_explains_the_recipients_state() {
     }
     h.shutdown().await;
 }
+
+// ------------------------------------------------- antigravity (#228) --
+
+/// Google Antigravity exports `ANTIGRAVITY_CONVERSATION_ID` to its child
+/// processes (#228): the proxy binds the conversation to a stable session,
+/// a restart of the same conversation resumes that authenticated session,
+/// and the documented precedence holds (`BUS_HOST_SESSION` >
+/// `CLAUDE_CODE_SESSION_ID` > `ANTIGRAVITY_CONVERSATION_ID` > `_meta`).
+#[tokio::test]
+async fn proxy_binds_an_antigravity_conversation() {
+    use ai_crew_sync::proxy::session_for;
+
+    let h = require_db!("t_proxy_antigravity");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let ag = [("ANTIGRAVITY_CONVERSATION_ID", "ag-conv-1")];
+
+    let first = spawn_proxy(&dir, &repo, &[], &ag).await;
+    let s1 = call(&first, "session_status", json!({})).await;
+    assert_eq!(s1["binding"], "antigravity", "{s1}");
+    assert_eq!(s1["session"], session_for("ag-conv-1"), "{s1}");
+    assert!(s1["error"].is_null(), "{s1}");
+    let who1 = call(&first, "whoami", json!({})).await;
+    let session_id = who1["session_identity"]["session_id"].clone();
+    // The private binding is keyed by the conversation id, so hooks of the
+    // same conversation find it.
+    let record = ai_crew_sync::context::read_binding(&dir, "ag-conv-1").expect("binding written");
+    assert_eq!(record.binding.as_deref(), Some("antigravity"));
+    let _ = first.cancel().await;
+
+    // Restarted with the same conversation: the same authenticated session,
+    // resumed rather than refused as a live label or minted anew.
+    let again = spawn_proxy(&dir, &repo, &[], &ag).await;
+    let s2 = call(&again, "session_status", json!({})).await;
+    assert_eq!(s2["session"], s1["session"], "{s2}");
+    assert!(s2["error"].is_null(), "the restart was refused: {s2}");
+    let who2 = call(&again, "whoami", json!({})).await;
+    assert_eq!(who2["session_identity"]["session_id"], session_id, "{who2}");
+    // A request's _meta id is informative only once the environment bound
+    // the conversation.
+    let mut params = CallToolRequestParams::new("session_status");
+    let mut m = rmcp::model::JsonObject::new();
+    m.insert("threadId".into(), json!("some-other-thread"));
+    params.meta = Some(rmcp::model::RequestMetaObject::from(m));
+    let s3 = again
+        .call_tool(params)
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(s3["binding"], "antigravity", "{s3}");
+    let _ = again.cancel().await;
+
+    // What agy 1.4.3 actually does: no environment variable for MCP
+    // servers, the conversation id in each tools/call's _meta.
+    let meta = spawn_proxy(&dir, &repo, &[], &[]).await;
+    let with = |key: &str, id: &str| {
+        let mut params = CallToolRequestParams::new("session_status");
+        let mut m = rmcp::model::JsonObject::new();
+        m.insert(key.into(), json!(id));
+        params.meta = Some(rmcp::model::RequestMetaObject::from(m));
+        params
+    };
+    let s4 = meta
+        .call_tool(with("antigravity.google/conversation_id", "ag-meta-1"))
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(s4["binding"], "antigravity", "{s4}");
+    assert_eq!(s4["session"], session_for("ag-meta-1"), "{s4}");
+    assert!(
+        ai_crew_sync::context::read_binding(&dir, "ag-meta-1")
+            .is_some_and(|b| b.binding.as_deref() == Some("antigravity")),
+        "the binding is keyed by the conversation id hooks receive"
+    );
+    // A second Antigravity conversation on the same process is refused.
+    let err = meta
+        .call_tool(with("antigravity.google/conversation_id", "ag-meta-2"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("another conversation"), "{err}");
+    let _ = meta.cancel().await;
+
+    // Precedence.
+    let both = spawn_proxy(
+        &dir,
+        &repo,
+        &[],
+        &[
+            ("CLAUDE_CODE_SESSION_ID", "cc-conv"),
+            ("ANTIGRAVITY_CONVERSATION_ID", "ag-conv-2"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        call(&both, "session_status", json!({})).await["binding"],
+        "claude-code"
+    );
+    let _ = both.cancel().await;
+    // Launched from a Claude Code terminal, Antigravity's MCP server inherits
+    // CLAUDE_CODE_SESSION_ID; the conversation id Antigravity sends wins.
+    let inherited = spawn_proxy(&dir, &repo, &[], &[("CLAUDE_CODE_SESSION_ID", "cc-parent")]).await;
+    let s5 = inherited
+        .call_tool(with("antigravity.google/conversation_id", "ag-child"))
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(s5["binding"], "antigravity", "{s5}");
+    assert_eq!(s5["session"], session_for("ag-child"), "{s5}");
+    let _ = inherited.cancel().await;
+    let explicit = spawn_proxy(
+        &dir,
+        &repo,
+        &["--host-session", "explicit-conv"],
+        &[("ANTIGRAVITY_CONVERSATION_ID", "ag-conv-3")],
+    )
+    .await;
+    assert_eq!(
+        call(&explicit, "session_status", json!({})).await["binding"],
+        "explicit"
+    );
+    // A blank variable binds nothing.
+    let blank = spawn_proxy(&dir, &repo, &[], &[("ANTIGRAVITY_CONVERSATION_ID", "  ")]).await;
+    assert_eq!(
+        call(&blank, "session_status", json!({})).await["binding"],
+        "instance"
+    );
+    for c in [explicit, blank] {
+        let _ = c.cancel().await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}

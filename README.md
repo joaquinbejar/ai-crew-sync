@@ -826,16 +826,25 @@ the credential it saved.
 
 **Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
 (any host that can set a per-window variable), `CLAUDE_CODE_SESSION_ID`
-(Claude Code sets it on MCP server processes), the `_meta.threadId` Codex
-attaches to every call, otherwise the process itself. With a conversation id
-the session label is **stable**, so a resumed conversation reconnects to the
-same session and a fork gets a new one; without one, the session lives as
-long as the process. When the conversation was identified from the request's
-`_meta` (`threadId`, or `sessionId`), a second conversation id on the same
-process is refused rather than mixed in. When it was fixed by
-`--host-session` / `BUS_HOST_SESSION` or `CLAUDE_CODE_SESSION_ID`, that
-binding wins and ids on the wire are ignored — so configure the host to start
-one proxy per conversation.
+(Claude Code sets it on MCP server processes), `ANTIGRAVITY_CONVERSATION_ID`
+(where an Antigravity surface exports it to MCP servers), the conversation
+id a request carries in `_meta` (Antigravity's
+`antigravity.google/conversation_id`, Codex's `threadId`), otherwise the
+process itself. With a conversation id the session label is **stable**, so
+a resumed conversation reconnects to the same session and a fork gets a new
+one; without one, the session lives as long as the process. When the
+conversation was identified from the request's `_meta`, a second
+conversation id of the same kind on the same process is refused rather than
+mixed in. When it was fixed by `--host-session` / `BUS_HOST_SESSION`,
+`CLAUDE_CODE_SESSION_ID` or `ANTIGRAVITY_CONVERSATION_ID`, that binding wins
+and other ids on the wire are ignored, so configure the host to start one
+proxy per conversation. Verified with the Antigravity CLI (`agy` 1.4.3): it
+exports `ANTIGRAVITY_CONVERSATION_ID` to hooks but not to MCP servers, and
+sends the conversation id in `_meta` on every `tools/call`, so `session_status`
+reports `binding: antigravity` and hooks of the same conversation find its
+binding. Started from a Claude Code terminal, Antigravity's MCP servers inherit
+`CLAUDE_CODE_SESSION_ID`; the conversation id Antigravity sends on the request
+then wins over that inherited one, so the two windows are never merged.
 
 The `initialize` result's `instructions` tell the model who and where this
 window is (agent, team, session address, project, role, channel) plus the
