@@ -162,7 +162,8 @@ fn codex_binding(config_dir: &Path, thread: &str) -> anyhow::Result<Option<Bindi
 }
 
 /// Run the adapter for one thread until `max_secs`, or until the window
-/// closes.
+/// closes. Whatever ends the run, an error included, the thread is released
+/// and the wake announcement withdrawn on the way out.
 pub async fn run(config_dir: &Path, opts: &Options) -> anyhow::Result<Ended> {
     if codex_binding(config_dir, &opts.thread)?.is_none() {
         bail!(
@@ -171,10 +172,30 @@ pub async fn run(config_dir: &Path, opts: &Options) -> anyhow::Result<Ended> {
             opts.thread
         );
     }
+    // The thread must exist where we are going to wake it. Checked before
+    // taking ownership, so a failed start leaves nothing to wait out.
+    {
+        let mut app = AppServer::connect(&opts.socket, "ai-crew-sync-wake").await?;
+        let thread = app
+            .request("thread/read", json!({"threadId": opts.thread}))
+            .await
+            .with_context(|| {
+                format!(
+                    "the Codex app-server at {} does not know thread '{}'",
+                    opts.socket.display(),
+                    opts.thread
+                )
+            })?;
+        tracing::info!(
+            thread = %opts.thread,
+            status = thread_status(&thread["thread"]).unwrap_or("unknown"),
+            "codex wake adapter attached"
+        );
+    }
     let path = state_path(config_dir, &opts.thread);
     let token = uuid::Uuid::new_v4().to_string();
     // Take the thread, unless a live adapter already has it.
-    let mut mark = context::with_config_lock(config_dir, || {
+    let mark = context::with_config_lock(config_dir, || {
         let prior = read_state(&path);
         if let Some(p) = &prior
             && now_secs() - p.alive_at < OWNER_STALE_SECS
@@ -198,51 +219,80 @@ pub async fn run(config_dir: &Path, opts: &Options) -> anyhow::Result<Ended> {
         Ok(mark)
     })?;
 
-    // The thread must exist where we are going to wake it.
-    {
-        let mut app = AppServer::connect(&opts.socket, "ai-crew-sync-wake").await?;
-        let thread = app
-            .request("thread/read", json!({"threadId": opts.thread}))
-            .await
-            .with_context(|| {
-                format!(
-                    "the Codex app-server at {} does not know thread '{}'",
-                    opts.socket.display(),
-                    opts.thread
-                )
-            })?;
-        tracing::info!(
-            thread = %opts.thread,
-            status = thread_status(&thread["thread"]).unwrap_or("unknown"),
-            "codex wake adapter attached"
-        );
-    }
+    let outcome = watch(config_dir, opts, &path, &token, mark).await;
+    release(config_dir, opts, &path, &token).await;
+    outcome
+}
 
+/// Give the thread up: withdraw the announcement and mark the record free,
+/// keeping the mark for the next adapter. Only while still the owner.
+async fn release(config_dir: &Path, opts: &Options, path: &Path, token: &str) {
+    let owner = context::with_config_lock(config_dir, || {
+        Ok(read_state(path).is_some_and(|s| s.token == token))
+    })
+    .unwrap_or(false);
+    if !owner {
+        return;
+    }
+    if let Ok(Some(binding)) = codex_binding(config_dir, &opts.thread) {
+        announce(&binding, None).await;
+    }
+    let _ = context::with_config_lock(config_dir, || {
+        if let Some(mut s) = read_state(path).filter(|s| s.token == token) {
+            s.alive_at = 0;
+            write_state(path, &s)?;
+        }
+        Ok(())
+    });
+}
+
+/// Refresh the ownership record. False when another adapter has it now.
+fn refresh_owner(config_dir: &Path, path: &Path, token: &str) -> anyhow::Result<bool> {
+    context::with_config_lock(config_dir, || match read_state(path) {
+        Some(mut s) if s.token == token => {
+            s.alive_at = now_secs();
+            write_state(path, &s)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    })
+}
+
+/// Resolves at `deadline`, or never without one.
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// How often the owner record and the announcement are kept alive while a
+/// delivery is in progress (it may wait on a busy thread for a long time).
+const KEEPALIVE_DURING_DELIVERY: Duration = Duration::from_secs(30);
+
+async fn watch(
+    config_dir: &Path,
+    opts: &Options,
+    path: &Path,
+    token: &str,
+    mut mark: WatchState,
+) -> anyhow::Result<Ended> {
     let deadline = opts
         .max_secs
         .map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
     let mut announced: Option<tokio::time::Instant> = None;
     let stop = stop_signal();
     tokio::pin!(stop);
-    let ended = loop {
+    loop {
         if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
-            break Ended::Deadline;
+            return Ok(Ended::Deadline);
         }
-        // Still ours, and still alive: refresh the record.
-        let owned = context::with_config_lock(config_dir, || match read_state(&path) {
-            Some(mut s) if s.token == token => {
-                s.alive_at = now_secs();
-                write_state(&path, &s)?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        })?;
-        if !owned {
-            break Ended::Replaced;
+        if !refresh_owner(config_dir, path, token)? {
+            return Ok(Ended::Replaced);
         }
         let binding = match codex_binding(config_dir, &opts.thread)? {
             Some(b) => b,
-            None => break Ended::WindowClosed,
+            None => return Ok(Ended::WindowClosed),
         };
         if announced.is_none_or(|at| at.elapsed() >= ANNOUNCE_EVERY) {
             announce(&binding, Some(ANNOUNCE_TTL_SECS)).await;
@@ -254,7 +304,7 @@ pub async fn run(config_dir: &Path, opts: &Options) -> anyhow::Result<Ended> {
             Err(e) => {
                 tracing::warn!(error = %e, "could not read the window's inbox; retrying");
                 tokio::select! {
-                    _ = &mut stop => break Ended::Stopped,
+                    _ = &mut stop => return Ok(Ended::Stopped),
                     _ = tokio::time::sleep(RETRY_PAUSE) => {}
                 }
                 continue;
@@ -262,40 +312,73 @@ pub async fn run(config_dir: &Path, opts: &Options) -> anyhow::Result<Ended> {
         };
         if !mark.primed {
             // What was waiting before the adapter started is not news: the
-            // thread's own next turn reports it.
-            mark = primed(&token, reading);
-            save_mark(config_dir, &path, &token, &mark)?;
+            // thread's own next turn reports it. An inbox count that could
+            // not be read is read once more, so a passing failure is not
+            // taken for an empty inbox (and its backlog for news later).
+            let reading = match reading.inbox {
+                Some(_) => reading,
+                None => {
+                    tokio::time::sleep(SETTLE).await;
+                    hook::pending_for_window(&binding).await.unwrap_or(reading)
+                }
+            };
+            mark = primed(token, reading);
+            save_mark(config_dir, path, token, &mark)?;
         } else {
             let (wake, next) = hook::watch_step(&mark, reading);
             mark = next;
             if wake {
                 // Let a burst land, then wake once for all of it.
-                tokio::time::sleep(SETTLE).await;
+                tokio::select! {
+                    _ = &mut stop => return Ok(Ended::Stopped),
+                    _ = tokio::time::sleep(SETTLE) => {}
+                }
                 if let Ok(later) = hook::pending_for_window(&binding).await {
                     mark = hook::watch_step(&mark, later).1;
                 }
                 // Marked before the turn is requested: a crash between the
                 // two costs one missed wake, never a duplicate.
-                save_mark(config_dir, &path, &token, &mark)?;
-                let notice = hook::wake_text(mark.direct, mark.inbox);
-                let result = deliver(&opts.socket, &opts.thread, &notice, &mark).await;
-                report(&binding, result).await;
+                save_mark(config_dir, path, token, &mark)?;
+                if mark.direct == 0 && mark.inbox == 0 {
+                    // Read in the meantime: nothing left to wake it for.
+                    continue;
+                }
+                // The delivery can wait a long time on a busy thread: keep
+                // the record and the announcement alive, and honour a stop
+                // or the deadline meanwhile.
+                let delivery = deliver(&opts.socket, &opts.thread, &binding, &mark);
+                tokio::pin!(delivery);
+                let mut tick = tokio::time::interval(KEEPALIVE_DURING_DELIVERY);
+                tick.tick().await;
+                let result = loop {
+                    tokio::select! {
+                        r = &mut delivery => break r,
+                        _ = &mut stop => return Ok(Ended::Stopped),
+                        _ = until(deadline) => return Ok(Ended::Deadline),
+                        _ = tick.tick() => {
+                            if !refresh_owner(config_dir, path, token)? {
+                                return Ok(Ended::Replaced);
+                            }
+                            if announced.is_none_or(|at| at.elapsed() >= ANNOUNCE_EVERY) {
+                                announce(&binding, Some(ANNOUNCE_TTL_SECS)).await;
+                                announced = Some(tokio::time::Instant::now());
+                            }
+                        }
+                    }
+                };
+                if let Some(result) = result {
+                    report(&binding, result).await;
+                }
                 continue;
             }
-            save_mark(config_dir, &path, &token, &mark)?;
+            save_mark(config_dir, path, token, &mark)?;
         }
 
         // Wait on the bus for the next message addressed to this window.
         let started = tokio::time::Instant::now();
-        let until_deadline = async {
-            match deadline {
-                Some(d) => tokio::time::sleep_until(d).await,
-                None => std::future::pending().await,
-            }
-        };
         let waited = tokio::select! {
-            _ = &mut stop => break Ended::Stopped,
-            _ = until_deadline => break Ended::Deadline,
+            _ = &mut stop => return Ok(Ended::Stopped),
+            _ = until(deadline) => return Ok(Ended::Deadline),
             w = hook::call_as_window(
                 &binding,
                 "wait_for_updates",
@@ -309,30 +392,11 @@ pub async fn run(config_dir: &Path, opts: &Options) -> anyhow::Result<Ended> {
                 FAST_RETURN_PAUSE
             };
             tokio::select! {
-                _ = &mut stop => break Ended::Stopped,
+                _ = &mut stop => return Ok(Ended::Stopped),
                 _ = tokio::time::sleep(pause) => {}
             }
         }
-    };
-
-    // Withdraw the announcement while still the owner, then release.
-    let still_owner = context::with_config_lock(config_dir, || {
-        Ok(read_state(&path).is_some_and(|s| s.token == token))
-    })?;
-    if still_owner {
-        if let Ok(Some(binding)) = codex_binding(config_dir, &opts.thread) {
-            announce(&binding, None).await;
-        }
-        // Keep the mark for the next adapter; give up ownership.
-        context::with_config_lock(config_dir, || {
-            if let Some(mut s) = read_state(&path).filter(|s| s.token == token) {
-                s.alive_at = 0;
-                write_state(&path, &s)?;
-            }
-            Ok(())
-        })?;
     }
-    Ok(ended)
 }
 
 fn write_state(path: &Path, state: &AdapterState) -> anyhow::Result<()> {
@@ -404,12 +468,22 @@ async fn report(binding: &Binding, result: Delivery) {
     }
 }
 
-/// Start one turn on the thread, with bounded retries.
-async fn deliver(socket: &Path, thread: &str, notice: &str, mark: &WatchState) -> Delivery {
+/// Start one turn on the thread, with bounded retries, then confirm it.
+/// `None` when, after waiting for a busy thread, nothing is left unread: the
+/// thread's own turn took care of it. Retries cover only the steps before
+/// Codex accepted a turn; once it has, no second turn is ever requested for
+/// the same news.
+async fn deliver(
+    socket: &Path,
+    thread: &str,
+    binding: &Binding,
+    mark: &WatchState,
+) -> Option<Delivery> {
     let mut last = String::new();
     for (attempt, pause) in DELIVERY_BACKOFF.iter().enumerate() {
-        match deliver_once(socket, thread, notice, mark).await {
-            Ok(d) => return d,
+        match start_turn(socket, thread, binding, mark).await {
+            Ok(Some((mut app, turn))) => return Some(confirm(&mut app, thread, &turn).await),
+            Ok(None) => return None,
             Err(e) => {
                 last = format!("{e:#}");
                 tracing::warn!(attempt = attempt + 1, error = %last, "codex wake attempt failed");
@@ -417,15 +491,17 @@ async fn deliver(socket: &Path, thread: &str, notice: &str, mark: &WatchState) -
             }
         }
     }
-    Delivery::Failed(last)
+    Some(Delivery::Failed(last))
 }
 
-async fn deliver_once(
+/// Get the thread to idle and start the turn. The connection and the turn
+/// id on success.
+async fn start_turn(
     socket: &Path,
     thread: &str,
-    notice: &str,
+    binding: &Binding,
     mark: &WatchState,
-) -> anyhow::Result<Delivery> {
+) -> anyhow::Result<Option<(AppServer, String)>> {
     let mut app = AppServer::connect(socket, "ai-crew-sync-wake").await?;
     let read = app
         .request("thread/read", json!({"threadId": thread}))
@@ -444,17 +520,24 @@ async fn deliver_once(
     if status == "systemError" {
         bail!("the Codex thread is in an error state");
     }
+    let (mut direct, mut inbox) = (mark.direct, mark.inbox);
     if status == "active" {
         // Never a second turn: wait until the human's (or anyone's) turn is
-        // over.
+        // over, then look again: that turn may have read the news itself.
         wait_until_idle(&mut app, thread).await?;
+        let now = hook::pending_for_window(binding).await?;
+        direct = now.direct;
+        inbox = now.inbox.unwrap_or(inbox);
+        if direct == 0 && inbox == 0 {
+            return Ok(None);
+        }
     }
     let started = app
         .request(
             "turn/start",
             json!({
                 "threadId": thread,
-                "input": [{"type": "text", "text": notice}],
+                "input": [{"type": "text", "text": hook::wake_text(direct, inbox)}],
                 // Names the news this turn is for, so it can be told apart
                 // in the thread's history.
                 "clientUserMessageId": format!(
@@ -466,34 +549,46 @@ async fn deliver_once(
     let Some(turn) = started["turn"]["id"].as_str().map(str::to_owned) else {
         bail!("Codex accepted turn/start without a turn id");
     };
-    // Confirmed once Codex says the turn started. A connection that did
-    // not start or resume the thread is not sent its notifications
-    // (verified against codex-cli 0.163.0), so the turn list is read too.
+    Ok(Some((app, turn)))
+}
+
+/// Confirmed once Codex says the turn started. A connection that did not
+/// start or resume a thread is not sent its notifications (verified against
+/// codex-cli 0.163.0), so the turn list is read too. Never an error: the
+/// turn was accepted, and failing here must not lead to another one.
+async fn confirm(app: &mut AppServer, thread: &str, turn: &str) -> Delivery {
     let until = tokio::time::Instant::now() + CONFIRM_WITHIN;
     loop {
         let left = until.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
-            return Ok(Delivery::Requested);
+            return Delivery::Requested;
         }
-        if let Some(n) = app.next_notification(left.min(POLL_EVERY)).await?
-            && n["method"] == "turn/started"
-            && n["params"]["threadId"] == thread
-            && n["params"]["turn"]["id"] == turn.as_str()
-        {
-            return Ok(Delivery::Confirmed);
+        match app.next_notification(left.min(POLL_EVERY)).await {
+            Ok(Some(n))
+                if n["method"] == "turn/started"
+                    && n["params"]["threadId"] == thread
+                    && n["params"]["turn"]["id"] == turn =>
+            {
+                return Delivery::Confirmed;
+            }
+            Ok(_) => {}
+            Err(_) => return Delivery::Requested,
         }
-        let turns = app
+        let Ok(turns) = app
             .request(
                 "thread/turns/list",
                 json!({"threadId": thread, "limit": 10}),
             )
-            .await?;
+            .await
+        else {
+            return Delivery::Requested;
+        };
         let started = turns["data"].as_array().is_some_and(|ts| {
             ts.iter()
-                .any(|t| t["id"] == turn.as_str() && !t["startedAt"].is_null())
+                .any(|t| t["id"] == turn && !t["startedAt"].is_null())
         });
         if started {
-            return Ok(Delivery::Confirmed);
+            return Delivery::Confirmed;
         }
     }
 }

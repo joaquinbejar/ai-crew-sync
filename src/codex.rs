@@ -33,6 +33,9 @@ use tokio::{
 const MAX_FRAME_BYTES: u64 = 64 * 1024 * 1024;
 /// How long one request may take before the adapter gives up on it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Connecting and upgrading are local and quick; a daemon that accepts and
+/// then stalls must not hang the adapter.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where the Codex app-server daemon listens by default: under
 /// `$CODEX_HOME` (else `~/.codex`), as `codex app-server daemon version`
@@ -52,6 +55,10 @@ pub struct AppServer {
     stream: UnixStream,
     /// Bytes read past the end of the last frame.
     buf: Vec<u8>,
+    /// Fragments of a message whose final frame has not arrived yet. Kept
+    /// here rather than on the stack so a read cancelled by a timeout loses
+    /// nothing: the next read continues the same message.
+    partial: Vec<u8>,
     next_id: i64,
     /// Notifications that arrived while waiting for a response, oldest first.
     pending: VecDeque<Value>,
@@ -71,6 +78,18 @@ impl AppServer {
     /// Connect to the daemon's socket, upgrade to WebSocket, and initialise
     /// as `client_name`.
     pub async fn connect(socket: &Path, client_name: &str) -> anyhow::Result<Self> {
+        tokio::time::timeout(CONNECT_TIMEOUT, Self::open(socket, client_name))
+            .await
+            .with_context(|| {
+                format!(
+                    "the Codex app-server at {} did not answer within {}s",
+                    socket.display(),
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })?
+    }
+
+    async fn open(socket: &Path, client_name: &str) -> anyhow::Result<Self> {
         let stream = UnixStream::connect(socket).await.with_context(|| {
             format!(
                 "could not reach the Codex app-server at {}; is it running? \
@@ -81,6 +100,7 @@ impl AppServer {
         let mut client = Self {
             stream,
             buf: Vec::new(),
+            partial: Vec::new(),
             next_id: 1,
             pending: VecDeque::new(),
         };
@@ -171,7 +191,6 @@ impl AppServer {
     /// continuations) are parsed as JSON; pings are answered; a close ends
     /// the connection with an error.
     async fn read_message(&mut self) -> anyhow::Result<Value> {
-        let mut message: Vec<u8> = Vec::new();
         loop {
             self.fill(2).await?;
             let fin = self.buf[0] & 0x80 != 0;
@@ -211,8 +230,12 @@ impl AppServer {
             self.buf.drain(..total);
             match opcode {
                 0x0 | 0x1 => {
-                    message.extend_from_slice(&payload);
+                    if self.partial.len() as u64 + payload.len() as u64 > MAX_FRAME_BYTES {
+                        bail!("the Codex app-server sent an oversized message; refusing it");
+                    }
+                    self.partial.extend_from_slice(&payload);
                     if fin {
+                        let message = std::mem::take(&mut self.partial);
                         return serde_json::from_slice(&message)
                             .context("the Codex app-server sent a message that is not JSON");
                     }

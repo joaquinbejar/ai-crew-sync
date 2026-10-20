@@ -17899,6 +17899,8 @@ struct FakeCodexState {
     idle_after: Option<std::time::Duration>,
     /// Refuse turn/start.
     fail_turn_start: bool,
+    /// Refuse thread/turns/list, so a started turn cannot be confirmed.
+    fail_turns_list: bool,
     /// The text of every turn started.
     turns: Vec<String>,
     /// turn/start calls that arrived while the thread was active.
@@ -18059,6 +18061,9 @@ impl FakeCodex {
                             json!({"id": id, "result": {"turn": {"id": turn, "status": "inProgress"}}})
                         }
                     }
+                    "thread/turns/list" if st.fail_turns_list => {
+                        json!({"id": id, "error": {"code": -32601, "message": "no such method"}})
+                    }
                     "thread/turns/list" => {
                         let data: Vec<Value> = (1..=st.turns.len())
                             .rev()
@@ -18215,6 +18220,28 @@ async fn the_codex_adapter_wakes_an_idle_thread_for_news_only() {
     }
     assert_eq!(e["attention"]["last_wake"], "confirmed", "{e}");
 
+    // A turn Codex accepted but that cannot be confirmed is recorded as
+    // requested and never requested again: no duplicate turn.
+    assert!(eventually(5, || codex.state.lock().unwrap().status == "idle").await);
+    codex.state.lock().unwrap().fail_turns_list = true;
+    dm("can you confirm?").await;
+    let mut e = Value::Null;
+    for _ in 0..80 {
+        e = session_entry(&marta, &address).await;
+        if e["attention"]["last_wake"] == "requested" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(e["attention"]["last_wake"], "requested", "{e}");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        codex.turns().len(),
+        2,
+        "an unconfirmed turn was requested again"
+    );
+    codex.state.lock().unwrap().fail_turns_list = false;
+
     // A busy thread is waited on, never given a second turn. First let the
     // woken turn end, so its own end does not make the thread idle again.
     assert!(eventually(5, || codex.state.lock().unwrap().status == "idle").await);
@@ -18225,7 +18252,7 @@ async fn the_codex_adapter_wakes_an_idle_thread_for_news_only() {
     }
     dm("and another thing").await;
     assert!(
-        eventually(30, || codex.turns().len() == 2).await,
+        eventually(30, || codex.turns().len() == 3).await,
         "no wake after idle"
     );
     assert_eq!(codex.state.lock().unwrap().started_while_active, 0);
@@ -18249,7 +18276,7 @@ async fn the_codex_adapter_wakes_an_idle_thread_for_news_only() {
     assert_eq!(e["attention"]["wake"], "unknown", "{e}");
     let restarted = codex_wake(&dir, thread, &codex.socket, 120);
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    assert_eq!(codex.turns().len(), 2, "woke twice for the same messages");
+    assert_eq!(codex.turns().len(), 3, "woke twice for the same messages");
 
     // A refused wake is retried, then recorded as failed.
     codex.state.lock().unwrap().fail_turn_start = true;
@@ -18263,7 +18290,7 @@ async fn the_codex_adapter_wakes_an_idle_thread_for_news_only() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     assert_eq!(e["attention"]["last_wake"], "failed", "{e}");
-    assert_eq!(codex.turns().len(), 2);
+    assert_eq!(codex.turns().len(), 3);
 
     drop(restarted);
     let _ = marta.cancel().await;
@@ -18315,6 +18342,10 @@ async fn the_codex_adapter_refuses_what_codex_did_not_bind() {
         .unwrap();
     assert!(!out.status.success());
     assert!(stderr(out).contains("does not know thread"));
+    // A failed start takes nothing: no ownership record to wait out.
+    let record =
+        ai_crew_sync::context::binding_path(&dir, "thread-elsewhere").with_extension("codex-wake");
+    assert!(!record.exists(), "a failed start left an ownership record");
 
     for c in [explicit, meta] {
         let _ = c.cancel().await;

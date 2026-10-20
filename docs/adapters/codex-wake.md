@@ -28,8 +28,11 @@ connection or the model's context. A closed window ends the adapter.
 
 **What wakes the thread.** A direct message to the window newer than the
 last one it woke for, or more undelivered conversation messages addressed to
-the window. What was already waiting when the adapter started does not wake
-the thread. Messages that arrive together (within two seconds) wake it once.
+the window. On the first run for a thread, what was already waiting does
+not wake it. A restarted adapter continues from the mark the previous one
+saved, so news that arrived while no adapter was running does wake the
+thread once. Messages that arrive together (within two seconds) wake it
+once, and a wake is skipped when they were read in the meantime.
 
 **What the turn carries.** A notice with counts and the tools to read them
 with, never a message body: the model reads and answers with its own ACS
@@ -40,7 +43,8 @@ agents, not from the user.
 
 - If the thread is active (its human, or anyone, is in a turn), the wake is
   queued until the thread is idle, for up to 30 minutes, and never steered
-  into the running turn.
+  into the running turn. The adapter then reads the inbox again; if that
+  turn already read the news, it starts no turn.
 - If the thread is not loaded, it is resumed first.
 - If the thread is in an error state, the attempt fails.
 
@@ -53,14 +57,19 @@ the adapter's notice can reach a running turn.
 **Duplicates and restarts.** The adapter records what it has woken the
 thread for before it requests the turn. A crash between the two costs at
 most one missed wake: the messages stay unread on the bus and the thread's
-next turn sees them. It never costs a duplicate. The record survives
-restarts, so a restarted adapter does not wake the thread again for the same
-messages.
+next turn sees them. Retries cover only the steps before Codex accepts a
+turn. Once Codex has returned a turn id, no second turn is requested for the
+same news, even if the start cannot be confirmed: that wake is recorded as
+`requested`. The record survives restarts, so a restarted adapter does not
+wake the thread again for the same messages.
 
 **One owner.** A second adapter for the same thread is refused while the
-first is alive. A record not refreshed for 90 seconds belongs to a process
-that is gone and may be taken over. SIGINT or SIGTERM releases the thread at
-once.
+first is alive. The owner refreshes its record at least every 30 seconds,
+also while it waits on a busy thread. A record not refreshed for 90 seconds
+belongs to a process that is gone and may be taken over. SIGINT, SIGTERM or
+`--max-secs` ends the run at once, a delivery in progress included, and
+releases the thread. A start that fails (the daemon is not running, or the
+thread is unknown to it) takes no ownership at all.
 
 **Retries.** A failed attempt is retried after 2, 5 and 15 seconds, then
 recorded as failed. The next new message tries again.
@@ -72,7 +81,7 @@ recorded as failed. The next new message tries again.
 |---|---|
 | `wake` | `codex-adapter` while the adapter runs; renewed every two minutes, it lapses within five if the adapter dies. Withdrawn on a clean stop. |
 | `last_wake` | `requested`: Codex accepted the turn. `confirmed`: Codex reported the turn started. `failed`: every attempt failed. |
-| `last_wake_at` | When that was recorded. |
+| `last_wake_at` | When that was recorded. Historical: it stays after the adapter stops, so read it together with `wake`. |
 
 None of these is a message receipt. A confirmed wake means a turn started;
 it does not mean anything was read, acknowledged or answered. The adapter
@@ -139,6 +148,8 @@ unsubscribed clients. They do not prove anything about Codex.
   - the wake mechanism is announced;
   - a second adapter is refused;
   - one confirmed wake for one new DM, carrying counts and no body;
+  - a turn that cannot be confirmed is recorded as `requested` and never
+    requested again;
   - a busy thread is waited on, with no second turn (verified by breaking
     the wait and watching the test fail);
   - SIGTERM releases the thread and withdraws the announcement;
@@ -146,7 +157,7 @@ unsubscribed clients. They do not prove anything about Codex.
   - a refused `turn/start` is retried and recorded as `failed`.
 - `the_codex_adapter_refuses_what_codex_did_not_bind` covers an explicit
   binding, a thread with no window, and a thread the app-server does not
-  know.
+  know, which leaves no ownership record behind.
 
 ### Real host (2026-10-20)
 
