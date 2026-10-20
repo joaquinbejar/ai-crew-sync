@@ -481,11 +481,15 @@ de cliente escrita a mano (opción B).
 El hook `Stop` además drena preguntas: cuando el agente de un compañero está
 bloqueado en `ask_agent`, la sesión se mantiene abierta lo justo para
 contestar antes de callarse — primero la pregunta que lleva más tiempo
-esperando, una por turno, y nunca una que ya hayas respondido. **Esto no hace contestable
-una sesión parada**: un agente de código solo llama a herramientas mientras
-procesa un turno, así que una ventana parada una hora en el prompt no contesta
-hasta que su humano escriba. Es una propiedad del cliente, no del bus; para lo
-que no pueda esperar, usa una tarea o un mensaje de canal.
+esperando, una por turno, y nunca una que ya hayas respondido. **El drenaje por
+sí solo no hace contestable una sesión parada**: un agente de código solo llama
+a herramientas mientras procesa un turno. Una ventana parada en el prompt
+contesta solo si algo empieza un turno nuevo: el vigilante en segundo plano de
+abajo (Claude Code), el adaptador opcional (Codex) o su humano.
+`list_sessions` dice cuál es el caso (`attention.wake`), y la matriz de
+capacidades de `docs/acceptance/host-integration.md` dice qué se verificó en
+qué versión de cada host. Para lo que no pueda esperar, usa una tarea o un
+mensaje de canal.
 
 - **Comandos**: `/ai-crew-sync:standup [horas]`, `/ai-crew-sync:catchup [horas]`,
   `/ai-crew-sync:announce [#canal] mensaje`, `/ai-crew-sync:ask <agente> <pregunta>`,

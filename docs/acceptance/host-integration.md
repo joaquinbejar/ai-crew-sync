@@ -32,6 +32,44 @@ was observed, not if the documentation merely claims it.
 | Codex CLI | 0.155.1 | Does **not** implement `roots/list` | Client capabilities in `rmcp_client.rs` advertise only elicitation |
 | Codex CLI | 0.155.1 | Hooks: `SessionStart`, `Stop`, `SessionEnd`, `UserPromptSubmit` and others, with the same payload keys and `additionalContext` contract as Claude Code | `codex-rs/hooks/src/schema.rs` and the hooks documentation |
 | Both | — | No third-party MCP server can push a message into an idle model turn | Codex logs server notifications without routing them to the model; MCP has no such client obligation |
+| Claude Code | 2.1.300 | A Stop or SessionStart hook with `async` + `asyncRewake` that exits 2 wakes an idle window and shows its stderr to the model, also after 11 minutes with `timeout: 14400` | #203, measured on a real window |
+| Codex CLI | 0.163.0 | A managed app-server daemon serves threads on `$CODEX_HOME/app-server-control/app-server-control.sock`: JSON-RPC 2.0 over WebSocket; `thread/read`, `thread/resume`, `turn/start` and `thread/turns/list` as the adapter uses them | `codex app-server generate-json-schema`, and a real throwaway thread (#222) |
+| Codex CLI | 0.163.0 | A connection that did not start or resume a thread receives none of its notifications | Real thread: `turn/started` never reached the adapter's connection (#222) |
+| Codex CLI | 0.163.0 | Runs the installed ai-crew-sync plugin's hooks (SessionStart, Stop) for a thread | `hook/started` notifications on a real thread |
+| ChatGPT desktop app | — | Runs its own app-server over stdio (`ChatGPT.app/.../codex app-server`, no `--listen`); nothing outside the app can reach its threads | Process listing on 2026-10-20 |
+| Antigravity CLI (`agy`) | 1.4.3 | Exports `ANTIGRAVITY_CONVERSATION_ID` to hooks, not to MCP servers; sends the same id as `_meta["antigravity.google/conversation_id"]` on every `tools/call` | A probe plugin dumping environment and requests (#228) |
+| Antigravity CLI (`agy`) | 1.4.3 | Hook payloads are camelCase (`conversationId`, `workspacePaths`, `terminationReason`); SessionStart takes `injectSteps`, Stop takes `decision: continue`; hooks run synchronously from the plugin's directory; there are no background (async) hooks | Its bundled hooks documentation, and real runs (#229) |
+| Antigravity CLI (`agy`) | 1.4.3 | A globally installed plugin starts its MCP server in the plugin's directory, not the workspace | A wrapper logging the server's working directory (#230) |
+
+## Capability matrix
+
+Checked on 2026-10-20, ai-crew-sync at the 0.7.7 branch, against the host
+versions named. "Real" means observed on that host; "automated" means
+covered only by `tests/integration.rs` or `plugin/scripts/test-hooks.sh`,
+where the host is simulated; "untested" means neither, and is not a pass.
+
+| Capability | Claude Code 2.1.304 (plugin) | Codex 0.163.0 (daemon thread) | Antigravity `agy` 1.4.3 (plugin) |
+|---|---|---|---|
+| Connected proxy, one authenticated session per conversation | Real (in daily use) | Real (#222 run) | Real (#228 run) |
+| Startup catch-up | Real (SessionStart `additionalContext`) | Hooks run (observed); content not inspected: untested | Real (`injectSteps`, #229) |
+| Stop drain answers a waiting question | Automated; real untested in this round | Untested (hooks run; whether `block` is honoured was not checked) | Real, once the conversation is bound (#229) |
+| Wait during an active turn (`wait_for_updates` up to 1800 s through the proxy) | Automated; real untested in this round | Automated; Codex needs `tool_timeout_sec` (examples/codex-config.toml); real untested | Untested |
+| Waking an idle window | Real via the background watcher, `attention.wake: claude-watcher` (#203, measured on 2.1.300; not re-run on 2.1.304) | Real via the opt-in adapter, `context codex-wake`, `attention.wake: codex-adapter` (#222); without it: unsupported | Unsupported: no background hooks (`attention.wake: unknown`) |
+| Reconnect / resume keeps the session | Automated | Untested | Real, with a limit: a resumed conversation binds on its first ai-crew-sync tool call (#229) |
+
+What the observations above mean, and what they do not:
+
+- **Stored is not delivered.** A message is stored on the bus whatever the
+  recipient is doing, so a timed-out `ask_agent` is not a failed delivery
+  (#224).
+- **Connected is not attending.** A live proxy proves a process, not a model
+  in a turn (#221).
+- **Wake requested is not presented.** `last_wake: requested` means the host
+  accepted a new turn, and `confirmed` means it reported the turn started.
+  Neither means the message was read or answered.
+- **An active-turn wait is bounded.** It holds a turn open at most
+  `timeout_seconds`, and the host may cut it sooner: Codex at 60 s unless
+  `tool_timeout_sec` is raised.
 
 ## Unsupported topologies
 
@@ -41,13 +79,21 @@ State these to users rather than letting them discover them:
   first conversation id it sees and refuses a second, rather than mixing two
   windows' cursors and claims. If a host ever multiplexes this way, that host
   needs an explicit per-conversation binding.
-- **Background delivery into an idle window.** Nothing wakes a model that is
-  not in a turn. `wait_for_updates` and `wait_for_conversation_updates` block
-  *during* a turn; the `Stop` hook holds a turn open long enough to answer a
-  blocking question. A window parked at the prompt for an hour answers
-  nothing, and no amount of infrastructure changes that. The durable inbox
-  is no exception: it makes a reference survive a restart, not a model wake
-  up. Nothing on this list becomes supported because a broker is involved.
+- **Background delivery into an idle window, without a wake mechanism.** The
+  bus cannot push into a model that is not in a turn. `wait_for_updates` and
+  `wait_for_conversation_updates` block *during* a turn; the `Stop` hook holds
+  a turn open long enough to answer a blocking question. Only two mechanisms
+  start a new turn in an idle window:
+  - Claude Code's background watcher (`asyncRewake`);
+  - the opt-in Codex adapter (`context codex-wake`), for threads hosted by
+    the managed app-server daemon.
+
+  Everywhere else (Antigravity, ChatGPT desktop app threads, Codex without
+  the adapter, any other MCP client) a window parked at the prompt answers
+  nothing until its human types. `list_sessions` says which case a window is
+  in (`attention.wake`). The durable inbox is no exception: it makes a
+  reference survive a restart, not a model wake up, and nothing on this list
+  becomes supported because a broker is involved.
 - **Sharing one agent token between two tools without separate sessions.**
   Two clients that send no session header are the same window to the bus.
   That is what the proxy exists to prevent.
@@ -106,6 +152,58 @@ Neither carries a token. `BUS_TOKEN` must be **unset** for this test.
 | 10 | Restore a working token, then kill a proxy process abruptly and reopen that conversation. | It resumes; its claims and locks are still its own; no sibling window was idled or drained. |
 | 11 | With a team routed to a broker: send a message to three windows; each calls `fetch_conversation_inbox`. Then `get_message_receipts`. | Each window gets exactly its own reference, with no body. `delivered_at` is set for the windows whose proxy confirmed, and null for any that did not — never for all three because one of them answered. |
 | 12 | Kill one window's proxy between the fetch and the confirm (`kill -9` the process), then reopen it and call `fetch_conversation_inbox` again. | Its spool file under the state directory still lists the reference; the reopened window confirms it and `delivered_at` appears then, not before. `conversation_inbox_status` reported `handed_out_unconfirmed: 1` in the meantime — not an empty inbox, and not a receipt. |
+
+### Waking an idle window (run per host)
+
+The scenario #225 asks for: the sender asks after the recipient's turn has
+ended, the recipient stays idle, and each observation is recorded separately.
+Use a second agent as the sender (`client ask`, or another window).
+
+| # | Do this | Record |
+|---|---|---|
+| 13 | Let the recipient finish its turn and leave it idle. From the sender, `list_sessions`. | The recipient's `attention.state` (`idle` where a Stop hook reports it, `attending` turning `unknown` where none does) and `attention.wake`. |
+| 14 | Sender: `ask_agent` to the recipient's exact address with a short question, default timeout. | `question_stored`, the `recipient` object and the suggestion. On a timeout: was it the "no way to be woken" or the "wake mechanism" wording, and did it match step 13? |
+| 15 | Wait without touching the recipient. | Whether a turn started on its own; `last_wake` (`requested` or `confirmed`) where a wake mechanism exists; whether and when the answer arrived (`answered`, time from the question). |
+| 16 | Send two direct messages within one second. | One wake, not two (bursts are coalesced). |
+| 17 | Restart the wake mechanism (a new Claude Code turn ends; restart `context codex-wake`) without new messages. | No wake for messages already woken for. |
+| 18 | Open a second window of the same agent with the same role; address only the first. | Only the addressed window wakes. |
+| 19 | Stop the wake mechanism (Codex: stop the adapter) and ask again. | `attention.wake` back to `unknown`, the "no way to be woken" wording, and no turn. |
+| 20 | A message arriving exactly while the recipient's turn ends. | Whether the Stop drain took it (same turn) or the wake did (new turn). Either is fine; losing it is a bug. |
+
+Results on 2026-10-20:
+- **Codex 0.163.0 with the adapter:**
+  - steps 13–15 woke and answered in 16–18 s, `confirmed`;
+  - step 17 caused no repeat wake;
+  - a message sent during a busy turn was queued and answered 29 s later.
+- **Antigravity:** steps 13–15 behave as unsupported, by design.
+- **Claude Code** and every remaining step: untested in this round.
+
+### When a window should have woken and did not
+
+Look from the sender's side first: `list_sessions` (or `client sessions`)
+shows the window's `attention`.
+
+- **Claude Code, `wake: unknown`.** The watcher is not running. It starts
+  at SessionStart and after every turn, as an `async` + `asyncRewake` hook.
+  1. Run `ai-crew-sync context hook --binding <session id> --event status`.
+     It must say `authenticated`.
+  2. `no-credential` means the window's proxy closed: start a new turn.
+  3. `missing` means the plugin's proxy never bound this conversation.
+- **Codex, `wake: unknown`.** No adapter is running for that thread. Start
+  `ai-crew-sync context codex-wake --thread <thread id>`. If it refuses:
+  - "not bound by Codex": the thread has not called an ai-crew-sync tool
+    yet;
+  - "already waking": another adapter runs, or one died less than 90 s ago;
+  - "does not know thread": the thread is not hosted by the managed daemon
+    (`codex app-server daemon version`).
+- **Codex, `last_wake: failed`.** The adapter reached the daemon but every
+  `turn/start` failed. Its stderr has the reason. Check that the thread is
+  not in an error state, and restart the adapter.
+- **`last_wake: requested`, never `confirmed`.** Codex accepted the turn,
+  but the adapter could not see it start. Look at the thread itself before
+  doing anything else: no second turn is requested for the same news.
+- **Antigravity.** No idle wake exists. A resumed conversation binds on its
+  first ai-crew-sync tool call; until then its hooks stay silent.
 
 ### Reporting
 
