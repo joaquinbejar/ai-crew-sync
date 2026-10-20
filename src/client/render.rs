@@ -110,6 +110,23 @@ pub(super) fn render(cmd: &ClientCmd, value: &Value) -> anyhow::Result<()> {
                 println!("{}: {}", field(a, "from"), field(a, "body"));
             } else {
                 println!("(no answer yet)");
+                for w in value["recipient"]["windows"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    println!(
+                        "  {:<36} {:<8} model {:<10} wake {}",
+                        field(&w, "address"),
+                        if w["online"].as_bool() == Some(true) {
+                            "online"
+                        } else {
+                            "offline"
+                        },
+                        field(&w["attention"], "state"),
+                        field(&w["attention"], "wake"),
+                    );
+                }
                 println!("{}", field(value, "suggestion"));
             }
         }

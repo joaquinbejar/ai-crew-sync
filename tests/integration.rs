@@ -18353,3 +18353,132 @@ async fn the_codex_adapter_refuses_what_codex_did_not_bind() {
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
 }
+
+// ------------------------------------------- ask_agent recipient (#224) --
+
+/// A timed-out question says what is known about the recipient instead of
+/// implying an answer is coming (#224): offline, attending, idle without a
+/// wake mechanism, idle with one (and a failed last wake) read differently;
+/// the question is always stored, and resuming never re-sends it.
+#[tokio::test]
+async fn a_timed_out_question_explains_the_recipients_state() {
+    let h = require_db!("t_ask_recipient");
+    let token = seed_agent(&h.pool, "acme", "codex").await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let ask = |to: &'static str| {
+        let marta = &marta;
+        async move {
+            call(
+                marta,
+                "ask_agent",
+                json!({"to": to, "question": "ready?", "timeout_seconds": 5}),
+            )
+            .await
+        }
+    };
+
+    // Never connected: stored, nobody reading.
+    let r = ask("codex/api").await;
+    assert_eq!(r["answered"], false, "{r}");
+    assert_eq!(r["question_stored"], true, "{r}");
+    assert_eq!(r["recipient"]["routing"], "exact", "{r}");
+    assert!(
+        r["recipient"]["windows"].as_array().unwrap().is_empty(),
+        "{r}"
+    );
+    let s = r["suggestion"].as_str().unwrap();
+    assert!(s.contains("no window of theirs is connected"), "{s}");
+
+    // Connected, its turn ended, no wake mechanism.
+    let api = connect_with_session(&h.base, &token, "api").await;
+    call(&api, "heartbeat", json!({"attention": "idle"})).await;
+    let r = ask("codex/api").await;
+    let s = r["suggestion"].as_str().unwrap();
+    assert!(s.contains("announces no way to be woken"), "{s}");
+    assert!(s.contains("Do not wait in a loop"), "{s}");
+    assert_eq!(
+        r["recipient"]["windows"][0]["attention"]["state"], "idle",
+        "{r}"
+    );
+
+    // Idle but wakeable, then a failed last wake.
+    call(
+        &api,
+        "heartbeat",
+        json!({"refresh_only": true, "wake": "codex-adapter", "wake_ttl_seconds": 300}),
+    )
+    .await;
+    let r = ask("codex/api").await;
+    let s = r["suggestion"].as_str().unwrap();
+    assert!(s.contains("wake mechanism (codex-adapter)"), "{s}");
+    assert!(!s.contains("failed"), "{s}");
+    call(
+        &api,
+        "heartbeat",
+        json!({"refresh_only": true, "wake_result": "failed"}),
+    )
+    .await;
+    let r = ask("codex/api").await;
+    let s = r["suggestion"].as_str().unwrap();
+    assert!(s.contains("last wake attempt failed"), "{s}");
+
+    // Attending: an answer may still come; resuming does not re-send.
+    call(&api, "heartbeat", json!({"attention": "attending"})).await;
+    let r = ask("codex/api").await;
+    let qid = r["question_message_id"].as_i64().unwrap();
+    let s = r["suggestion"].as_str().unwrap();
+    assert!(s.contains("an answer may still come"), "{s}");
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+    };
+    let before = count().await;
+    let resumed = call(
+        &marta,
+        "ask_agent",
+        json!({"to": "codex/api", "resume_message_id": qid, "timeout_seconds": 5}),
+    )
+    .await;
+    assert_eq!(resumed["question_message_id"], qid, "{resumed}");
+    assert_eq!(count().await, before, "resuming sent another message");
+
+    // The bare name reaches every window: say so.
+    let web = connect_with_session(&h.base, &token, "web").await;
+    call(&web, "heartbeat", json!({})).await;
+    let r = ask("codex").await;
+    assert_eq!(r["recipient"]["routing"], "agent", "{r}");
+    assert_eq!(
+        r["recipient"]["windows"].as_array().unwrap().len(),
+        2,
+        "{r}"
+    );
+    let s = r["suggestion"].as_str().unwrap();
+    assert!(s.contains("reaches every window"), "{s}");
+
+    // An answer carries the recipient too.
+    let answerer = tokio::spawn({
+        let (base, token) = (h.base.clone(), token.clone());
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            let api = connect_with_session(&base, &token, "api").await;
+            call(&api, "post_message", json!({"to": "marta", "body": "yes"})).await;
+            let _ = api.cancel().await;
+        }
+    });
+    let r = call(
+        &marta,
+        "ask_agent",
+        json!({"to": "codex/api", "question": "now?", "timeout_seconds": 10}),
+    )
+    .await;
+    answerer.await.unwrap();
+    assert_eq!(r["answered"], true, "{r}");
+    assert_eq!(r["recipient"]["routing"], "exact", "{r}");
+
+    for c in [api, web, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
