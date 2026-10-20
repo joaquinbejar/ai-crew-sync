@@ -143,7 +143,11 @@ fn git_place(dir: &Path) -> (Option<String>, Option<String>) {
 }
 
 /// One tool call as the bound window, with its credential and epoch.
-async fn call_as_window(binding: &Binding, tool: &str, args: Value) -> anyhow::Result<Value> {
+pub(crate) async fn call_as_window(
+    binding: &Binding,
+    tool: &str,
+    args: Value,
+) -> anyhow::Result<Value> {
     let url = binding
         .mcp_url
         .as_deref()
@@ -331,35 +335,35 @@ const WATCH_STARTUP_SECS: u64 = 20;
 /// the window now. Kept next to the binding (0600, in the 0700 directory),
 /// holds no credential.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct WatchState {
+pub(crate) struct WatchState {
     /// The watcher that owns this window; an older one that finds another
     /// token here stops.
-    token: String,
+    pub(crate) token: String,
     /// Unread direct messages for this window at the last check.
-    direct: i64,
+    pub(crate) direct: i64,
     /// Newest direct message addressed to this window at the last check.
     /// The arrival mark: a message read and another received between two
     /// checks leave the count unchanged, but not this.
     #[serde(default)]
-    newest_direct: i64,
+    pub(crate) newest_direct: i64,
     /// Conversation messages addressed to this window and not yet delivered.
-    inbox: i64,
+    pub(crate) inbox: i64,
     /// False until a watcher has read the counts once. A record written
     /// only to claim the window holds zeros that were never observed, and
     /// must not read as "nothing waiting": the next watcher would wake the
     /// window for messages its session start already announced.
     #[serde(default)]
-    primed: bool,
+    pub(crate) primed: bool,
 }
 
 /// One reading of what is waiting for the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Reading {
-    direct: i64,
-    newest_direct: i64,
+pub(crate) struct Reading {
+    pub(crate) direct: i64,
+    pub(crate) newest_direct: i64,
     /// `None` when the inbox could not be read this time; the last known
     /// figure stands rather than a zero nobody observed.
-    inbox: Option<i64>,
+    pub(crate) inbox: Option<i64>,
 }
 
 fn watch_path(config_dir: &Path, binding_id: &str) -> std::path::PathBuf {
@@ -378,7 +382,7 @@ fn write_watch_state(path: &Path, state: &WatchState) -> anyhow::Result<()> {
 /// one addressed to it, and undelivered conversation messages when the team
 /// has conversations at all. A history read (`only_new: false`) never moves
 /// the window's read cursor.
-async fn pending_for_window(binding: &Binding) -> anyhow::Result<Reading> {
+pub(crate) async fn pending_for_window(binding: &Binding) -> anyhow::Result<Reading> {
     let who = call_as_window(binding, "whoami", json!({})).await?;
     let direct = who["unread_direct_messages"].as_i64().unwrap_or(0);
     let newest = call_as_window(
@@ -407,7 +411,7 @@ async fn pending_for_window(binding: &Binding) -> anyhow::Result<Reading> {
 
 /// The text the host shows the woken model. Counts only: bodies are
 /// teammates' words, and the model reads them through the usual tools.
-fn wake_text(direct: i64, inbox: i64) -> String {
+pub(crate) fn wake_text(direct: i64, inbox: i64) -> String {
     let mut waiting = Vec::new();
     if direct > 0 {
         waiting.push(format!("{direct} unread direct message(s) (read_messages)"));
@@ -431,7 +435,7 @@ fn wake_text(direct: i64, inbox: i64) -> String {
 /// news; so is an inbox count above the mark. A count below the mark means
 /// the window read something, so the mark comes down and the next arrival
 /// counts again. The same unread messages never wake a window twice.
-fn watch_step(seen: &WatchState, reading: Reading) -> (bool, WatchState) {
+pub(crate) fn watch_step(seen: &WatchState, reading: Reading) -> (bool, WatchState) {
     let inbox = reading.inbox.unwrap_or(seen.inbox);
     let wake =
         (reading.direct > 0 && reading.newest_direct > seen.newest_direct) || inbox > seen.inbox;

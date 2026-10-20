@@ -17885,3 +17885,471 @@ async fn a_throttled_call_after_stop_is_flushed() {
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
 }
+
+// ------------------------------------------------- codex wake (#222) --
+
+/// What the fake Codex app-server does, and what it saw.
+#[derive(Default)]
+struct FakeCodexState {
+    /// The thread it knows, and its status: idle, active or notLoaded.
+    thread: String,
+    status: String,
+    /// When the status is `active`, flip it to idle (with a notification)
+    /// this long after a client reads it.
+    idle_after: Option<std::time::Duration>,
+    /// Refuse turn/start.
+    fail_turn_start: bool,
+    /// Refuse thread/turns/list, so a started turn cannot be confirmed.
+    fail_turns_list: bool,
+    /// The text of every turn started.
+    turns: Vec<String>,
+    /// turn/start calls that arrived while the thread was active.
+    started_while_active: usize,
+    resumed: usize,
+}
+
+/// A stand-in for the Codex app-server daemon: JSON-RPC over WebSocket on a
+/// Unix socket, the shape the real one serves (verified against codex-cli
+/// 0.163.0). Server frames are unmasked; client frames must be masked.
+struct FakeCodex {
+    socket: std::path::PathBuf,
+    state: std::sync::Arc<std::sync::Mutex<FakeCodexState>>,
+}
+
+async fn ws_read(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Option<Value> {
+    use tokio::io::AsyncReadExt;
+    loop {
+        let mut head = [0u8; 2];
+        stream.read_exact(&mut head).await.ok()?;
+        let opcode = head[0] & 0x0f;
+        assert!(head[1] & 0x80 != 0, "a client frame must be masked");
+        let mut len = u64::from(head[1] & 0x7f);
+        if len == 126 {
+            let mut b = [0u8; 2];
+            stream.read_exact(&mut b).await.ok()?;
+            len = u64::from(u16::from_be_bytes(b));
+        } else if len == 127 {
+            let mut b = [0u8; 8];
+            stream.read_exact(&mut b).await.ok()?;
+            len = u64::from_be_bytes(b);
+        }
+        let mut mask = [0u8; 4];
+        stream.read_exact(&mut mask).await.ok()?;
+        let mut payload = vec![0u8; len as usize];
+        stream.read_exact(&mut payload).await.ok()?;
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+        match opcode {
+            0x1 => return serde_json::from_slice(&payload).ok(),
+            0x8 => return None,
+            _ => continue,
+        }
+    }
+}
+
+async fn ws_write(stream: &mut (impl tokio::io::AsyncWrite + Unpin), value: &Value) {
+    use tokio::io::AsyncWriteExt;
+    let payload = serde_json::to_vec(value).unwrap();
+    let mut frame = vec![0x81u8];
+    if payload.len() < 126 {
+        frame.push(payload.len() as u8);
+    } else {
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(&payload);
+    let _ = stream.write_all(&frame).await;
+}
+
+impl FakeCodex {
+    fn start(thread: &str, status: &str) -> Self {
+        // A short path: Unix socket paths are limited to about 104 bytes.
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/acs-fc-{}.sock",
+            &Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake codex");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(FakeCodexState {
+            thread: thread.to_owned(),
+            status: status.to_owned(),
+            ..Default::default()
+        }));
+        let shared = state.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(FakeCodex::serve(stream, shared.clone()));
+            }
+        });
+        Self { socket, state }
+    }
+
+    async fn serve(
+        mut stream: tokio::net::UnixStream,
+        state: std::sync::Arc<std::sync::Mutex<FakeCodexState>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read_exact(&mut byte).await.is_err() {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                  Connection: Upgrade\r\nSec-WebSocket-Accept: fake\r\n\r\n",
+            )
+            .await;
+        // Replies and notifications go through one writer, so a delayed
+        // notification can be sent while the next request is handled.
+        let (mut reader, mut writer) = stream.into_split();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        tokio::spawn(async move {
+            while let Some(v) = rx.recv().await {
+                ws_write(&mut writer, &v).await;
+            }
+        });
+        while let Some(msg) = ws_read(&mut reader).await {
+            let Some(id) = msg.get("id").cloned() else {
+                continue;
+            };
+            let method = msg["method"].as_str().unwrap_or("").to_owned();
+            let params = msg["params"].clone();
+            let mut later: Vec<Value> = Vec::new();
+            let mut flip_idle: Option<std::time::Duration> = None;
+            let reply = {
+                let mut st = state.lock().unwrap();
+                let known = params["threadId"] == st.thread.as_str();
+                match method.as_str() {
+                    "initialize" => json!({"id": id, "result": {"userAgent": "fake-codex"}}),
+                    "thread/read" | "thread/resume" | "turn/start" if !known => {
+                        json!({"id": id, "error": {"code": -32600, "message": "thread not found"}})
+                    }
+                    "thread/read" => {
+                        if st.status == "active" {
+                            flip_idle = st.idle_after.take();
+                        }
+                        json!({"id": id, "result": {"thread": {
+                            "id": st.thread, "status": {"type": st.status}}}})
+                    }
+                    "thread/resume" => {
+                        st.resumed += 1;
+                        st.status = "idle".into();
+                        json!({"id": id, "result": {"thread": {"id": st.thread}}})
+                    }
+                    "turn/start" => {
+                        if st.fail_turn_start {
+                            json!({"id": id, "error": {"code": -32000, "message": "refused"}})
+                        } else {
+                            if st.status == "active" {
+                                st.started_while_active += 1;
+                            }
+                            st.status = "active".into();
+                            let text = params["input"][0]["text"].as_str().unwrap_or("").to_owned();
+                            st.turns.push(text);
+                            let turn = format!("turn-{}", st.turns.len());
+                            // Like the real one, no turn/started for a client that
+                            // did not start or resume the thread: the adapter has to
+                            // read the turn list.
+                            let _ = &mut later;
+                            // The turn ends a moment later.
+                            st.idle_after = None;
+                            flip_idle = Some(std::time::Duration::from_millis(300));
+                            json!({"id": id, "result": {"turn": {"id": turn, "status": "inProgress"}}})
+                        }
+                    }
+                    "thread/turns/list" if st.fail_turns_list => {
+                        json!({"id": id, "error": {"code": -32601, "message": "no such method"}})
+                    }
+                    "thread/turns/list" => {
+                        let data: Vec<Value> = (1..=st.turns.len())
+                            .rev()
+                            .map(|n| json!({"id": format!("turn-{n}"), "startedAt": 1}))
+                            .collect();
+                        json!({"id": id, "result": {"data": data}})
+                    }
+                    _ => json!({"id": id, "result": {}}),
+                }
+            };
+            let _ = tx.send(reply);
+            for n in later {
+                let _ = tx.send(n);
+            }
+            if let Some(after) = flip_idle {
+                let (state, tx) = (state.clone(), tx.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(after).await;
+                    let thread = {
+                        let mut st = state.lock().unwrap();
+                        st.status = "idle".into();
+                        st.thread.clone()
+                    };
+                    let _ = tx.send(json!({"method": "thread/status/changed", "params": {
+                        "threadId": thread, "status": {"type": "idle"}}}));
+                });
+            }
+        }
+    }
+
+    fn turns(&self) -> Vec<String> {
+        self.state.lock().unwrap().turns.clone()
+    }
+}
+
+impl Drop for FakeCodex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// The adapter binary for `thread`, against `socket`.
+fn codex_wake(
+    dir: &std::path::Path,
+    thread: &str,
+    socket: &std::path::Path,
+    max_secs: u64,
+) -> tokio::process::Child {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_ai-crew-sync"))
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("BUS_CONFIG_DIR", dir)
+        .args(["context", "codex-wake", "--thread", thread, "--socket"])
+        .arg(socket)
+        .args(["--max-secs", &max_secs.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn codex-wake")
+}
+
+/// Poll until `check` holds or `secs` pass.
+async fn eventually(secs: u64, mut check: impl FnMut() -> bool) -> bool {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < until {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    check()
+}
+
+/// The Codex wake adapter end to end against a fake app-server (#222):
+/// bound only through a thread id Codex itself sent, it wakes an idle
+/// thread for news and not for what was already waiting, carries counts and
+/// never a body, waits for a busy thread instead of starting a second turn,
+/// keeps one owner per thread, does not wake twice for the same messages
+/// across a restart, and records what each attempt came to.
+#[tokio::test]
+async fn the_codex_adapter_wakes_an_idle_thread_for_news_only() {
+    let h = require_db!("t_codex_wake");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+
+    // The window, bound by the thread id Codex sends on its own calls.
+    let window = spawn_proxy(&dir, &repo, &[], &[]).await;
+    let thread = "019a-thread-wake";
+    let mut params = CallToolRequestParams::new("session_status");
+    let mut m = rmcp::model::JsonObject::new();
+    m.insert("threadId".into(), json!(thread));
+    params.meta = Some(rmcp::model::RequestMetaObject::from(m));
+    let status = window
+        .call_tool(params)
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(status["binding"], "request-meta", "{status}");
+    let address = status["address"].as_str().unwrap().to_owned();
+    let dm = |body: &'static str| {
+        let (marta, address) = (&marta, address.clone());
+        async move {
+            call(marta, "post_message", json!({"to": address, "body": body})).await;
+        }
+    };
+
+    // Waiting before the adapter starts: not news.
+    dm("old business").await;
+    let codex = FakeCodex::start(thread, "idle");
+    let adapter = codex_wake(&dir, thread, &codex.socket, 120);
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        codex.turns().is_empty(),
+        "woke for what was already waiting"
+    );
+    let e = session_entry(&marta, &address).await;
+    assert_eq!(e["attention"]["wake"], "codex-adapter", "{e}");
+
+    // One adapter per thread.
+    let second = codex_wake(&dir, thread, &codex.socket, 30)
+        .wait_with_output()
+        .await
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("already waking this Codex thread"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    // News: one turn, counts only, recorded as confirmed.
+    dm("please review the lease change").await;
+    assert!(eventually(20, || codex.turns().len() == 1).await, "no wake");
+    let text = codex.turns()[0].clone();
+    assert!(text.contains("unread direct message"), "{text}");
+    assert!(
+        !text.contains("lease change"),
+        "a body reached Codex: {text}"
+    );
+    let mut e = Value::Null;
+    for _ in 0..40 {
+        e = session_entry(&marta, &address).await;
+        if e["attention"]["last_wake"] == "confirmed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(e["attention"]["last_wake"], "confirmed", "{e}");
+
+    // A turn Codex accepted but that cannot be confirmed is recorded as
+    // requested and never requested again: no duplicate turn.
+    assert!(eventually(5, || codex.state.lock().unwrap().status == "idle").await);
+    codex.state.lock().unwrap().fail_turns_list = true;
+    dm("can you confirm?").await;
+    let mut e = Value::Null;
+    for _ in 0..80 {
+        e = session_entry(&marta, &address).await;
+        if e["attention"]["last_wake"] == "requested" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(e["attention"]["last_wake"], "requested", "{e}");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        codex.turns().len(),
+        2,
+        "an unconfirmed turn was requested again"
+    );
+    codex.state.lock().unwrap().fail_turns_list = false;
+
+    // A busy thread is waited on, never given a second turn. First let the
+    // woken turn end, so its own end does not make the thread idle again.
+    assert!(eventually(5, || codex.state.lock().unwrap().status == "idle").await);
+    {
+        let mut st = codex.state.lock().unwrap();
+        st.status = "active".into();
+        st.idle_after = Some(std::time::Duration::from_millis(1500));
+    }
+    dm("and another thing").await;
+    assert!(
+        eventually(30, || codex.turns().len() == 3).await,
+        "no wake after idle"
+    );
+    assert_eq!(codex.state.lock().unwrap().started_while_active, 0);
+
+    // Stopped with SIGTERM, it releases the thread and withdraws its
+    // announcement; a new one starts at once and does not wake again for
+    // the same messages.
+    let pid = adapter.id().expect("adapter pid");
+    std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap();
+    let out = adapter.wait_with_output().await.unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("released"));
+    let e = session_entry(&marta, &address).await;
+    assert_eq!(e["attention"]["wake"], "unknown", "{e}");
+    let restarted = codex_wake(&dir, thread, &codex.socket, 120);
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert_eq!(codex.turns().len(), 3, "woke twice for the same messages");
+
+    // A refused wake is retried, then recorded as failed.
+    codex.state.lock().unwrap().fail_turn_start = true;
+    dm("this one will not get through").await;
+    let mut e = Value::Null;
+    for _ in 0..60 {
+        e = session_entry(&marta, &address).await;
+        if e["attention"]["last_wake"] == "failed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(e["attention"]["last_wake"], "failed", "{e}");
+    assert_eq!(codex.turns().len(), 3);
+
+    drop(restarted);
+    let _ = marta.cancel().await;
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// The adapter never guesses which thread a window is: a window bound by
+/// anything but Codex's own thread id is refused, and so is a thread with
+/// no window or one the app-server does not know (#222).
+#[tokio::test]
+async fn the_codex_adapter_refuses_what_codex_did_not_bind() {
+    let h = require_db!("t_codex_wake_refuse");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let explicit = spawn_proxy(&dir, &repo, &[], &[("BUS_HOST_SESSION", "conv-explicit")]).await;
+    call(&explicit, "session_status", json!({})).await;
+    let codex = FakeCodex::start("conv-explicit", "idle");
+    let stderr = |out: std::process::Output| String::from_utf8_lossy(&out.stderr).into_owned();
+
+    let out = codex_wake(&dir, "conv-explicit", &codex.socket, 10)
+        .wait_with_output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr(out).contains("not bound by Codex"));
+
+    let out = codex_wake(&dir, "no-such-thread", &codex.socket, 10)
+        .wait_with_output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr(out).contains("no ai-crew-sync window is bound"));
+
+    // Bound by Codex, but unknown to the app-server.
+    let meta = spawn_proxy(&dir, &repo, &[], &[]).await;
+    let mut params = CallToolRequestParams::new("session_status");
+    let mut m = rmcp::model::JsonObject::new();
+    m.insert("threadId".into(), json!("thread-elsewhere"));
+    params.meta = Some(rmcp::model::RequestMetaObject::from(m));
+    meta.call_tool(params).await.unwrap();
+    let out = codex_wake(&dir, "thread-elsewhere", &codex.socket, 10)
+        .wait_with_output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr(out).contains("does not know thread"));
+    // A failed start takes nothing: no ownership record to wait out.
+    let record =
+        ai_crew_sync::context::binding_path(&dir, "thread-elsewhere").with_extension("codex-wake");
+    assert!(!record.exists(), "a failed start left an ownership record");
+
+    for c in [explicit, meta] {
+        let _ = c.cancel().await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}

@@ -165,7 +165,7 @@ async fn load_agents(pool: &PgPool, team_id: Uuid) -> Result<Vec<AgentRow>, sqlx
                p.updated_at,
                COALESCE(p.expires_at > now(), false) AS online,
                p.attention, p.attention_at, p.last_tool_at, p.last_inbox_read_at,
-               p.wake, p.wake_until
+               p.wake, p.wake_until, p.wake_result, p.wake_result_at
         FROM agents a
         LEFT JOIN agent_presence p ON p.agent_id = a.id
         WHERE a.team_id = $1 AND a.disabled_at IS NULL

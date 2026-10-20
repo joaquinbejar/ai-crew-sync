@@ -439,8 +439,8 @@ The plugin comes fully preconfigured:
   unread messages never wake a window twice, a newer watcher replaces the
   older one, and it gives up quietly after `BUS_WATCH_SECS` (default 14000 s,
   under the hook's 4 h timeout). Authenticated mode only (it needs the binary
-  and the window's own credential); other hosts have no equivalent, so Codex
-  still sees news at the end of a turn.
+  and the window's own credential). Codex has no such hook; for it there is
+  an opt-in adapter (see "Waking an idle Codex thread" below).
 
 You no longer set `BUS_SESSION` for this: the proxy derives the session from
 the conversation id Claude Code gives it, so a window keeps its identity across
@@ -878,14 +878,35 @@ a newer observation and only while the window is online; `idle` stands until
 something observes a new turn; whatever nobody observed is `unknown`. The
 proxy's keepalive renews the lease and the credential with `refresh_only`
 and never touches `status` or `attention`, so an idle window stays idle. The
-proxy cannot see a turn end: hosts without hooks (Codex) show `attending`
-after a tool call, which turns `unknown` once it is old. `wake` is
+proxy cannot see a turn end: a host whose hooks are not installed shows
+`attending` after a tool call, which turns `unknown` once it is old (Codex
+runs the plugin's Stop and UserPromptSubmit hooks too when the plugin is
+installed there). `wake` is
 descriptive, never proof that a wake will succeed. None of these fields
 promises an answer.
 
 `heartbeat` takes the observations as optional arguments (`attention`,
-`tool_activity`, `wake`, `wake_ttl_seconds`, `refresh_only`); omitted keeps,
-`""` clears. They are additive: existing callers see only new fields.
+`tool_activity`, `wake`, `wake_ttl_seconds`, `wake_result`, `refresh_only`);
+omitted keeps, `""` clears. They are additive: existing callers see only new
+fields.
+
+#### Waking an idle Codex thread (opt-in)
+
+Codex has no background hook that can start a turn, so the watcher above
+does not exist there. `ai-crew-sync context codex-wake --thread <id>` is the
+equivalent, as a local process you start yourself, for one thread at a time.
+It talks to the Codex app-server daemon on its Unix socket, and when the bus
+has something new for that thread's window it starts a turn
+(`turn/start`) carrying counts, never message bodies. It acts as that window
+with its own credential, and only for a thread id Codex itself gave the
+window's proxy (the binding reads `request-meta`); anything else is refused.
+It never starts a second turn while the thread is busy, does not wake for
+what was already waiting, and records each attempt on the window's presence
+(`attention.wake: codex-adapter`, `attention.last_wake`: `requested`,
+`confirmed` or `failed`). Verified on codex-cli 0.163.0 for threads hosted by
+the managed daemon; ChatGPT desktop app threads are not reachable from
+outside that app. The contract, setup and measured results are in
+[docs/adapters/codex-wake.md](docs/adapters/codex-wake.md).
 
 ### Sessions: one agent, several windows
 
@@ -1860,7 +1881,8 @@ One binary, four kinds of command, told apart by what they need. `ai-crew-sync
 verify` asks the bus who the resolved token really is; `context hook
 --binding ID --event session_start|prompt_submit|heartbeat|stop|session_end|status|call` is
 what the plugin's authenticated hooks run (`call` serves only `whoami`,
-`read_messages`, `team_digest` and `heartbeat`).
+`read_messages`, `team_digest` and `heartbeat`); `context codex-wake
+--thread ID` wakes an idle Codex thread (opt-in, see above).
 
 **Local only**: `context show` (which bus, as whom, and why), `context
 set-project` (writes `.acs.toml`), `context profile add|list|default|remove`

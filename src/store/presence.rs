@@ -26,6 +26,8 @@ pub struct RawAttention {
     pub last_inbox_read_at: Option<chrono::DateTime<chrono::Utc>>,
     pub wake: Option<String>,
     pub wake_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub wake_result: Option<String>,
+    pub wake_result_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// What the stored observations say now. `idle` stands until something
@@ -59,6 +61,8 @@ pub fn attention_of(raw: &RawAttention, online: bool) -> SessionAttention {
         last_inbox_read_at: ts_opt(raw.last_inbox_read_at),
         wake: wake.0,
         wake_until: ts_opt(wake.1),
+        last_wake: raw.wake_result.clone(),
+        last_wake_at: ts_opt(raw.wake_result_at),
     }
 }
 
@@ -109,6 +113,9 @@ pub struct HeartbeatInput {
     /// with the same token, never a successor's.
     pub wake_token: Option<String>,
     pub wake_ttl_seconds: Option<i64>,
+    /// What the window's wake mechanism's last attempt came to:
+    /// requested, confirmed or failed. `None` keeps it.
+    pub wake_result: Option<String>,
     /// Renew the lease and the labels but keep `status` as it is: what a
     /// process that is merely alive sends, so it never overwrites what the
     /// window's hooks or its model said.
@@ -247,6 +254,20 @@ pub async fn heartbeat(
         }
         other => other.map(str::to_owned),
     };
+    let wake_result = match input
+        .wake_result
+        .as_deref()
+        .map(|v| v.trim().to_lowercase())
+    {
+        None => None,
+        Some(v) if matches!(v.as_str(), "requested" | "confirmed" | "failed") => Some(v),
+        Some(v) => {
+            return Err(BusError::invalid(format!(
+                "wake_result must be one of: requested, confirmed, failed (got '{v}'); it is \
+                 what the wake mechanism's last attempt came to"
+            )));
+        }
+    };
     let wake_ttl = input
         .wake_ttl_seconds
         .unwrap_or(DEFAULT_WAKE_TTL_SECS)
@@ -267,7 +288,8 @@ pub async fn heartbeat(
             INSERT INTO agent_presence
                 (agent_id, session, status, repo, branch, activity, project, role,
                  updated_at, expires_at,
-                 attention, attention_at, last_tool_at, wake, wake_until, wake_token)
+                 attention, attention_at, last_tool_at, wake, wake_until, wake_token,
+                 wake_result, wake_result_at)
             -- NULLIF on the insert path too: the CASE below only runs on
             -- conflict, so a first heartbeat for a new or freshly swept
             -- session stored '' and reported an empty string where the
@@ -281,7 +303,8 @@ pub async fn heartbeat(
                     NULLIF($12, ''),
                     CASE WHEN NULLIF($12, '') IS NULL THEN NULL
                          ELSE now() + make_interval(secs => $13) END,
-                    CASE WHEN NULLIF($12, '') IS NULL THEN NULL ELSE $16 END)
+                    CASE WHEN NULLIF($12, '') IS NULL THEN NULL ELSE $16 END,
+                    $17, CASE WHEN $17::text IS NULL THEN NULL ELSE now() END)
             ON CONFLICT (agent_id, session) DO UPDATE SET
                 -- A refresh renews the lease and nothing a hook or the
                 -- model said: a live process is not news about the model.
@@ -352,11 +375,14 @@ pub async fn heartbeat(
                                     THEN agent_presence.wake_token
                                   WHEN $12 = '' THEN NULL
                                   ELSE $16 END,
+                wake_result = COALESCE($17, agent_presence.wake_result),
+                wake_result_at = CASE WHEN $17::text IS NULL THEN agent_presence.wake_result_at
+                                      ELSE now() END,
                 updated_at = now(),
                 expires_at = EXCLUDED.expires_at
             RETURNING agent_id, session, status, repo, branch, activity, project, role,
                       updated_at, expires_at, attention, attention_at, last_tool_at,
-                      last_inbox_read_at, wake, wake_until
+                      last_inbox_read_at, wake, wake_until, wake_result, wake_result_at
         )
         SELECT a.name,
                a.display_name,
@@ -370,7 +396,7 @@ pub async fn heartbeat(
                up.updated_at,
                up.expires_at > now() AS online,
                up.attention, up.attention_at, up.last_tool_at, up.last_inbox_read_at,
-               up.wake, up.wake_until
+               up.wake, up.wake_until, up.wake_result, up.wake_result_at
         FROM up
         JOIN agents a ON a.id = up.agent_id
         "#,
@@ -391,6 +417,7 @@ pub async fn heartbeat(
     .bind(input.refresh_only)
     .bind(observed_ago_secs)
     .bind(wake_token.as_deref())
+    .bind(wake_result.as_deref())
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -469,7 +496,7 @@ pub async fn list_agents(pool: &PgPool, auth: &AuthCtx, online_only: bool) -> Bu
                p.updated_at,
                COALESCE(p.expires_at > now(), false) AS online,
                p.attention, p.attention_at, p.last_tool_at, p.last_inbox_read_at,
-               p.wake, p.wake_until
+               p.wake, p.wake_until, p.wake_result, p.wake_result_at
         FROM agents a
         -- Every session, deliberately: the previous change picked a single
         -- presence row per agent so the flat output stayed correct while it
@@ -623,7 +650,7 @@ pub async fn list_sessions(
                p.updated_at,
                (p.expires_at > now()) AS online,
                p.attention, p.attention_at, p.last_tool_at, p.last_inbox_read_at,
-               p.wake, p.wake_until
+               p.wake, p.wake_until, p.wake_result, p.wake_result_at
         FROM agent_presence p
         JOIN agents a ON a.id = p.agent_id
         WHERE a.team_id = $1

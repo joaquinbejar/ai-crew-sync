@@ -456,8 +456,8 @@ El plugin trae todo preconfigurado:
   despiertan dos veces una ventana, un vigilante nuevo sustituye al anterior, y
   se rinde en silencio tras `BUS_WATCH_SECS` (por defecto 14000 s, por debajo
   del límite de 4 h del hook). Solo en modo autenticado (necesita el binario y
-  la credencial propia de la ventana); otros clientes no tienen equivalente,
-  así que Codex sigue viendo las novedades al terminar cada turno.
+  la credencial propia de la ventana). Codex no tiene un hook así; para él hay
+  un adaptador opcional (ver «Despertar un hilo de Codex inactivo» más abajo).
 
 Para esto ya no hace falta `BUS_SESSION`: el proxy deriva la sesión del id de
 conversación que le da Claude Code, así que una ventana mantiene su identidad
@@ -906,15 +906,35 @@ observación más reciente y solo mientras la ventana está en línea; `idle`
 vale hasta que algo observa un turno nuevo; lo que nadie observó es
 `unknown`. El keep-alive del proxy renueva la presencia y la credencial con
 `refresh_only` y nunca toca `status` ni `attention`, así que una ventana
-inactiva sigue inactiva. El proxy no ve terminar un turno: los hosts sin
-hooks (Codex) muestran `attending` tras una llamada, que pasa a `unknown`
-cuando envejece. `wake` es descriptivo, nunca prueba de que despertar vaya a
+inactiva sigue inactiva. El proxy no ve terminar un turno: un host sin los
+hooks instalados muestra `attending` tras una llamada, que pasa a `unknown`
+cuando envejece (Codex también ejecuta los hooks Stop y UserPromptSubmit del
+plugin cuando el plugin está instalado allí). `wake` es descriptivo, nunca prueba de que despertar vaya a
 funcionar. Ninguno de estos campos promete una respuesta.
 
 `heartbeat` acepta las observaciones como argumentos opcionales
-(`attention`, `tool_activity`, `wake`, `wake_ttl_seconds`, `refresh_only`);
-omitido conserva, `""` borra. Son aditivos: quien ya llamaba solo ve campos
-nuevos.
+(`attention`, `tool_activity`, `wake`, `wake_ttl_seconds`, `wake_result`,
+`refresh_only`); omitido conserva, `""` borra. Son aditivos: quien ya
+llamaba solo ve campos nuevos.
+
+#### Despertar un hilo de Codex inactivo (opcional)
+
+Codex no tiene un hook en segundo plano que pueda empezar un turno, así que
+el vigilante de arriba no existe allí. `ai-crew-sync context codex-wake
+--thread <id>` es el equivalente, como un proceso local que arrancas tú, para
+un hilo cada vez. Habla con el daemon app-server de Codex por su socket Unix,
+y cuando el bus tiene algo nuevo para la ventana de ese hilo empieza un turno
+(`turn/start`) que lleva recuentos, nunca cuerpos de mensajes. Actúa como esa
+ventana con su propia credencial, y solo para un id de hilo que el propio
+Codex dio al proxy de la ventana (el binding dice `request-meta`); cualquier
+otro se rechaza. Nunca empieza un segundo turno mientras el hilo está
+ocupado, no despierta por lo que ya estaba esperando y registra cada intento
+en la presencia de la ventana (`attention.wake: codex-adapter`,
+`attention.last_wake`: `requested`, `confirmed` o `failed`). Verificado con
+codex-cli 0.163.0 para hilos del daemon gestionado; los hilos de la app de
+escritorio de ChatGPT no son alcanzables desde fuera de esa app. El contrato,
+la puesta en marcha y los resultados medidos están en
+[docs/adapters/codex-wake.md](docs/adapters/codex-wake.md).
 
 ### Sesiones: un agente, varias ventanas
 
@@ -1910,7 +1930,8 @@ necesitan. `ai-crew-sync <comando> --help` imprime todos los flags.
 `context verify` le pregunta al bus quién es de verdad el token resuelto;
 `context hook --binding ID --event session_start|prompt_submit|heartbeat|stop|session_end|status|call`
 es lo que ejecutan los hooks autenticados del plugin (`call` solo sirve
-`whoami`, `read_messages`, `team_digest` y `heartbeat`).
+`whoami`, `read_messages`, `team_digest` y `heartbeat`); `context codex-wake
+--thread ID` despierta un hilo de Codex inactivo (opcional, ver arriba).
 
 **Solo local**: `context show` (qué bus, como quién y por qué),
 `context set-project` (escribe `.acs.toml`),

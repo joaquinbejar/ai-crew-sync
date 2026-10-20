@@ -187,6 +187,13 @@ pub struct SessionAttention {
     /// When the wake announcement lapses unless renewed.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub wake_until: Option<String>,
+    /// What the wake mechanism's last attempt came to: `requested` (the
+    /// host accepted a new turn), `confirmed` (the host said it started) or
+    /// `failed`. Not a receipt: a started turn has read nothing yet.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_wake: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_wake_at: Option<String>,
 }
 
 /// One session as `list_sessions` reports it: addressable, with its
