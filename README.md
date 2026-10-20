@@ -903,6 +903,34 @@ promises an answer.
 omitted keeps, `""` clears. They are additive: existing callers see only new
 fields.
 
+#### Antigravity's hook contract
+
+The same scripts serve Google Antigravity, which passes its payload with a
+camelCase `conversationId` and reads every hook's answer as JSON. Each
+script tells the hosts apart by the payload (falling back to
+`ANTIGRAVITY_CONVERSATION_ID`, which Antigravity exports to its hooks) and
+answers in that host's contract:
+
+- **SessionStart**: `{"injectSteps": [{"systemMessage": {"systemMessage": …}}]}`
+  instead of `hookSpecificOutput`.
+- **Stop drain**: `{"decision": "continue", "reason": …}` with the whole
+  instruction in the reason, once per question, instead of `block`.
+- **Anything with nothing to say**: `{}`.
+
+`ai-crew-sync context hook --host antigravity` selects the format explicitly;
+without it the helper detects Antigravity by its environment variable.
+Verified with `agy` 1.4.3:
+
+- SessionStart injected the window's context into a new conversation.
+- A question pending for a resumed conversation was answered (`reply_to`
+  set) after the Stop drain continued the loop.
+
+One limit comes from the host: agy names the conversation to MCP servers
+only on `tools/call`. In a resumed conversation the new proxy is not bound
+until the model calls an ai-crew-sync tool, so until then the hooks find the
+previous process's closed binding and stay silent. They never act as a
+guessed window.
+
 #### Waking an idle Codex thread (opt-in)
 
 Codex has no background hook that can start a turn, so the watcher above

@@ -16,6 +16,7 @@ bad() { echo "  FAIL  $1: $2"; FAIL=1; }
 # A stand-in for bus-call.sh that records "<tool> <json>" and sends nothing.
 mkdir -p "$WORK/bin"
 cp "$ROOT/heartbeat.sh" "$WORK/bin/heartbeat.sh"
+cp "$ROOT/host-payload.sh" "$WORK/bin/host-payload.sh"
 cat > "$WORK/bin/bus-call.sh" <<'FAKE'
 #!/bin/sh
 printf '%s\t%s\n' "$1" "${2:-{\}}" >> "$CAPTURE"
@@ -209,6 +210,18 @@ assert a["attention"] == "" and a["activity"] == "", a
 ' 2>/dev/null && ok "legacy SessionStart clears the previous attention" \
     || bad "legacy reset attention" "$(cut -f2 "$CAPTURE" | tail -1)"
 
+# Antigravity (#229): the Stop heartbeat answers {} and still reports idle.
+: > "$CAPTURE"
+hb_out="$(cd "$REPO_DIR" && printf '{"conversationId":"agy-hb"}' \
+    | env -u BUS_HOST_SESSION BUS_URL=x BUS_TOKEN=y sh "$WORK/bin/heartbeat.sh" stop --from-payload)"
+[ "$hb_out" = "{}" ] && ok "under Antigravity the Stop heartbeat answers {}" \
+    || bad "antigravity heartbeat output" "$hb_out"
+cut -f2 "$CAPTURE" | tail -1 | python3 -c '
+import json, sys
+assert json.load(sys.stdin)["attention"] == "idle"
+' 2>/dev/null && ok "under Antigravity the Stop heartbeat still reports idle" \
+    || bad "antigravity heartbeat attention" "$(cut -f2 "$CAPTURE" | tail -1)"
+
 # --- the Stop drain: oldest unanswered question, once each -------------------
 cp "$ROOT/stop-drain.sh" "$WORK/bin/stop-drain.sh"
 
@@ -294,6 +307,42 @@ assert "newer one" in ctx, ctx
 assert "reply_to: 11" in ctx, ctx
 ' 2>/dev/null && ok "the second question is not lost behind the first" \
     || bad "drain loses a queued question" "$out"
+
+# Antigravity (#229): its payload names the conversation `conversationId`,
+# and its Stop contract is {"decision": "continue", "reason": ...} with the
+# whole instruction in the reason; with nothing to say it gets `{}`.
+drain_agy() {
+    # $1 = messages array JSON, $2 = conversation id
+    cat > "$WORK/bin/bus-call.sh" <<FAKE
+#!/bin/sh
+if [ "\$1" = "whoami" ]; then
+    echo '{"result":{"structuredContent":{"agent":"joaquin","team":"layerv"}}}'
+else
+    cat <<'RESP'
+{"result":{"structuredContent":{"messages":$1}}}
+RESP
+fi
+FAKE
+    chmod +x "$WORK/bin/bus-call.sh"
+    printf '{"conversationId":"%s","terminationReason":"NO_TOOL_CALL"}' "$2" \
+        | TMPDIR="$WORK" BUS_URL=http://example.invalid/mcp BUS_TOKEN=acs_test \
+          sh "$WORK/bin/stop-drain.sh" 2>/dev/null
+}
+out="$(drain_agy "$ONE" agy-a)"
+printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["decision"] == "continue", d
+assert "is it green?" in d["reason"] and "reply_to: 9" in d["reason"], d
+assert "hookSpecificOutput" not in d, d
+' 2>/dev/null && ok "under Antigravity a pending question continues the loop with the instruction" \
+    || bad "antigravity stop drain" "$out"
+out="$(drain_agy "$ONE" agy-a)"
+[ "$out" = "{}" ] && ok "under Antigravity the loop guard answers {} the second time" \
+    || bad "antigravity drain loop guard" "$out"
+out="$(drain_agy "$NONE" agy-b)"
+[ "$out" = "{}" ] && ok "under Antigravity no question answers {}" \
+    || bad "antigravity drain quiet" "$out"
 
 # A question addressed to another window of the same person must not surface
 # here. `agent/session` narrows who a message is for, so it has to narrow who

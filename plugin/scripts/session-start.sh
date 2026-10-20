@@ -6,25 +6,21 @@ set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 command -v python3 >/dev/null 2>&1 || exit 0
 
-# Claude Code delivers the hook payload on stdin. Its session_id is this
-# conversation's id, and exporting it as BUS_HOST_SESSION is what makes every
-# hook of this window act on the same bus session as its `mcp proxy` — no
-# shared per-repository file, no "current session" value to race on.
-PAYLOAD="$(cat 2>/dev/null || true)"
-HOST_SESSION="$(PAYLOAD="$PAYLOAD" python3 -c 'import json,os,sys
-try:
-    v = json.loads(os.environ.get("PAYLOAD") or "{}").get("session_id")
-except Exception:
-    v = None
-sys.stdout.write(str(v) if v else "")' 2>/dev/null || true)"
+# The host delivers the hook payload on stdin. Its conversation id (Claude
+# Code's session_id, Antigravity's conversationId) is this conversation's id,
+# and exporting it as BUS_HOST_SESSION is what makes every hook of this
+# window act on the same bus session as its `mcp proxy` — no shared
+# per-repository file, no "current session" value to race on. HOOK_HOST says
+# which contract to answer in.
+. "$DIR/host-payload.sh"
 [ -n "$HOST_SESSION" ] && export BUS_HOST_SESSION="$HOST_SESSION"
 
 # Configured either way: local binary with profiles, or the legacy
 # BUS_URL/BUS_TOKEN pair. Neither present means this repository has no bus.
 if [ -z "${BUS_TOKEN:-}" ] && ! command -v ai-crew-sync >/dev/null 2>&1; then
-    exit 0
+    acs_quiet_exit
 fi
-[ -n "${BUS_TOKEN:-}" ] && [ -z "${BUS_URL:-}" ] && exit 0
+[ -n "${BUS_TOKEN:-}" ] && [ -z "${BUS_URL:-}" ] && acs_quiet_exit
 
 # Authenticated mode: this conversation's proxy registered a session, so the
 # helper acts as THAT window with its own credential. It prints the host's
@@ -34,9 +30,10 @@ if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
     STATE="$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)"
     case "$STATE" in
         *'"authenticated"'*)
-            ai-crew-sync context hook --binding "$HOST_SESSION" --event session_start \
-                --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true
-            exit 0
+            OUT="$(ai-crew-sync context hook --binding "$HOST_SESSION" --event session_start \
+                --host "$HOOK_HOST" --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true)"
+            [ -n "$OUT" ] && { printf '%s\n' "$OUT"; exit 0; }
+            acs_quiet_exit
             ;;
         *'"no-credential"'*)
             # A resumed conversation starts a new proxy while this hook runs:
@@ -57,9 +54,11 @@ if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
                 waited=$((waited + 1))
                 case "$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)" in
                     *'"authenticated"'*)
-                        ai-crew-sync context hook --binding "$HOST_SESSION" --event session_start \
-                            --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true
-                        exit 0
+                        OUT="$(ai-crew-sync context hook --binding "$HOST_SESSION" \
+                            --event session_start --host "$HOOK_HOST" \
+                            --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true)"
+                        [ -n "$OUT" ] && { printf '%s\n' "$OUT"; exit 0; }
+                        acs_quiet_exit
                         ;;
                 esac
             done
@@ -67,7 +66,7 @@ if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
             # Falling through would inject a digest read with the parent token
             # under a guessed label, which is the unproven identity this whole
             # path exists to avoid. Say so instead, and stay quiet on the bus.
-            printf '%s' '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"[ai-crew-sync] This conversation is bound to a bus session whose credential is gone (the window was closed, or its state file was removed). No bus context was loaded and nothing was published. Restart the conversation, or run `ai-crew-sync context hook --binding <session id> --event status` to see the binding."}}'
+            acs_context "[ai-crew-sync] This conversation is bound to a bus session whose credential is gone (the window was closed, or its state file was removed). No bus context was loaded and nothing was published. Restart the conversation, or run \`ai-crew-sync context hook --binding <session id> --event status\` to see the binding."
             exit 0
             ;;
     esac
@@ -81,7 +80,7 @@ fi
 WHO="$("$DIR/bus-call.sh" whoami 2>/dev/null || true)"
 case "$WHO" in
     *'"agent"'*) ;;
-    *) exit 0 ;;
+    *) acs_quiet_exit ;;
 esac
 
 # reset: a new session has not done anything yet, so the previous run's
@@ -103,10 +102,17 @@ SUGGESTED="$(git config --get remote.origin.url 2>/dev/null \
   | sed -e 's#\.git$##' -e 's#.*[:/][^/]*/##')"
 
 DIG="$("$DIR/bus-call.sh" team_digest "{\"hours\":$HOURS}" 2>/dev/null || true)"
-export WHO DIG BUS_DIGEST_HOURS="$HOURS" SUGGESTED BUS_SESSION="${BUS_SESSION:-}"
+export WHO DIG BUS_DIGEST_HOURS="$HOURS" SUGGESTED BUS_SESSION="${BUS_SESSION:-}" HOOK_HOST
 
 python3 - <<'PY' 2>/dev/null || true
 import json, os
+
+def quiet():
+    # Antigravity reads a JSON object from every hook; Claude Code wants
+    # nothing when there is nothing to say.
+    if os.environ.get("HOOK_HOST") == "antigravity":
+        print("{}")
+    raise SystemExit(0)
 
 def sc(raw):
     try:
@@ -117,7 +123,7 @@ def sc(raw):
 who = sc(os.environ.get("WHO", ""))
 dig = sc(os.environ.get("DIG", ""))
 if not who and not dig:
-    raise SystemExit(0)
+    quiet()
 
 lines = []
 if who:
@@ -176,11 +182,15 @@ lines.append(
     "window can see."
 )
 
-print(json.dumps({
-    "hookSpecificOutput": {
-        "hookEventName": "SessionStart",
-        "additionalContext": "\n".join(lines),
-    }
-}))
+text = "\n".join(lines)
+if os.environ.get("HOOK_HOST") == "antigravity":
+    print(json.dumps({"injectSteps": [{"systemMessage": {"systemMessage": text}}]}))
+else:
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": text,
+        }
+    }))
 PY
 exit 0

@@ -18652,3 +18652,86 @@ async fn proxy_binds_an_antigravity_conversation() {
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
 }
+
+/// Antigravity's hook contract end to end (#229): a window bound the way agy
+/// binds it (`_meta` conversation id), then the real plugin scripts fed
+/// Antigravity's payload. SessionStart answers `injectSteps` as that window,
+/// and the Stop drain continues the loop with the question to answer.
+#[tokio::test]
+async fn antigravity_hooks_answer_in_antigravitys_contract() {
+    let h = require_db!("t_antigravity_hooks");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let window = spawn_proxy(&dir, &repo, &[], &[]).await;
+    let mut params = CallToolRequestParams::new("session_status");
+    let mut m = rmcp::model::JsonObject::new();
+    m.insert(
+        "antigravity.google/conversation_id".into(),
+        json!("ag-hooks-1"),
+    );
+    params.meta = Some(rmcp::model::RequestMetaObject::from(m));
+    let status = window
+        .call_tool(params)
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(status["binding"], "antigravity", "{status}");
+    let address = status["address"].as_str().unwrap().to_owned();
+    let payload = json!({"conversationId": "ag-hooks-1", "modelName": "auto"}).to_string();
+
+    let out = run_hook("session-start.sh", &dir, &repo, &payload, &[]).await;
+    let v: Value = serde_json::from_str(out.trim()).expect("SessionStart printed JSON");
+    let text = v["injectSteps"][0]["systemMessage"]["systemMessage"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("agent 'joaquin'"), "{out}");
+    assert!(v.get("hookSpecificOutput").is_none(), "{out}");
+    assert!(
+        !out.contains("acss_") && !out.contains("acs_"),
+        "a credential leaked"
+    );
+
+    // A question for this window: the drain continues the loop with it.
+    call(
+        &marta,
+        "post_message",
+        json!({"to": address, "body": "can I deploy?", "metadata": {"question": true}}),
+    )
+    .await;
+    let stop =
+        json!({"conversationId": "ag-hooks-1", "terminationReason": "NO_TOOL_CALL"}).to_string();
+    let out = run_hook("stop-drain.sh", &dir, &repo, &stop, &[]).await;
+    let v: Value = serde_json::from_str(out.trim()).expect("Stop printed JSON");
+    assert_eq!(v["decision"], "continue", "{out}");
+    assert!(
+        v["reason"].as_str().unwrap().contains("can I deploy?"),
+        "{out}"
+    );
+    // Once per question.
+    let out = run_hook("stop-drain.sh", &dir, &repo, &stop, &[]).await;
+    assert_eq!(out.trim(), "{}", "{out}");
+    // The Stop heartbeat answers {} and reports the turn over.
+    let out = run_hook(
+        "heartbeat.sh",
+        &dir,
+        &repo,
+        &stop,
+        &["stop", "--from-payload"],
+    )
+    .await;
+    assert_eq!(out.trim(), "{}", "{out}");
+    assert_eq!(
+        session_entry(&marta, &address).await["attention"]["state"],
+        "idle"
+    );
+
+    let _ = marta.cancel().await;
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
