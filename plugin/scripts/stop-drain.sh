@@ -14,7 +14,10 @@
 # unreachable, or when the bus is not configured at all.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-command -v python3 >/dev/null 2>&1 || exit 0
+if ! command -v python3 >/dev/null 2>&1; then
+    [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ] && printf '{}\n'
+    exit 0
+fi
 
 # The host delivers the payload on stdin; its conversation id (Claude Code's
 # session_id, Antigravity's conversationId) keys both the loop guard and the
@@ -76,6 +79,21 @@ def quiet():
     if os.environ.get("HOOK_HOST") == "antigravity":
         print("{}")
     raise SystemExit(0)
+
+# An unexpected error still answers in the host's contract.
+import sys
+sys.excepthook = lambda *_: os.environ.get("HOOK_HOST") == "antigravity" and print("{}")
+
+# Antigravity also runs Stop when the user cancelled, on errors and at its
+# invocation limits. Only a turn that ended normally is held open: forcing
+# the loop on past a cancel is not this hook's call, and the question waits
+# for the next normal stop.
+try:
+    _reason = json.loads(os.environ.get("PAYLOAD") or "{}").get("terminationReason")
+except Exception:
+    _reason = None
+if os.environ.get("HOOK_HOST") == "antigravity" and _reason not in (None, "", "NO_TOOL_CALL"):
+    quiet()
 
 def sc(raw):
     try:

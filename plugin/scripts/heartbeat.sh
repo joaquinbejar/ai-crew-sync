@@ -45,6 +45,9 @@ RESET="${2:-}"
 HOOK_HOST=claude
 if [ "$RESET" = "--from-payload" ]; then
     RESET=""
+    # Without python3 the payload cannot be read; the environment still says
+    # whether Antigravity is asking.
+    [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ] && HOOK_HOST=antigravity
     if command -v python3 >/dev/null 2>&1; then
         . "$DIR/host-payload.sh"
         [ -z "${BUS_HOST_SESSION:-}" ] && [ -n "$HOST_SESSION" ] \

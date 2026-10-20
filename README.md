@@ -914,8 +914,13 @@ answers in that host's contract:
 - **SessionStart**: `{"injectSteps": [{"systemMessage": {"systemMessage": …}}]}`
   instead of `hookSpecificOutput`.
 - **Stop drain**: `{"decision": "continue", "reason": …}` with the whole
-  instruction in the reason, once per question, instead of `block`.
+  instruction in the reason, once per question, instead of `block`. Only
+  after a turn that ended normally (`terminationReason: NO_TOOL_CALL`): a
+  cancelled turn is never forced on, and its question waits for the next stop.
 - **Anything with nothing to say**: `{}`.
+
+Antigravity runs hooks from the plugin's directory, so the scripts move to
+the payload's first `workspacePaths` entry before reading repo and branch.
 
 `ai-crew-sync context hook --host antigravity` selects the format explicitly;
 without it the helper detects Antigravity by its environment variable.

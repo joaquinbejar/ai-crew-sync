@@ -942,8 +942,15 @@ responde en el contrato de ese host:
 - **SessionStart**: `{"injectSteps": [{"systemMessage": {"systemMessage": …}}]}`
   en vez de `hookSpecificOutput`.
 - **Drenaje en Stop**: `{"decision": "continue", "reason": …}` con toda la
-  instrucción en el motivo, una vez por pregunta, en vez de `block`.
+  instrucción en el motivo, una vez por pregunta, en vez de `block`. Solo tras
+  un turno que terminó con normalidad (`terminationReason: NO_TOOL_CALL`): un
+  turno cancelado nunca se fuerza a seguir, y su pregunta espera al siguiente
+  Stop.
 - **Cuando no hay nada que decir**: `{}`.
+
+Antigravity ejecuta los hooks desde el directorio del plugin, así que los
+scripts se mueven a la primera entrada de `workspacePaths` del payload antes
+de leer el repo y la rama.
 
 `ai-crew-sync context hook --host antigravity` elige el formato a mano; sin
 él, el ayudante detecta Antigravity por su variable de entorno. Verificado

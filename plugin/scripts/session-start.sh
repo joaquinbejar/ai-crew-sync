@@ -4,7 +4,12 @@
 # Always exits 0; produces no output when the bus is unreachable.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-command -v python3 >/dev/null 2>&1 || exit 0
+# Without python3 the payload cannot be read; under Antigravity, which reads
+# every hook's stdout as JSON, still answer an empty object.
+if ! command -v python3 >/dev/null 2>&1; then
+    [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ] && printf '{}\n'
+    exit 0
+fi
 
 # The host delivers the hook payload on stdin. Its conversation id (Claude
 # Code's session_id, Antigravity's conversationId) is this conversation's id,
@@ -14,6 +19,10 @@ command -v python3 >/dev/null 2>&1 || exit 0
 # which contract to answer in.
 . "$DIR/host-payload.sh"
 [ -n "$HOST_SESSION" ] && export BUS_HOST_SESSION="$HOST_SESSION"
+# Only Antigravity needs the flag: a Claude Code hook calls the helper
+# exactly as before, so an older binary on the PATH keeps working.
+HOST_FLAG=""
+[ "$HOOK_HOST" = antigravity ] && HOST_FLAG="--host antigravity"
 
 # Configured either way: local binary with profiles, or the legacy
 # BUS_URL/BUS_TOKEN pair. Neither present means this repository has no bus.
@@ -31,7 +40,7 @@ if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
     case "$STATE" in
         *'"authenticated"'*)
             OUT="$(ai-crew-sync context hook --binding "$HOST_SESSION" --event session_start \
-                --host "$HOOK_HOST" --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true)"
+                $HOST_FLAG --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true)"
             [ -n "$OUT" ] && { printf '%s\n' "$OUT"; exit 0; }
             acs_quiet_exit
             ;;
@@ -55,7 +64,7 @@ if [ -n "$HOST_SESSION" ] && command -v ai-crew-sync >/dev/null 2>&1; then
                 case "$(ai-crew-sync context hook --binding "$HOST_SESSION" --event status 2>/dev/null)" in
                     *'"authenticated"'*)
                         OUT="$(ai-crew-sync context hook --binding "$HOST_SESSION" \
-                            --event session_start --host "$HOOK_HOST" \
+                            --event session_start $HOST_FLAG \
                             --digest-hours "${BUS_DIGEST_HOURS:-8}" 2>/dev/null || true)"
                         [ -n "$OUT" ] && { printf '%s\n' "$OUT"; exit 0; }
                         acs_quiet_exit

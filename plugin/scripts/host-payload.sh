@@ -22,22 +22,30 @@ p = p if isinstance(p, dict) else {}
 
 def clean(v):
     v = str(v or "").strip()
-    # One line, or nothing: the id is used as a single shell word.
-    return v if v and "\n" not in v and "\r" not in v else ""
+    # One line, not an option, or nothing: the id is passed as one argument.
+    ok = v and "\n" not in v and "\r" not in v and not v.startswith("-")
+    return v if ok else ""
 
 if clean(p.get("conversationId")):
-    print("antigravity")
-    print(clean(p.get("conversationId")))
+    host, cid = "antigravity", clean(p.get("conversationId"))
 elif clean(p.get("session_id")):
-    print("claude")
-    print(clean(p.get("session_id")))
+    host, cid = "claude", clean(p.get("session_id"))
 else:
-    env = clean(os.environ.get("ANTIGRAVITY_CONVERSATION_ID"))
-    print("antigravity" if env else "claude")
-    print(env)
-' 2>/dev/null || printf 'claude\n\n')"
+    cid = clean(os.environ.get("ANTIGRAVITY_CONVERSATION_ID"))
+    host = "antigravity" if cid else "claude"
+# Antigravity runs hooks from the plugin directory; the workspace is in the
+# payload, and presence (repo, branch) has to describe it.
+roots = p.get("workspacePaths")
+workspace = clean(roots[0]) if isinstance(roots, list) and roots else ""
+# One write, so a failure cannot leave half an answer behind.
+print(f"{host}\n{cid}\n{workspace}")
+' 2>/dev/null || printf 'claude\n\n\n')"
 HOOK_HOST="$(printf '%s\n' "$_acs_ids" | sed -n 1p)"
 HOST_SESSION="$(printf '%s\n' "$_acs_ids" | sed -n 2p)"
+HOOK_WORKSPACE="$(printf '%s\n' "$_acs_ids" | sed -n 3p)"
+# The workspace the host is working in, when it says so and it exists: the
+# helper reads repo and branch from the current directory.
+[ -n "$HOOK_WORKSPACE" ] && [ -d "$HOOK_WORKSPACE" ] && cd "$HOOK_WORKSPACE"
 case "$HOOK_HOST" in
     antigravity) ;;
     *) HOOK_HOST=claude ;;

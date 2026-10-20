@@ -324,7 +324,7 @@ RESP
 fi
 FAKE
     chmod +x "$WORK/bin/bus-call.sh"
-    printf '{"conversationId":"%s","terminationReason":"NO_TOOL_CALL"}' "$2" \
+    printf '{"conversationId":"%s","terminationReason":"%s"}' "$2" "${3:-NO_TOOL_CALL}" \
         | TMPDIR="$WORK" BUS_URL=http://example.invalid/mcp BUS_TOKEN=acs_test \
           sh "$WORK/bin/stop-drain.sh" 2>/dev/null
 }
@@ -340,6 +340,15 @@ assert "hookSpecificOutput" not in d, d
 out="$(drain_agy "$ONE" agy-a)"
 [ "$out" = "{}" ] && ok "under Antigravity the loop guard answers {} the second time" \
     || bad "antigravity drain loop guard" "$out"
+# A cancelled turn is not forced on, and the question is not used up.
+out="$(drain_agy "$ONE" agy-c USER_CANCELED)"
+[ "$out" = "{}" ] && ok "under Antigravity a cancelled turn is not held open" \
+    || bad "antigravity drain on cancel" "$out"
+out="$(drain_agy "$ONE" agy-c)"
+case "$out" in
+    *'"continue"'*) ok "the question survives a cancel for the next normal stop" ;;
+    *) bad "antigravity drain after cancel" "$out" ;;
+esac
 out="$(drain_agy "$NONE" agy-b)"
 [ "$out" = "{}" ] && ok "under Antigravity no question answers {}" \
     || bad "antigravity drain quiet" "$out"
