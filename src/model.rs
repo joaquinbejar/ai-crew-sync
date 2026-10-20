@@ -545,7 +545,9 @@ pub struct RecipientState {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RecipientWindow {
-    /// What to put in `to` to reach exactly this window.
+    /// This window's address: `agent/session` reaches exactly it; a bare
+    /// `agent` is the shared window, and that address reaches every window
+    /// of theirs.
     pub address: String,
     pub online: bool,
     pub attention: SessionAttention,

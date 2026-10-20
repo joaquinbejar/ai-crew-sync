@@ -18457,6 +18457,29 @@ async fn a_timed_out_question_explains_the_recipients_state() {
     let s = r["suggestion"].as_str().unwrap();
     assert!(s.contains("reaches every window"), "{s}");
 
+    // Asking yourself as a person: the asking window is not a recipient,
+    // however attending it is.
+    let me = connect_with_session(&h.base, &token, "general").await;
+    call(&me, "heartbeat", json!({"attention": "attending"})).await;
+    call(&web, "heartbeat", json!({"attention": "idle"})).await;
+    call(&api, "heartbeat", json!({"attention": "idle"})).await;
+    let r = call(
+        &me,
+        "ask_agent",
+        json!({"to": "codex", "question": "anyone?", "timeout_seconds": 5}),
+    )
+    .await;
+    let addrs: Vec<String> = r["recipient"]["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["address"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(!addrs.contains(&"codex/general".to_owned()), "{r}");
+    let s = r["suggestion"].as_str().unwrap();
+    assert!(!s.contains("an answer may still come"), "{s}");
+    let _ = me.cancel().await;
+
     // An answer carries the recipient too.
     let answerer = tokio::spawn({
         let (base, token) = (h.base.clone(), token.clone());

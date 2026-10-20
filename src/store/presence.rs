@@ -71,9 +71,12 @@ pub fn attention_of(raw: &RawAttention, online: bool) -> SessionAttention {
 /// `session` narrows to one window (`agent/session`); `None` is the person,
 /// every window of theirs. Scoped by the caller's team through `agent_id`,
 /// which the caller resolved by name within its own team; exposes only what
-/// `list_sessions` already shows teammates.
+/// `list_sessions` already shows teammates. The asking window itself is left
+/// out: when you ask yourself as a person, the window blocked on the
+/// question is not one that can answer it.
 pub async fn recipient_state(
     pool: &PgPool,
+    auth: &AuthCtx,
     agent_id: uuid::Uuid,
     agent_name: &str,
     session: Option<&str>,
@@ -87,12 +90,15 @@ pub async fn recipient_state(
         FROM agent_presence p
         WHERE p.agent_id = $1
           AND ($2::text IS NULL OR p.session = $2)
+          AND NOT (p.agent_id = $3 AND p.session = $4)
         ORDER BY (p.expires_at > now()) DESC, p.updated_at DESC
         LIMIT 20
         "#,
     )
     .bind(agent_id)
     .bind(session)
+    .bind(auth.agent_id)
+    .bind(&auth.session)
     .fetch_all(pool)
     .await?;
     let windows = rows

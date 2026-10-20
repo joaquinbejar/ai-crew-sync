@@ -161,10 +161,12 @@ fn timeout_suggestion(
         "{to} has not answered within {timeout}s. Your question (message {question_id}) is \
          stored and stays in their inbox"
     );
-    let reach = match (recipient.routing.as_str(), recipient.windows.len()) {
-        ("agent", n) if n > 1 => format!(
-            " The bare name reaches every window of theirs ({n} known); ask one window \
-             (`agent/session`, see list_sessions) to know which will read it."
+    let live = recipient.windows.iter().filter(|w| w.online).count();
+    let reach = match recipient.routing.as_str() {
+        "agent" if live > 1 => format!(
+            " The bare name reaches every window of theirs ({live} connected); ask one \
+             window by its `agent/session` address (see list_sessions) to know which will \
+             read it."
         ),
         _ => String::new(),
     };
@@ -333,10 +335,6 @@ impl Bus {
         let (target_name, target_session) = messaging::parse_address(&to)?;
         let target_id = agent_id_by_name(&self.db, auth.team_id, &target_name).await?;
         // Asking another of your own sessions is the point of session
-        // addressing — a coordinating window handing work to the one with the
-        // repository open. Only asking *this* window is impossible: nothing
-        // would ever read the question, and the call would block until timeout.
-        // Asking another of your own sessions is the point of session
         // addressing. What cannot work is an address only *this* window can
         // read, because the call blocks until something answers it.
         if target_id == auth.agent_id {
@@ -421,6 +419,7 @@ impl Bus {
             {
                 let recipient = crate::store::presence::recipient_state(
                     &self.db,
+                    &auth,
                     target_id,
                     &target_name,
                     target_session.as_deref(),
@@ -479,6 +478,7 @@ impl Bus {
                 let answered = answer.is_some();
                 let recipient = crate::store::presence::recipient_state(
                     &self.db,
+                    &auth,
                     target_id,
                     &target_name,
                     target_session.as_deref(),
