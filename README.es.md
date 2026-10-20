@@ -540,6 +540,55 @@ Los hooks eligen una de tres vías por conversación, probadas en este orden:
 
 Ninguna de las tres configurada: los hooks no hacen nada, en silencio.
 
+### Opción C (Google Antigravity): plugin
+
+El mismo directorio `plugin/` es también un plugin de Antigravity, que lee
+allí sus propios ficheros:
+
+- `plugin.json`: el manifiesto;
+- `mcp_config.json`: arranca `ai-crew-sync mcp proxy`, sin credencial;
+- el `hooks.json` de la raíz: SessionStart y Stop, con timeouts en segundos;
+- `skills/ai-crew-sync/`: la skill de convenciones, más una referencia por
+  procedimiento, generada desde `recipes/`.
+
+Claude Code sigue leyendo `.claude-plugin/`, `.mcp.json`, `hooks/hooks.json`
+y `commands/`. Ningún host carga los ficheros del otro.
+
+```bash
+brew install joaquinbejar/tap/ai-crew-sync   # el binario, como para Claude Code
+ai-crew-sync context profile add --name acme --default \
+    --url https://bus.your-company.com:8443 --team roundcrew --agent backend-agy
+git clone https://github.com/joaquinbejar/ai-crew-sync
+agy plugin install ai-crew-sync/plugin       # o cópialo a <workspace>/.agents/plugins/
+```
+
+Dale a Antigravity su propio agente, como a cualquier otra herramienta (ver
+«Un agente por herramienta»). Lo verificado con `agy` 1.4.3:
+
+- **Instalación.** `agy plugin install` instala el servidor MCP, los hooks y
+  la skill con sus referencias de procedimientos.
+- **Identidad de la conversación.** Cada conversación vincula su propia
+  sesión con el id que Antigravity manda en cada llamada a una herramienta
+  (`binding: antigravity` en `session_status`).
+- **SessionStart.** Inyecta la identidad de la ventana y el resumen del
+  equipo.
+- **Stop.** Mantiene el bucle para responder una pregunta que espera.
+
+Antigravity no tiene hooks en segundo plano, así que una conversación
+inactiva no se despierta.
+
+**Valores del proyecto con una instalación global.** Un plugin instalado con
+`agy plugin install` arranca el proxy en el directorio del plugin, no en tu
+workspace, así que no encuentra el `.acs.toml` del workspace. Fija un perfil
+por defecto (`--default` arriba). Otra opción es instalar el plugin por
+workspace en `<workspace>/.agents/plugins/ai-crew-sync`, donde sí se
+encuentra el `.acs.toml`. La issue #236 sigue el trabajo de encontrar el
+workspace mediante los roots de MCP.
+
+Sin el plugin, registra el servidor en `~/.gemini/config/mcp_config.json` (ver
+`examples/antigravity-mcp_config.json`). `ai-crew-sync proxy-config` imprime
+el mismo bloque `mcpServers`. Así tienes las herramientas, no los hooks.
+
 ### Opción B (cualquier cliente MCP): configuración manual
 
 Dos formas, y la diferencia es qué prueba qué ventana está llamando.
@@ -574,7 +623,8 @@ etiquetas y el perfil con los que arranca la ventana, por encima de
 }
 ```
 
-Listos para copiar: `examples/.mcp.json` y `examples/codex-config.toml`.
+Listos para copiar: `examples/.mcp.json`, `examples/codex-config.toml` y
+`examples/antigravity-mcp_config.json`.
 
 **HTTP directo.** No necesita binario, y el bus es Streamable HTTP pelado con
 un Bearer token — es lo que usa un script, un job de CI o un cliente MCP al
@@ -2134,7 +2184,9 @@ src/
 migrations/      esquema sqlx (se aplica solo al arrancar)
 recipes/         16 procedimientos independientes del host: el origen de plugin/commands
                  (`make recipes`; si se apartan, falla `make check`) y de `ai-crew-sync recipes`
-plugin/          plugin de Claude Code (MCP + hooks + comandos + skill)
+plugin/          plugin de Claude Code y Antigravity (MCP + hooks + comandos + skill);
+                 Antigravity lee plugin.json, mcp_config.json, hooks.json y
+                 skills/ai-crew-sync/references/ (generadas desde recipes/)
   .claude-plugin/plugin.json
   .mcp.json      arranca `ai-crew-sync mcp proxy`; no lleva credencial
   hooks/         SessionStart (catch-up + heartbeat), UserPromptSubmit, Stop y SessionEnd
@@ -2144,7 +2196,8 @@ plugin/          plugin de Claude Code (MCP + hooks + comandos + skill)
                  claim|done|handoff|board|who|lock|unlock|note|wait|thread|inbox|review
   skills/        convenciones de coordinación
 tests/           la suite de integración (servidor real, Postgres y NATS)
-examples/        .mcp.json, .mcp.http.json, codex-config.toml, snippet de CLAUDE.md
+examples/        .mcp.json, .mcp.http.json, codex-config.toml,
+                 antigravity-mcp_config.json, snippet de CLAUDE.md
 packaging/       unidad systemd y fichero de entorno para el .deb/.rpm
 docs/            ADRs, guías de operación, scripts de aceptación
 Docker/          Dockerfile + el único compose (imagen publicada, build local, apto Swarm)

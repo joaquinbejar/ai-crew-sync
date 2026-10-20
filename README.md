@@ -521,6 +521,52 @@ The hooks pick one of three paths per conversation, tried in this order:
 
 None configured means the hooks do nothing at all, silently.
 
+### Option C (Google Antigravity): plugin
+
+The same `plugin/` directory is also an Antigravity plugin. Antigravity reads
+its own files there:
+
+- `plugin.json`: the manifest;
+- `mcp_config.json`: starts `ai-crew-sync mcp proxy`, with no credential;
+- the root `hooks.json`: SessionStart and Stop, with timeouts in seconds;
+- `skills/ai-crew-sync/`: the conventions skill, plus one reference per
+  procedure, generated from `recipes/`.
+
+Claude Code keeps reading `.claude-plugin/`, `.mcp.json`, `hooks/hooks.json`
+and `commands/`. Neither host loads the other's files.
+
+```bash
+brew install joaquinbejar/tap/ai-crew-sync   # the binary, as for Claude Code
+ai-crew-sync context profile add --name acme --default \
+    --url https://bus.your-company.com:8443 --team roundcrew --agent backend-agy
+git clone https://github.com/joaquinbejar/ai-crew-sync
+agy plugin install ai-crew-sync/plugin       # or copy it to <workspace>/.agents/plugins/
+```
+
+Give Antigravity its own agent, as for any other tool (see "One agent per
+tool"). What was verified with `agy` 1.4.3:
+
+- **Install.** `agy plugin install` installs the MCP server, the hooks and
+  the skill with its procedure references.
+- **Conversation identity.** Each conversation binds its own session from
+  the id Antigravity sends on every tool call (`binding: antigravity` in
+  `session_status`).
+- **SessionStart.** It injects the window's identity and the team catch-up.
+- **Stop.** It keeps the loop going to answer a waiting question.
+
+Antigravity has no background hooks, so an idle conversation is not woken.
+
+**Project defaults with a global install.** A plugin installed with
+`agy plugin install` starts the proxy in the plugin's directory, not in your
+workspace, so the workspace's `.acs.toml` is not found. Set a user default
+profile (`--default` above). Alternatively, install the plugin per workspace
+under `<workspace>/.agents/plugins/ai-crew-sync`, where `.acs.toml` is found.
+Issue #236 tracks finding the workspace through MCP roots.
+
+Without the plugin, register the server in `~/.gemini/config/mcp_config.json`
+(see `examples/antigravity-mcp_config.json`). `ai-crew-sync proxy-config`
+prints the same `mcpServers` block. This gives the tools, not the hooks.
+
 ### Option B (any MCP client): manual configuration
 
 Two shapes, and the difference is what proves which window is calling.
@@ -555,7 +601,8 @@ starting labels and profile, over `.acs.toml` and the user default) plus
 }
 ```
 
-Ready to copy: `examples/.mcp.json` and `examples/codex-config.toml`.
+Ready to copy: `examples/.mcp.json`, `examples/codex-config.toml` and
+`examples/antigravity-mcp_config.json`.
 
 **Direct HTTP.** No binary needed, and the bus is plain Streamable HTTP with a
 Bearer token — this is what a script, a CI job or an MCP client you cannot
@@ -2076,7 +2123,9 @@ src/
 migrations/      sqlx schema (applied automatically on startup)
 recipes/         16 host-neutral procedures: the source of plugin/commands
                  (`make recipes`; drift fails `make check`) and of `ai-crew-sync recipes`
-plugin/          Claude Code plugin (MCP + hooks + commands + skill)
+plugin/          Claude Code and Antigravity plugin (MCP + hooks + commands + skill);
+                 Antigravity reads plugin.json, mcp_config.json, hooks.json and
+                 skills/ai-crew-sync/references/ (generated from recipes/)
   .claude-plugin/plugin.json
   .mcp.json      starts `ai-crew-sync mcp proxy`; carries no credential
   hooks/         SessionStart (catch-up + heartbeat), UserPromptSubmit, Stop and SessionEnd
@@ -2086,7 +2135,8 @@ plugin/          Claude Code plugin (MCP + hooks + commands + skill)
                  claim|done|handoff|board|who|lock|unlock|note|wait|thread|inbox|review
   skills/        coordination conventions
 tests/           the integration suite (real server, Postgres and NATS)
-examples/        .mcp.json, .mcp.http.json, codex-config.toml, CLAUDE.md snippet
+examples/        .mcp.json, .mcp.http.json, codex-config.toml,
+                 antigravity-mcp_config.json, CLAUDE.md snippet
 packaging/       systemd unit and environment file for the .deb/.rpm
 docs/            ADRs, operations guides, acceptance scripts
 Docker/          Dockerfile + the one compose file (published image, local build, Swarm-ready)

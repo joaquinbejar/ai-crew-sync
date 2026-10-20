@@ -693,5 +693,45 @@ if [ -d "$SRC" ]; then
         || bad "tools exist server-side" "missing:$missing"
 fi
 
+# --- both hosts' hook files point at scripts that exist (#230) -----------
+# Claude Code reads hooks/hooks.json (timeouts in ms, ${CLAUDE_PLUGIN_ROOT}
+# paths); Antigravity reads the root hooks.json (named groups, timeouts in
+# seconds, commands run from the plugin root). A typo in either is a hook
+# that silently never runs.
+PLUGIN_DIR="$(cd "$ROOT/.." && pwd)"
+PLUGIN_DIR="$PLUGIN_DIR" python3 - <<'PY' 2>/dev/null && ok "both hosts' hooks files name existing executable scripts" \
+    || bad "hook files" "a hook names a missing script or a bad timeout"
+import json, os, shlex
+root = os.environ["PLUGIN_DIR"]
+
+def scripts_of(command):
+    for word in shlex.split(command):
+        word = word.replace('"${CLAUDE_PLUGIN_ROOT}"', root).replace("${CLAUDE_PLUGIN_ROOT}", root)
+        if word.endswith(".sh"):
+            yield word if os.path.isabs(word) else os.path.join(root, word)
+
+claude = json.load(open(os.path.join(root, "hooks", "hooks.json")))["hooks"]
+for groups in claude.values():
+    for g in groups:
+        for h in g["hooks"]:
+            assert h["timeout"] >= 1000, h  # milliseconds
+            for path in scripts_of(h["command"]):
+                assert os.access(path, os.X_OK), path
+
+agy = json.load(open(os.path.join(root, "hooks.json")))
+assert set(agy) == {"ai-crew-sync"}, agy.keys()
+for event, handlers in agy["ai-crew-sync"].items():
+    assert event in {"SessionStart", "PreToolUse", "PostToolUse", "PreInvocation",
+                     "PostInvocation", "Stop"}, event
+    for h in handlers:
+        assert 1 <= h["timeout"] <= 60, h  # seconds
+        assert h["command"].startswith("./scripts/"), h
+        for path in scripts_of(h["command"]):
+            assert os.access(path, os.X_OK), path
+
+mcp = json.load(open(os.path.join(root, "mcp_config.json")))["mcpServers"]["ai-crew-sync"]
+assert mcp == {"command": "ai-crew-sync", "args": ["mcp", "proxy"]}, mcp
+PY
+
 [ "$FAIL" -eq 0 ] && echo "plugin hooks: clean" || echo "plugin hooks: FAILURES"
 exit "$FAIL"

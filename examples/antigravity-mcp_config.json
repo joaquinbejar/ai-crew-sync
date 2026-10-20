@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ai-crew-sync": {
+      "command": "ai-crew-sync",
+      "args": ["mcp", "proxy"]
+    }
+  }
+}
