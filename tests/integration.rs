@@ -16976,3 +16976,466 @@ async fn verify_failure_names_url_and_credential_provenance() {
 
     h.shutdown().await;
 }
+
+// ------------------------------------------------------ wait scopes (#223) --
+
+/// A wait on the inbox watches what `read_messages {"scope": "inbox"}`
+/// drains (#223). Unread channel chatter used to return every wait at once
+/// while the inbox was empty, so a window that only reads its inbox spun
+/// through waits that reported a backlog it never consumes.
+#[tokio::test]
+async fn an_inbox_wait_ignores_channel_backlog_and_wakes_on_a_direct_message() {
+    let h = require_db!("t_wait_scope_inbox");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let joaquin = connect_with_session(&h.base, &token, "api").await;
+    call(&marta, "create_channel", json!({"name": "dev"})).await;
+    for i in 0..3 {
+        call(
+            &marta,
+            "post_message",
+            json!({"channel": "dev", "body": format!("chatter {i}")}),
+        )
+        .await;
+    }
+
+    // The default scope reports the channel backlog at once, as before.
+    let all = call(&joaquin, "wait_for_updates", json!({"timeout_seconds": 5})).await;
+    assert_eq!(all["woke"], true, "{all}");
+    assert_eq!(all["message_scope"], "all", "{all}");
+    assert_eq!(all["unread_in_scope"], 3, "{all}");
+
+    // The inbox is empty: an inbox wait blocks, and a direct message to a
+    // sibling window does not wake it either.
+    let waiter = {
+        let (base, token) = (h.base.clone(), token.clone());
+        tokio::spawn(async move {
+            let client = connect_with_session(&base, &token, "api").await;
+            let started = std::time::Instant::now();
+            let r = call(
+                &client,
+                "wait_for_updates",
+                json!({"timeout_seconds": 20, "scope": "inbox", "kinds": ["message"]}),
+            )
+            .await;
+            let _ = client.cancel().await;
+            (r, started.elapsed())
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    call(
+        &marta,
+        "post_message",
+        json!({"to": "joaquin/web", "body": "for the other window"}),
+    )
+    .await;
+    call(
+        &marta,
+        "post_message",
+        json!({"channel": "dev", "body": "more chatter"}),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(
+        !waiter.is_finished(),
+        "channel or sibling traffic woke an inbox wait"
+    );
+    call(
+        &marta,
+        "post_message",
+        json!({"to": "joaquin", "body": "are you there?"}),
+    )
+    .await;
+
+    let (woke, elapsed) = waiter.await.unwrap();
+    assert_eq!(woke["woke"], true, "{woke}");
+    assert!(
+        elapsed.as_secs() < 10,
+        "woke by timeout, not by the DM: {woke}"
+    );
+    assert_eq!(woke["message_scope"], "inbox", "{woke}");
+    assert_eq!(woke["unread_in_scope"], 1, "{woke}");
+    assert!(
+        woke["read_with"].as_str().unwrap().contains("\"inbox\""),
+        "{woke}"
+    );
+    assert!(
+        woke["events"].to_string().contains("are you there?"),
+        "{woke}"
+    );
+    assert!(!woke["events"].to_string().contains("chatter"), "{woke}");
+
+    // A wait never moves a cursor: the channel backlog is still unread, and
+    // reading the inbox drains only the inbox.
+    let inbox = call(&joaquin, "read_messages", json!({"scope": "inbox"})).await;
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1, "{inbox}");
+    let dev = call(&joaquin, "read_messages", json!({"scope": "dev"})).await;
+    assert_eq!(dev["messages"].as_array().unwrap().len(), 4, "{dev}");
+
+    // Drained: the next inbox wait times out instead of reporting it again.
+    let quiet = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 5, "scope": "inbox", "kinds": ["message"]}),
+    )
+    .await;
+    assert_eq!(quiet["timed_out"], true, "{quiet}");
+    assert_eq!(quiet["unread_in_scope"], 0, "{quiet}");
+
+    for c in [joaquin, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A message that committed before the wait started is reported at once,
+/// not lost: the backlog check reads the same cursor the inbox read moves.
+#[tokio::test]
+async fn an_inbox_wait_reports_a_direct_message_that_arrived_before_it() {
+    let h = require_db!("t_wait_scope_before");
+    let joaquin = connect(&h.base, &seed_agent(&h.pool, "acme", "joaquin").await).await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    call(
+        &marta,
+        "post_message",
+        json!({"to": "joaquin", "body": "sent before you waited"}),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let r = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 20, "scope": "inbox"}),
+    )
+    .await;
+    assert!(started.elapsed().as_secs() < 5, "{r}");
+    assert_eq!(r["woke"], true, "{r}");
+    assert_eq!(r["unread_in_scope"], 1, "{r}");
+    for c in [joaquin, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// A channel scope wakes on that channel only: not on another channel, not
+/// on a direct message, and never on another team's channel of the same name.
+#[tokio::test]
+async fn a_channel_wait_wakes_on_that_channel_only() {
+    let h = require_db!("t_wait_scope_channel");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let eve = connect(&h.base, &seed_agent(&h.pool, "other", "eve").await).await;
+    for name in ["dev", "ops"] {
+        call(&marta, "create_channel", json!({"name": name})).await;
+    }
+    call(&eve, "create_channel", json!({"name": "dev"})).await;
+
+    let waiter = {
+        let (base, token) = (h.base.clone(), token.clone());
+        tokio::spawn(async move {
+            let client = connect(&base, &token).await;
+            let r = call(
+                &client,
+                "wait_for_updates",
+                json!({"timeout_seconds": 20, "scope": "dev", "kinds": ["message"]}),
+            )
+            .await;
+            let _ = client.cancel().await;
+            r
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    call(
+        &marta,
+        "post_message",
+        json!({"channel": "ops", "body": "ops news"}),
+    )
+    .await;
+    call(
+        &marta,
+        "post_message",
+        json!({"to": "joaquin", "body": "a DM"}),
+    )
+    .await;
+    call(
+        &eve,
+        "post_message",
+        json!({"channel": "dev", "body": "other team"}),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(
+        !waiter.is_finished(),
+        "a message outside #dev woke the wait"
+    );
+    call(
+        &marta,
+        "post_message",
+        json!({"channel": "dev", "body": "dev news"}),
+    )
+    .await;
+
+    let woke = waiter.await.unwrap();
+    assert_eq!(woke["woke"], true, "{woke}");
+    assert_eq!(woke["message_scope"], "#dev", "{woke}");
+    let text = woke["events"].to_string();
+    assert!(text.contains("dev news"), "{woke}");
+    assert!(
+        !text.contains("ops news") && !text.contains("other team"),
+        "{woke}"
+    );
+    // The direct message is still reported, as a count, for what to do next.
+    assert_eq!(woke["unread_direct_messages"], 1, "{woke}");
+
+    // An unknown channel is an error the caller can act on.
+    let joaquin = connect(&h.base, &token).await;
+    let err = call_expect_error(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 5, "scope": "nope"}),
+    )
+    .await;
+    assert!(err.contains("list_channels"), "{err}");
+
+    for c in [joaquin, marta, eve] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Pending questions are their own state (#223): reading a question does
+/// not answer it, and a reply does.
+#[tokio::test]
+async fn pending_questions_survive_a_read_and_clear_on_a_reply() {
+    let h = require_db!("t_wait_pending_questions");
+    let joaquin = connect(&h.base, &seed_agent(&h.pool, "acme", "joaquin").await).await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let asked = call(
+        &marta,
+        "post_message",
+        json!({"to": "joaquin", "body": "can I deploy?", "metadata": {"question": true}}),
+    )
+    .await;
+    let question_id = asked["message"]["id"].as_i64().unwrap();
+    call(
+        &marta,
+        "post_message",
+        json!({"to": "joaquin", "body": "fyi only"}),
+    )
+    .await;
+
+    let first = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 5, "scope": "inbox"}),
+    )
+    .await;
+    assert_eq!(first["pending_questions"], 1, "{first}");
+
+    call(&joaquin, "read_messages", json!({"scope": "inbox"})).await;
+    let read = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 5, "scope": "inbox", "kinds": ["message"]}),
+    )
+    .await;
+    assert_eq!(
+        read["timed_out"], true,
+        "a pending question woke the wait: {read}"
+    );
+    assert_eq!(read["pending_questions"], 1, "reading answered it: {read}");
+
+    call(
+        &joaquin,
+        "post_message",
+        json!({"to": "marta", "body": "yes", "reply_to": question_id}),
+    )
+    .await;
+    let answered = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 5, "scope": "inbox", "kinds": ["message"]}),
+    )
+    .await;
+    assert_eq!(answered["pending_questions"], 0, "{answered}");
+
+    for c in [joaquin, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Through the proxy, a long inbox wait keeps its scope from slice to slice:
+/// channel backlog does not end it early, and a direct message after the
+/// first slice still wakes it (#223).
+#[tokio::test]
+async fn a_long_inbox_wait_through_the_proxy_keeps_its_scope_across_slices() {
+    let h = require_db!("t_long_wait_scope");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta_token = seed_agent(&h.pool, "acme", "marta").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let window = spawn_proxy(&dir, &repo, &[], &[]).await;
+    let address = call(&window, "session_status", json!({})).await["address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let marta = connect(&h.base, &marta_token).await;
+    call(&marta, "create_channel", json!({"name": "dev"})).await;
+    call(
+        &marta,
+        "post_message",
+        json!({"channel": "dev", "body": "backlog"}),
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    let post = async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        call(
+            &marta,
+            "post_message",
+            json!({"channel": "dev", "body": "noise"}),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        call(
+            &marta,
+            "post_message",
+            json!({"to": address, "body": "now"}),
+        )
+        .await;
+    };
+    let wait = call(
+        &window,
+        "wait_for_updates",
+        json!({"timeout_seconds": 150, "scope": "inbox", "kinds": ["message"]}),
+    );
+    let (waited, ()) = tokio::join!(wait, post);
+    let elapsed = started.elapsed().as_secs();
+    assert_eq!(waited["woke"], true, "{waited}");
+    assert!(
+        (60..140).contains(&elapsed),
+        "woke after {elapsed}s; channel backlog must not end an inbox wait: {waited}"
+    );
+    assert_eq!(waited["message_scope"], "inbox", "{waited}");
+
+    let _ = marta.cancel().await;
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// Another window of yours writing to a teammate is visible to you, but it
+/// is nothing for you to read: it must not wake a wait whose backlog count
+/// would then report nothing (#223 review).
+#[tokio::test]
+async fn a_sibling_windows_outgoing_message_does_not_wake_a_wait() {
+    let h = require_db!("t_wait_sibling_outgoing");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    seed_agent(&h.pool, "acme", "marta").await;
+    let web = connect_with_session(&h.base, &token, "web").await;
+    let waiter = {
+        let (base, token) = (h.base.clone(), token.clone());
+        tokio::spawn(async move {
+            let api = connect_with_session(&base, &token, "api").await;
+            let r = call(
+                &api,
+                "wait_for_updates",
+                json!({"timeout_seconds": 5, "kinds": ["message"]}),
+            )
+            .await;
+            let _ = api.cancel().await;
+            r
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    call(
+        &web,
+        "post_message",
+        json!({"to": "marta", "body": "from my other window"}),
+    )
+    .await;
+    let r = waiter.await.unwrap();
+    assert_eq!(r["timed_out"], true, "{r}");
+    let _ = web.cancel().await;
+    h.shutdown().await;
+}
+
+/// A direct message between two other windows of the same agent is not for
+/// this window: it must not wake an inbox wait (#226 review).
+#[tokio::test]
+async fn a_dm_between_two_other_windows_does_not_wake_an_inbox_wait() {
+    let h = require_db!("t_wait_inbox_siblings");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let general = connect_with_session(&h.base, &token, "general").await;
+    let waiter = {
+        let (base, token) = (h.base.clone(), token.clone());
+        tokio::spawn(async move {
+            let api = connect_with_session(&base, &token, "api").await;
+            let r = call(
+                &api,
+                "wait_for_updates",
+                json!({"timeout_seconds": 5, "scope": "inbox", "kinds": ["message"]}),
+            )
+            .await;
+            let _ = api.cancel().await;
+            r
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    call(
+        &general,
+        "post_message",
+        json!({"to": "joaquin/web", "body": "for the web window only"}),
+    )
+    .await;
+    let r = waiter.await.unwrap();
+    assert_eq!(r["timed_out"], true, "{r}");
+    assert_eq!(r["unread_in_scope"], 0, "{r}");
+    let _ = general.cancel().await;
+    h.shutdown().await;
+}
+
+/// A channel named like a scope keyword is read back with its '#', and
+/// following `read_with` drains exactly what the wait reported (#226 review).
+#[tokio::test]
+async fn read_with_names_a_keyword_channel_unambiguously() {
+    let h = require_db!("t_wait_keyword_channel");
+    let joaquin = connect(&h.base, &seed_agent(&h.pool, "acme", "joaquin").await).await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    call(&marta, "create_channel", json!({"name": "inbox"})).await;
+    call(
+        &marta,
+        "post_message",
+        json!({"channel": "inbox", "body": "in the channel"}),
+    )
+    .await;
+    let r = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 5, "scope": "#inbox", "kinds": ["message"]}),
+    )
+    .await;
+    assert_eq!(r["message_scope"], "#inbox", "{r}");
+    assert_eq!(r["unread_in_scope"], 1, "{r}");
+    let read_with = r["read_with"].as_str().unwrap();
+    assert!(read_with.contains("\"#inbox\""), "{read_with}");
+    // Follow it literally.
+    let args: Value = serde_json::from_str(read_with.trim_start_matches("read_messages ")).unwrap();
+    let read = call(&joaquin, "read_messages", args).await;
+    assert_eq!(read["messages"].as_array().unwrap().len(), 1, "{read}");
+    let again = call(
+        &joaquin,
+        "wait_for_updates",
+        json!({"timeout_seconds": 5, "scope": "#inbox", "kinds": ["message"]}),
+    )
+    .await;
+    assert_eq!(again["timed_out"], true, "{again}");
+    for c in [joaquin, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}

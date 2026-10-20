@@ -14,6 +14,7 @@ use crate::{
     auth::AuthCtx,
     events::BusEvent,
     model::{WaitEvent, WaitResult},
+    store::messaging::{self, Scope},
 };
 
 const DEFAULT_TIMEOUT_SECS: i64 = 25;
@@ -43,6 +44,16 @@ pub struct WaitArgs {
     /// never loses what happened between two calls. Omit on a first wait.
     #[serde(default)]
     pub since: Option<String>,
+    /// Which messages to wait for, with the same values and the same read
+    /// cursor as `read_messages`: "all" (the default), "inbox" (direct
+    /// messages to this session or to you), or a channel name. With "all",
+    /// channel chatter is still narrowed to this session's channel unless
+    /// `all_channels` is set. Use the scope
+    /// you will read with: a wait on "inbox" ignores unread channel chatter,
+    /// which a default wait reports at once. Only messages are narrowed;
+    /// tasks, locks and notes still wake you unless `kinds` leaves them out.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 async fn unread_dms(pool: &PgPool, auth: &AuthCtx) -> Result<i64, sqlx::Error> {
@@ -69,38 +80,30 @@ async fn unread_dms(pool: &PgPool, auth: &AuthCtx) -> Result<i64, sqlx::Error> {
     .await
 }
 
-async fn unread_anything(
-    pool: &PgPool,
-    auth: &AuthCtx,
-    focus: Option<Uuid>,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(
-        r#"
-        SELECT count(*)
-        FROM messages m
-        LEFT JOIN read_cursors c ON c.agent_id = $1 AND c.scope = $4
-        WHERE m.team_id = $2
-          AND m.id > COALESCE(c.last_message_id, 0)
-          -- Same rule as the wake filter: only this session's own messages
-          -- are excluded, so a sibling window's announcement still counts.
-          AND NOT (m.sender_agent_id = $1 AND COALESCE(m.sender_session, '') = $3)
-          AND ((m.channel_id IS NOT NULL
-                -- Same rule as the wake filter: an announcement counts as
-                -- pending whatever this session is focused on. Reporting a
-                -- backlog the wait would not wake for is a lie the caller
-                -- cannot act on.
-                AND ($5::uuid IS NULL OR m.channel_id = $5 OR m.announce))
-               OR (m.recipient_agent_id = $1
-                   AND (m.recipient_session IS NULL OR m.recipient_session = $3)))
-        "#,
-    )
-    .bind(auth.agent_id)
-    .bind(auth.team_id)
-    .bind(&auth.session)
-    .bind(crate::store::messaging::cursor_scope("all", &auth.session))
-    .bind(focus)
-    .fetch_one(pool)
-    .await
+/// Does this message event belong to the scope the wait watches? The same
+/// sets `read_messages` reads, so what wakes the wait is what the matching
+/// read returns.
+fn in_scope(event: &BusEvent, scope: &Scope, focus: Option<Uuid>, auth: &AuthCtx) -> bool {
+    match scope {
+        // A direct message counts only when it is for this window: the
+        // same rule as the backlog count and the inbox read.
+        Scope::All => {
+            (!event.is_direct_message() || for_this_window(event, auth)) && in_focus(event, focus)
+        }
+        Scope::Inbox => event.is_direct_message() && for_this_window(event, auth),
+        Scope::Channel { id, .. } => event.channel_id() == Some(*id),
+    }
+}
+
+/// A direct message addressed to this window, or to the person. `visible_to`
+/// also lets through every message this agent *sent*, so a message between
+/// two other windows of yours (general to web) would otherwise wake a third
+/// window's inbox wait that has nothing to read (#226 review).
+fn for_this_window(event: &BusEvent, auth: &AuthCtx) -> bool {
+    event.recipient_agent_id() == Some(auth.agent_id)
+        && event
+            .recipient_session()
+            .is_none_or(|addressed| addressed == auth.session)
 }
 
 /// Is this event inside the session's channel focus?
@@ -205,9 +208,11 @@ async fn describe(pool: &PgPool, event: &BusEvent) -> Option<WaitEvent> {
     }
 }
 
-fn suggestion_for(events: &[WaitEvent], unread: i64) -> String {
-    if events.iter().any(|e| e.kind == "message") || unread > 0 {
-        "Call read_messages to fetch the new messages.".into()
+fn suggestion_for(events: &[WaitEvent], unread: i64, in_scope: i64, read_with: &str) -> String {
+    if events.iter().any(|e| e.kind == "message") || in_scope > 0 {
+        format!("Call {read_with} to fetch the new messages.")
+    } else if unread > 0 {
+        "Call read_messages {\"scope\": \"inbox\"} to fetch your unread direct messages.".into()
     } else if events.iter().any(|e| e.kind == "task") {
         "Call list_tasks (or get_task) to see what changed.".into()
     } else if events.iter().any(|e| e.kind == "lock") {
@@ -349,11 +354,17 @@ impl Bus {
         // has not asked for the whole team. A window working on market-data
         // should not be woken by core-manager chatter — that is half the point
         // of naming a session after a repository.
-        let focus = match args.all_channels {
-            true => None,
-            false => crate::store::messaging::default_channel(&self.db, &auth)
+        // Which messages wake this wait, resolved like read_messages' scope.
+        let scope = match args.scope.as_deref() {
+            Some(raw) => messaging::resolve_scope(&self.db, &auth, raw).await?,
+            None => Scope::All,
+        };
+        let focus = match (&scope, args.all_channels) {
+            (Scope::All, false) => messaging::default_channel(&self.db, &auth)
                 .await?
                 .map(|(id, _)| id),
+            // An explicit scope is already narrower than any focus.
+            _ => None,
         };
 
         if args
@@ -388,29 +399,23 @@ impl Bus {
 
         // Same rule as the wake filter below: reporting a backlog the wait
         // would not have woken for is a lie the caller cannot act on.
-        let pending = unread_anything(&self.db, &auth, focus).await.map_err(|e| {
-            tracing::error!(error = %e, "unread check failed");
-            ErrorData::internal_error("database error", None)
-        })?;
+        let pending = messaging::unread_in_scope(&self.db, &auth, &scope, focus).await?;
         if pending > 0 && wants("message") {
             events.insert(
                 0,
                 WaitEvent {
                     kind: "message".into(),
-                    summary: format!("{pending} unread message(s) already waiting"),
+                    summary: format!(
+                        "{pending} unread message(s) already waiting in {}",
+                        scope.label()
+                    ),
                 },
             );
         }
         if !events.is_empty() {
-            let dms = unread_dms(&self.db, &auth).await.unwrap_or(0);
-            return Ok(Json(WaitResult {
-                woke: true,
-                timed_out: false,
-                suggestion: suggestion_for(&events, dms),
-                events,
-                unread_direct_messages: dms,
-                resume_from: position,
-            }));
+            return self
+                .wait_result(&auth, &scope, focus, events, position)
+                .await;
         }
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64);
@@ -440,7 +445,7 @@ impl Bus {
 
             if !event.visible_to(auth.team_id, auth.agent_id, &auth.session)
                 || !wants(event.kind())
-                || !in_focus(&event, focus)
+                || (event.kind() == "message" && !in_scope(&event, &scope, focus, &auth))
             {
                 continue;
             }
@@ -477,9 +482,12 @@ impl Bus {
                 while let Ok(Ok(more)) = tokio::time::timeout_at(grace, rx.recv()).await {
                     if more.kind() == "message"
                         && more.visible_to(auth.team_id, auth.agent_id, &auth.session)
-                        && in_focus(&more, focus)
+                        && in_scope(&more, &scope, focus, &auth)
                         && wants("message")
-                        && more.sender_agent_id() != Some(auth.agent_id)
+                        // Same rule as the first event: only this session's
+                        // own messages are not news.
+                        && !(more.sender_agent_id() == Some(auth.agent_id)
+                            && more.sender_session().unwrap_or("") == auth.session)
                         && let Some(d) = describe(&self.db, &more).await
                     {
                         events.push(d);
@@ -501,15 +509,52 @@ impl Bus {
         }
         push_overflow(&mut events, &last);
 
-        let unread = unread_dms(&self.db, &auth).await.unwrap_or(0);
+        self.wait_result(&auth, &scope, focus, events, position)
+            .await
+    }
+}
+
+impl Bus {
+    /// The answer to a wait: what woke it, the backlog of the scope it
+    /// watched and the read that consumes it, and the counts read back from
+    /// the database at the end, so a message that landed meanwhile is counted.
+    async fn wait_result(
+        &self,
+        auth: &AuthCtx,
+        scope: &Scope,
+        focus: Option<Uuid>,
+        events: Vec<WaitEvent>,
+        position: String,
+    ) -> Result<Json<WaitResult>, ErrorData> {
+        // Counts read back after the wait. A failure here must not throw
+        // away what the wait observed: report zero and log it; the next wait
+        // reads them again.
+        let unread = unread_dms(&self.db, auth).await.unwrap_or(0);
+        let unread_in_scope = messaging::unread_in_scope(&self.db, auth, scope, focus)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "could not count unread messages after a wait");
+                0
+            });
+        let pending_questions = messaging::pending_questions(&self.db, auth)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "could not count pending questions after a wait");
+                0
+            });
+        let read_with = scope.read_with();
         let woke = !events.is_empty();
         Ok(Json(WaitResult {
             woke,
             timed_out: !woke,
-            suggestion: suggestion_for(&events, unread),
+            suggestion: suggestion_for(&events, unread, unread_in_scope, &read_with),
             events,
             unread_direct_messages: unread,
             resume_from: position,
+            message_scope: scope.label(),
+            unread_in_scope,
+            read_with,
+            pending_questions,
         }))
     }
 }

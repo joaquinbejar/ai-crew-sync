@@ -805,6 +805,20 @@ su estado de no leído está en la base de datos). El proxy lo encadena de un
 tramo de una espera larga al siguiente. El bus guarda esos eventos alrededor
 de un día (`bus_event_log`, migración 0020).
 
+Espera por lo que vas a leer. `wait_for_updates` acepta `scope` con los
+mismos valores que `read_messages`: `all` (por defecto), `inbox` o el nombre
+de un canal. El atraso que informa es el que vacía la lectura equivalente,
+leído del mismo cursor, así que una ventana que solo lee su bandeja espera
+con `scope: "inbox"` y ya no vuelve al instante por la charla de canales que
+nunca lee. Solo se acotan los mensajes; las tareas, los locks y las notas
+siguen despertando la espera salvo que `kinds` los deje fuera. Cada resultado
+dice qué alcance vigiló (`message_scope`), cuánto hay sin leer ahí
+(`unread_in_scope`) y qué llamada lo consume (`read_with`). Una espera nunca
+mueve un cursor de lectura. `pending_questions` cuenta las preguntas dirigidas
+a la ventana (o a ti) en las últimas 24 horas que aún no has contestado: leer
+una pregunta no la contesta, responder a quien la hizo sí, y una pregunta
+pendiente se informa, nunca es motivo para despertar por sí sola.
+
 El proxy hace todo esto por ti: registra la sesión al conectar, reenvía cada
 llamada con la credencial y el epoch, renueva la credencial a mitad de su
 vida tanto si la ventana está ocupada como ociosa (`BUS_SESSION_TTL_SECS` y

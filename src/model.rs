@@ -443,6 +443,20 @@ pub struct WaitResult {
     /// wait_for_updates so a task, lock or note change that lands between the
     /// two calls is reported instead of lost. Opaque.
     pub resume_from: String,
+    /// The message scope this wait watched: `all`, `inbox` or `#channel`.
+    pub message_scope: String,
+    /// Unread messages in that scope now, the same count the matching read
+    /// would drain (your own session's messages excluded).
+    pub unread_in_scope: i64,
+    /// The read that consumes what this wait reported, e.g.
+    /// `read_messages {"scope": "inbox"}`. Reading another scope leaves this
+    /// one's backlog unread, and the next wait reports it again.
+    pub read_with: String,
+    /// Questions addressed to this session (or to you) in the last 24 hours
+    /// that you have not answered yet. Reading a question does not answer
+    /// it; replying with post_message (`to` the asker, `reply_to` the
+    /// question id) does. Reported, never a reason to wake by itself.
+    pub pending_questions: i64,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

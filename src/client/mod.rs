@@ -216,6 +216,9 @@ pub enum ClientCmd {
         /// Wake on every channel, not only the one this session works in.
         #[arg(long)]
         all_channels: bool,
+        /// Messages to wait for, as in `read`: all, inbox, or a channel name.
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Advisory locks on shared resources.
     #[command(subcommand)]
