@@ -454,14 +454,18 @@ pub const WATCH_WAKE_LABEL: &str = "claude-watcher";
 /// Announce (`Some(ttl)`) or withdraw (`None`) the watcher as this window's
 /// wake mechanism. Best effort and descriptive: teammates read it to tell a
 /// window that can be woken from one that cannot, never as proof.
-async fn announce_wake(binding: &Binding, ttl: Option<u64>) {
+/// `token` is this watcher's: stored with the announcement, and the bus
+/// clears an announcement only for the token that made it, so a retiring
+/// watcher's late withdrawal can never erase its successor's.
+async fn announce_wake(binding: &Binding, ttl: Option<u64>, token: &str) {
     let args = match ttl {
         Some(secs) => json!({
             "refresh_only": true,
             "wake": WATCH_WAKE_LABEL,
             "wake_ttl_seconds": secs.clamp(30, 86_400),
+            "wake_token": token,
         }),
-        None => json!({"refresh_only": true, "wake": ""}),
+        None => json!({"refresh_only": true, "wake": "", "wake_token": token}),
     };
     let _ = call_as_window(binding, "heartbeat", args).await;
 }
@@ -518,7 +522,7 @@ pub async fn watch(
     })?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     if let Resolution::Authenticated(b) = resolve_binding(config_dir, binding_id) {
-        announce_wake(&b, Some(max_secs)).await;
+        announce_wake(&b, Some(max_secs), &token).await;
     }
     loop {
         // Replaced: the newer watcher owns the announcement now.
@@ -532,7 +536,7 @@ pub async fn watch(
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             if owns_watch(config_dir, &path, &token)? {
-                announce_wake(&binding, None).await;
+                announce_wake(&binding, None, &token).await;
             }
             return Ok(None);
         }
@@ -567,7 +571,7 @@ pub async fn watch(
                     // another, which announces itself again. Withdrawn only
                     // while still the owner, or it would erase a successor's.
                     if owns_watch(config_dir, &path, &token)? {
-                        announce_wake(&binding, None).await;
+                        announce_wake(&binding, None, &token).await;
                     }
                     return Ok(Some(wake_text(next.direct, next.inbox)));
                 }

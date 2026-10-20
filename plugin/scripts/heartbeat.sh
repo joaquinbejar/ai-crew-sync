@@ -32,6 +32,9 @@ case "$STATUS" in
     active|idle|busy|blocked) ;;
     *) STATUS=active ;;
 esac
+# A window that is closing (SessionEnd sends idle) has no model running and
+# nothing to wake it: say so, as the authenticated session_end event does.
+[ "$STATUS" = idle ] && [ -z "$ATTENTION" ] && ATTENTION=idle
 RESET="${2:-}"
 
 # `--from-payload` in the second slot: the hook was given the host payload on
@@ -55,9 +58,9 @@ fi
 # repo and branch read from this checkout. Silent when there is no binding.
 if [ -n "${BUS_HOST_SESSION:-}" ] && command -v ai-crew-sync >/dev/null 2>&1; then
     case "$STATUS:$ATTENTION" in
+        idle:*)      EVENT=session_end ;;
         *:idle)      EVENT=stop ;;
         *:attending) EVENT=prompt_submit ;;
-        idle:*)      EVENT=session_end ;;
         *)           EVENT=heartbeat ;;
     esac
     case "$(ai-crew-sync context hook --binding "$BUS_HOST_SESSION" --event status 2>/dev/null)" in
@@ -96,6 +99,12 @@ import json, os
 args = {"status": os.environ["STATUS"], "ttl_seconds": int(os.environ["TTL"])}
 if os.environ.get("ATTENTION"):
     args["attention"] = os.environ["ATTENTION"]
+elif os.environ.get("RESET") == "reset":
+    # A new session knows nothing about the previous turn.
+    args["attention"] = ""
+if os.environ.get("STATUS") == "idle":
+    # Closing: whatever announced a way to wake this window is gone too.
+    args["wake"] = ""
 for key in ("repo", "branch"):
     value = os.environ.get(key.upper(), "").strip()
     if value:
@@ -106,10 +115,12 @@ if os.environ.get("RESET") == "reset":
 print(json.dumps(args))
 PY
 )"
+elif [ "$STATUS" = idle ]; then
+    ARGS="{\"status\":\"idle\",\"ttl_seconds\":$TTL,\"attention\":\"idle\",\"wake\":\"\"}"
 elif [ -n "$ATTENTION" ]; then
     ARGS="{\"status\":\"$STATUS\",\"ttl_seconds\":$TTL,\"attention\":\"$ATTENTION\"}"
 elif [ "$RESET" = "reset" ]; then
-    ARGS="{\"status\":\"$STATUS\",\"ttl_seconds\":$TTL,\"activity\":\"\"}"
+    ARGS="{\"status\":\"$STATUS\",\"ttl_seconds\":$TTL,\"activity\":\"\",\"attention\":\"\"}"
 else
     ARGS="{\"status\":\"$STATUS\",\"ttl_seconds\":$TTL}"
 fi

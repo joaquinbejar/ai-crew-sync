@@ -63,6 +63,16 @@ pub struct HeartbeatArgs {
     /// default 3600).
     #[serde(default)]
     pub wake_ttl_seconds: Option<i64>,
+    /// How many milliseconds ago `attention` was observed, when it is
+    /// reported late. The bus keeps only the newest observation, so a late
+    /// report never overwrites a newer one. Omit for "now".
+    #[serde(default)]
+    pub attention_observed_ms_ago: Option<i64>,
+    /// An opaque marker the wake mechanism chooses (at most 128 bytes),
+    /// stored with its `wake` announcement; a withdrawal (`wake: ""`) with
+    /// the same token clears only its own announcement.
+    #[serde(default)]
+    pub wake_token: Option<String>,
     /// Renew the presence lease and labels but leave `status` as it is.
     /// For a process that is merely alive (a proxy keepalive), so it never
     /// overwrites what the window's hooks or model said.
@@ -119,6 +129,8 @@ impl Bus {
             tool_activity: args.tool_activity,
             wake: args.wake,
             wake_ttl_seconds: args.wake_ttl_seconds,
+            attention_observed_ms_ago: args.attention_observed_ms_ago,
+            wake_token: args.wake_token,
             refresh_only: args.refresh_only,
         };
         Ok(Json(presence::heartbeat(&self.db, &auth, input).await?))

@@ -24,6 +24,8 @@
 --                    mechanism announced it. Not authority, not proof that a
 --                    wake will succeed.
 -- wake_until         when that announcement lapses unless renewed.
+-- wake_token         an opaque value the announcer chose, so that it can
+--                    withdraw its own announcement and never a successor's.
 
 ALTER TABLE agent_presence
     ADD COLUMN attention TEXT
@@ -32,4 +34,5 @@ ALTER TABLE agent_presence
     ADD COLUMN last_tool_at TIMESTAMPTZ,
     ADD COLUMN last_inbox_read_at TIMESTAMPTZ,
     ADD COLUMN wake TEXT,
-    ADD COLUMN wake_until TIMESTAMPTZ;
+    ADD COLUMN wake_until TIMESTAMPTZ,
+    ADD COLUMN wake_token TEXT;

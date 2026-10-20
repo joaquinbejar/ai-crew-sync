@@ -17771,3 +17771,117 @@ async fn the_proxy_and_hooks_report_the_models_turn() {
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
 }
+
+/// Review of #227: a report that arrives late never overwrites a newer
+/// observation, and a wake withdrawal carrying a token clears only the
+/// announcement made with that token.
+#[tokio::test]
+async fn late_reports_and_stale_withdrawals_change_nothing() {
+    let h = require_db!("t_attention_order");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let api = connect_with_session(&h.base, &token, "api").await;
+    let state = |e: &Value| e["attention"]["state"].as_str().unwrap().to_owned();
+
+    // The turn ended (now); a call observed 5 s ago arrives afterwards.
+    call(&api, "heartbeat", json!({"attention": "idle"})).await;
+    call(
+        &api,
+        "heartbeat",
+        json!({"refresh_only": true, "attention": "attending", "tool_activity": true,
+               "attention_observed_ms_ago": 5000}),
+    )
+    .await;
+    assert_eq!(state(&session_entry(&marta, "joaquin/api").await), "idle");
+    // A call observed now is news.
+    call(
+        &api,
+        "heartbeat",
+        json!({"refresh_only": true, "attention": "attending", "tool_activity": true}),
+    )
+    .await;
+    assert_eq!(
+        state(&session_entry(&marta, "joaquin/api").await),
+        "attending"
+    );
+
+    // A successor announced after the old watcher; the old one's late
+    // withdrawal leaves the successor's announcement in place.
+    let announce = |t: &'static str| json!({"refresh_only": true, "wake": "claude-watcher", "wake_ttl_seconds": 300, "wake_token": t});
+    call(&api, "heartbeat", announce("old")).await;
+    call(&api, "heartbeat", announce("new")).await;
+    call(
+        &api,
+        "heartbeat",
+        json!({"refresh_only": true, "wake": "", "wake_token": "old"}),
+    )
+    .await;
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert_eq!(e["attention"]["wake"], "claude-watcher", "{e}");
+    call(
+        &api,
+        "heartbeat",
+        json!({"refresh_only": true, "wake": "", "wake_token": "new"}),
+    )
+    .await;
+    let e = session_entry(&marta, "joaquin/api").await;
+    assert_eq!(e["attention"]["wake"], "unknown", "{e}");
+
+    for c in [api, marta] {
+        let _ = c.cancel().await;
+    }
+    h.shutdown().await;
+}
+
+/// Review of #227: a short tool call right after a Stop, inside the
+/// throttle window, is flushed once the throttle allows instead of waiting
+/// for the next keepalive.
+#[tokio::test]
+async fn a_throttled_call_after_stop_is_flushed() {
+    let h = require_db!("t_attention_flush");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let marta = connect(&h.base, &seed_agent(&h.pool, "acme", "marta").await).await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("market-data");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let window = spawn_proxy(&dir, &repo, &[], &[("BUS_HOST_SESSION", "conv-flush")]).await;
+    let address = call(&window, "session_status", json!({})).await["address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        attention_becomes(&marta, &address, "attending").await["attention"]["state"],
+        "attending"
+    );
+    let payload = json!({"session_id": "conv-flush"}).to_string();
+    run_hook(
+        "heartbeat.sh",
+        &dir,
+        &repo,
+        &payload,
+        &["stop", "--from-payload"],
+    )
+    .await;
+    assert_eq!(
+        session_entry(&marta, &address).await["attention"]["state"],
+        "idle"
+    );
+    // A short call inside the throttle window (a Stop drain does this).
+    call(&window, "whoami", json!({})).await;
+    let started = std::time::Instant::now();
+    let mut e = Value::Null;
+    while started.elapsed() < std::time::Duration::from_secs(25) {
+        e = session_entry(&marta, &address).await;
+        if e["attention"]["state"] == "attending" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(e["attention"]["state"], "attending", "never flushed: {e}");
+
+    let _ = marta.cancel().await;
+    let _ = window.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}

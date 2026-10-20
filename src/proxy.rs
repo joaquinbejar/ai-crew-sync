@@ -298,6 +298,8 @@ const WAITING_TOOLS: &[&str] = &["wait_for_updates", "ask_agent"];
 /// proxy cannot see (a Stop hook's `idle`): a call more than this long after
 /// the last report always goes out.
 const ATTENTION_REPORT_EVERY: Duration = Duration::from_secs(15);
+/// Least time between two attempts to flush a deferred call.
+const FLUSH_RETRY: Duration = Duration::from_secs(2);
 
 /// What this proxy has seen of its model's turn (#221). The host's tool
 /// calls are the only evidence: a call proves a turn is running, a call to a
@@ -328,6 +330,23 @@ struct AttentionReport {
 impl AttentionReport {
     fn tool_activity(&self) -> bool {
         self.call.is_some()
+    }
+
+    /// The heartbeat fields for this report. A call reported late says how
+    /// long ago it happened, so the bus can keep a newer observation (a Stop
+    /// hook's idle) rather than let a late report overwrite it.
+    fn fields(&self) -> Value {
+        let mut v = json!({
+            "refresh_only": true,
+            "attention": self.state,
+            "tool_activity": self.tool_activity(),
+        });
+        if self.state == "attending"
+            && let Some(at) = self.call
+        {
+            v["attention_observed_ms_ago"] = json!(at.elapsed().as_millis() as i64);
+        }
+        v
     }
 }
 
@@ -364,6 +383,19 @@ impl Attention {
             return None;
         };
         Some(AttentionReport { state, call })
+    }
+
+    /// When a call deferred by the throttle must be flushed, if one is
+    /// waiting: as soon as the throttle allows, so the window does not read
+    /// stale until the next keepalive.
+    fn flush_at(&self) -> Option<std::time::Instant> {
+        // A wait in flight is reported on its own terms (and re-reported by
+        // the keepalive); nothing to flush meanwhile.
+        if self.waits > 0 {
+            return None;
+        }
+        self.unreported_call?;
+        self.reported.map(|(_, at)| at + ATTENTION_REPORT_EVERY)
     }
 
     /// The bus accepted `report`.
@@ -1398,11 +1430,10 @@ impl Proxy {
     /// wait still in flight.
     async fn refresh_presence(&self) {
         let due = self.attention.lock().ok().and_then(|mut a| a.due(true));
-        let mut args = json!({"refresh_only": true});
-        if let Some(report) = due {
-            args["attention"] = json!(report.state);
-            args["tool_activity"] = json!(report.tool_activity());
-        }
+        let args = match due {
+            Some(report) => report.fields(),
+            None => json!({"refresh_only": true}),
+        };
         if self.publish_presence(args).await
             && let Some(report) = due
             && let Ok(mut a) = self.attention.lock()
@@ -1415,12 +1446,7 @@ impl Proxy {
     async fn report_attention(&self) {
         let due = self.attention.lock().ok().and_then(|mut a| a.due(false));
         let Some(report) = due else { return };
-        let args = json!({
-            "refresh_only": true,
-            "attention": report.state,
-            "tool_activity": report.tool_activity(),
-        });
-        if self.publish_presence(args).await
+        if self.publish_presence(report.fields()).await
             && let Ok(mut a) = self.attention.lock()
         {
             a.sent(report);
@@ -2203,6 +2229,7 @@ impl Proxy {
     /// renewed exactly as a busy one.
     pub async fn keepalive(self, ct: CancellationToken) {
         let mut next_heartbeat = tokio::time::Instant::now() + KEEPALIVE_EVERY;
+        let mut last_flush = tokio::time::Instant::now() - FLUSH_RETRY;
         // Earliest next renewal attempt, whatever the deadline says: keeps a
         // deadline already in the past (a bus that will not renew, a reply
         // without an expiry) from becoming a tight loop. Tied to the context
@@ -2216,6 +2243,19 @@ impl Proxy {
                 Some((for_generation, nb)) if for_generation == generation => at.max(nb),
                 _ => at,
             });
+            // A call the throttle deferred is flushed once it may be.
+            // Never sooner than a moment after the last attempt: a bus that
+            // refuses the report must not turn this into a busy loop.
+            let flush_at = self
+                .attention
+                .lock()
+                .ok()
+                .and_then(|a| a.flush_at())
+                .map(tokio::time::Instant::from_std)
+                .map(|at| at.max(last_flush + FLUSH_RETRY));
+            let flush_sleep = tokio::time::sleep_until(
+                flush_at.unwrap_or_else(|| tokio::time::Instant::now() + KEEPALIVE_EVERY),
+            );
             let renew_sleep = tokio::time::sleep_until(
                 renew_at.unwrap_or_else(|| tokio::time::Instant::now() + KEEPALIVE_EVERY),
             );
@@ -2230,6 +2270,10 @@ impl Proxy {
                     next_heartbeat = tokio::time::Instant::now() + KEEPALIVE_EVERY;
                 }
                 _ = self.attention_changed.notified() => {
+                    self.report_attention().await;
+                }
+                _ = flush_sleep, if flush_at.is_some() => {
+                    last_flush = tokio::time::Instant::now();
                     self.report_attention().await;
                 }
                 _ = renew_sleep, if renew_at.is_some() => {

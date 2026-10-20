@@ -100,6 +100,14 @@ pub struct HeartbeatInput {
     pub tool_activity: bool,
     /// Wake mechanism announcement; "" withdraws it, `None` keeps it.
     pub wake: Option<String>,
+    /// How long ago (ms) `attention` was observed. The bus keeps only the
+    /// newest observation, measured on its own clock, so a report sent late
+    /// never overwrites a newer one (a Stop hook's idle). `None`: now.
+    pub attention_observed_ms_ago: Option<i64>,
+    /// The announcer's token: stored with a `wake` announcement, and a
+    /// withdrawal (`wake: ""`) carrying one clears only an announcement made
+    /// with the same token, never a successor's.
+    pub wake_token: Option<String>,
     pub wake_ttl_seconds: Option<i64>,
     /// Renew the lease and the labels but keep `status` as it is: what a
     /// process that is merely alive sends, so it never overwrites what the
@@ -228,6 +236,17 @@ pub async fn heartbeat(
         Some(v) => Some(normalize_label("wake", v)?),
         None => None,
     };
+    let observed_ago_secs = input
+        .attention_observed_ms_ago
+        .map(|ms| ms.clamp(0, 86_400_000) as f64 / 1000.0);
+    let wake_token = match input.wake_token.as_deref() {
+        Some(t) if t.len() > 128 => {
+            return Err(BusError::invalid(
+                "wake_token is at most 128 bytes; it is an opaque marker, not a payload",
+            ));
+        }
+        other => other.map(str::to_owned),
+    };
     let wake_ttl = input
         .wake_ttl_seconds
         .unwrap_or(DEFAULT_WAKE_TTL_SECS)
@@ -248,7 +267,7 @@ pub async fn heartbeat(
             INSERT INTO agent_presence
                 (agent_id, session, status, repo, branch, activity, project, role,
                  updated_at, expires_at,
-                 attention, attention_at, last_tool_at, wake, wake_until)
+                 attention, attention_at, last_tool_at, wake, wake_until, wake_token)
             -- NULLIF on the insert path too: the CASE below only runs on
             -- conflict, so a first heartbeat for a new or freshly swept
             -- session stored '' and reported an empty string where the
@@ -256,11 +275,13 @@ pub async fn heartbeat(
             VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($8, ''), NULLIF($9, ''),
                     now(), now() + make_interval(secs => $7),
                     NULLIF($10, ''),
-                    CASE WHEN NULLIF($10, '') IS NULL THEN NULL ELSE now() END,
-                    CASE WHEN $11 THEN now() END,
+                    CASE WHEN NULLIF($10, '') IS NULL THEN NULL
+                         ELSE now() - make_interval(secs => COALESCE($15, 0)) END,
+                    CASE WHEN $11 THEN now() - make_interval(secs => COALESCE($15, 0)) END,
                     NULLIF($12, ''),
                     CASE WHEN NULLIF($12, '') IS NULL THEN NULL
-                         ELSE now() + make_interval(secs => $13) END)
+                         ELSE now() + make_interval(secs => $13) END,
+                    CASE WHEN NULLIF($12, '') IS NULL THEN NULL ELSE $16 END)
             ON CONFLICT (agent_id, session) DO UPDATE SET
                 -- A refresh renews the lease and nothing a hook or the
                 -- model said: a live process is not news about the model.
@@ -290,20 +311,47 @@ pub async fn heartbeat(
                                  ELSE COALESCE(EXCLUDED.role, agent_presence.role)
                              END,
                 -- Observations: omitted keeps, '' clears to unknown, a value
-                -- is stamped with the time it was observed.
+                -- is stamped with the time it was observed. One older than
+                -- what is stored is history, not news: it changes nothing.
                 attention = CASE WHEN $10::text IS NULL THEN agent_presence.attention
+                                 WHEN agent_presence.attention_at IS NOT NULL
+                                  AND now() - make_interval(secs => COALESCE($15, 0))
+                                      < agent_presence.attention_at
+                                   THEN agent_presence.attention
                                  WHEN $10 = '' THEN NULL
                                  ELSE $10 END,
                 attention_at = CASE WHEN $10::text IS NULL THEN agent_presence.attention_at
+                                    WHEN agent_presence.attention_at IS NOT NULL
+                                     AND now() - make_interval(secs => COALESCE($15, 0))
+                                         < agent_presence.attention_at
+                                      THEN agent_presence.attention_at
                                     WHEN $10 = '' THEN NULL
-                                    ELSE now() END,
-                last_tool_at = CASE WHEN $11 THEN now() ELSE agent_presence.last_tool_at END,
+                                    ELSE now() - make_interval(secs => COALESCE($15, 0)) END,
+                last_tool_at = CASE WHEN $11
+                                    THEN GREATEST(agent_presence.last_tool_at,
+                                                  now() - make_interval(secs => COALESCE($15, 0)))
+                                    ELSE agent_presence.last_tool_at END,
+                -- A withdrawal with a token clears only the announcement
+                -- made with that token: a retiring watcher cannot erase its
+                -- successor's, however late its request arrives.
                 wake = CASE WHEN $12::text IS NULL THEN agent_presence.wake
+                            WHEN $12 = '' AND $16::text IS NOT NULL
+                             AND agent_presence.wake_token IS DISTINCT FROM $16
+                              THEN agent_presence.wake
                             WHEN $12 = '' THEN NULL
                             ELSE $12 END,
                 wake_until = CASE WHEN $12::text IS NULL THEN agent_presence.wake_until
+                                  WHEN $12 = '' AND $16::text IS NOT NULL
+                                   AND agent_presence.wake_token IS DISTINCT FROM $16
+                                    THEN agent_presence.wake_until
                                   WHEN $12 = '' THEN NULL
                                   ELSE now() + make_interval(secs => $13) END,
+                wake_token = CASE WHEN $12::text IS NULL THEN agent_presence.wake_token
+                                  WHEN $12 = '' AND $16::text IS NOT NULL
+                                   AND agent_presence.wake_token IS DISTINCT FROM $16
+                                    THEN agent_presence.wake_token
+                                  WHEN $12 = '' THEN NULL
+                                  ELSE $16 END,
                 updated_at = now(),
                 expires_at = EXCLUDED.expires_at
             RETURNING agent_id, session, status, repo, branch, activity, project, role,
@@ -341,6 +389,8 @@ pub async fn heartbeat(
     .bind(wake.as_deref())
     .bind(wake_ttl as f64)
     .bind(input.refresh_only)
+    .bind(observed_ago_secs)
+    .bind(wake_token.as_deref())
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;

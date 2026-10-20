@@ -190,6 +190,25 @@ assert args["attention"] == os.environ["WANT"], args
         || bad "${pair%%:*} attention" "$(cut -f2 "$CAPTURE" | tail -1)"
 done
 
+# Legacy SessionEnd (idle) reports the model idle and withdraws any wake;
+# SessionStart (reset) clears the previous session's attention (#227 review).
+: > "$CAPTURE"
+(cd "$REPO_DIR" && BUS_URL=x BUS_TOKEN=y sh "$WORK/bin/heartbeat.sh" idle) >/dev/null 2>&1
+cut -f2 "$CAPTURE" | tail -1 | python3 -c '
+import json, sys
+a = json.load(sys.stdin)
+assert a["attention"] == "idle" and a["wake"] == "", a
+' 2>/dev/null && ok "legacy SessionEnd reports idle and withdraws the wake" \
+    || bad "legacy idle attention" "$(cut -f2 "$CAPTURE" | tail -1)"
+: > "$CAPTURE"
+(cd "$REPO_DIR" && BUS_URL=x BUS_TOKEN=y sh "$WORK/bin/heartbeat.sh" active reset) >/dev/null 2>&1
+cut -f2 "$CAPTURE" | tail -1 | python3 -c '
+import json, sys
+a = json.load(sys.stdin)
+assert a["attention"] == "" and a["activity"] == "", a
+' 2>/dev/null && ok "legacy SessionStart clears the previous attention" \
+    || bad "legacy reset attention" "$(cut -f2 "$CAPTURE" | tail -1)"
+
 # --- the Stop drain: oldest unanswered question, once each -------------------
 cp "$ROOT/stop-drain.sh" "$WORK/bin/stop-drain.sh"
 
