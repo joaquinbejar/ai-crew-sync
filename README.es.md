@@ -851,16 +851,30 @@ credencial que guardó.
 
 **Identidad de la conversación**, por orden: `--host-session` /
 `BUS_HOST_SESSION` (cualquier host que pueda fijar una variable por ventana),
-`CLAUDE_CODE_SESSION_ID` (Claude Code la exporta a los procesos MCP), el
-`_meta.threadId` que Codex adjunta a cada llamada, y si no el propio proceso.
-Con un id de conversación la etiqueta de sesión es **estable**: una
-conversación reanudada vuelve a la misma sesión y una bifurcada recibe otra;
-sin él, la sesión dura lo que el proceso. Cuando la conversación se identificó
-por el `_meta` de la petición (`threadId`, o `sessionId`), un segundo id de
-conversación en el mismo proceso se rechaza en vez de mezclarse. Cuando la
-fijó `--host-session` / `BUS_HOST_SESSION` o `CLAUDE_CODE_SESSION_ID`, ese
-binding manda y los ids que llegan en las peticiones se ignoran, así que
-configura el host para que arranque un proxy por conversación.
+`CLAUDE_CODE_SESSION_ID` (Claude Code la exporta a los procesos MCP),
+`ANTIGRAVITY_CONVERSATION_ID` (donde una superficie de Antigravity la exporta
+a los servidores MCP), el id de conversación que una petición lleva en
+`_meta` (`antigravity.google/conversation_id` de Antigravity, `threadId` de
+Codex), y si no el propio proceso. Con un id de conversación la etiqueta de
+sesión es **estable**: una conversación reanudada vuelve a la misma sesión y
+una bifurcada recibe otra; sin él, la sesión dura lo que el proceso. Cuando
+la conversación se identificó por el `_meta` de la petición, un segundo id de
+conversación del mismo tipo en el mismo proceso se rechaza en vez de
+mezclarse. Cuando la fijó `--host-session` / `BUS_HOST_SESSION`,
+`CLAUDE_CODE_SESSION_ID` o `ANTIGRAVITY_CONVERSATION_ID`, ese binding manda y
+los demás ids que llegan en las peticiones se ignoran, así que configura el
+host para que arranque un proxy por conversación. Verificado con la CLI de
+Antigravity (`agy` 1.4.3): exporta `ANTIGRAVITY_CONVERSATION_ID` a los hooks
+pero no a los servidores MCP, y manda el id de conversación en `_meta` en cada
+`tools/call`, así que `session_status` informa `binding: antigravity` y los
+hooks de la misma conversación encuentran su binding.
+
+Una limitación conocida: un host arrancado desde dentro de una sesión de
+Claude Code (su terminal, o una herramienta que ejecuta) hereda
+`CLAUDE_CODE_SESSION_ID`, y también lo heredan los proxies que ese host
+arranca. Se vinculan entonces a la conversación de Claude y se quedan con su
+sesión. Arranca los demás hosts desde un terminal normal, o borra la variable
+al lanzarlos (`env -u CLAUDE_CODE_SESSION_ID agy`).
 
 El campo `instructions` del resultado de `initialize` le dice al modelo quién
 es y dónde está esta ventana (agente, equipo, dirección de sesión, proyecto,
