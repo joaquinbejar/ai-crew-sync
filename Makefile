@@ -39,7 +39,7 @@ help: ## List every target
 # --- verification -----------------------------------------------------------
 
 .PHONY: check
-check: fmt-check lint validate config-check hooks-check recipes-check ## Pre-push gate: format, clippy, compose renders, config documented, hooks sane, commands match recipes. Offline.
+check: fmt-check lint validate config-check hooks-check recipes-check guidance-check ## Pre-push gate: format, clippy, compose renders, config documented, hooks sane, commands match recipes, shipped guidance consistent. Offline.
 
 .PHONY: pre-push
 pre-push: check ## Alias for check
@@ -105,6 +105,10 @@ recipes: ## Regenerate plugin/commands/*.md from recipes/*.md (the recipes are t
 .PHONY: recipes-check
 recipes-check: ## Fail if a slash command drifted from its recipe
 	@python3 plugin/scripts/recipes.py check
+
+.PHONY: guidance-check
+guidance-check: ## Fail if shipped guidance disagrees with the code (versions, retired claims, wake labels)
+	@python3 plugin/scripts/guidance-check.py
 
 .PHONY: test
 test: ## Integration tests against a throwaway Postgres (needs docker)

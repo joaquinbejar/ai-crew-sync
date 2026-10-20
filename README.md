@@ -463,11 +463,14 @@ for a hand-written client configuration (Option B).
 The `Stop` hook additionally drains questions: when a teammate's agent is
 blocked on `ask_agent`, the session is held open long enough to answer before
 it goes quiet — the longest-waiting question first, one per turn, and never one
-you have already replied to. **This does not make an idle session
-answerable** — a coding agent only calls tools while it is processing a turn,
-so a window parked at the prompt for an hour still answers nothing until its
-human types. That is a property of the client, not of the bus; for anything
-that must not wait, use a task or a channel message.
+you have already replied to. **The drain alone does not make an idle session
+answerable**: a coding agent only calls tools while it is processing a turn.
+A window parked at the prompt answers only if something starts a new turn:
+the background watcher below (Claude Code), the opt-in adapter (Codex), or
+its human. `list_sessions` shows which applies (`attention.wake`), and the
+capability matrix in `docs/acceptance/host-integration.md` says what was
+verified on which host version. For anything that must not wait, use a task
+or a channel message.
 
 - **Commands**: `/ai-crew-sync:standup [hours]`, `/ai-crew-sync:catchup [hours]`,
   `/ai-crew-sync:announce [#channel] message`, `/ai-crew-sync:ask <agent> <question>`,
