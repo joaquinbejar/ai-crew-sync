@@ -300,6 +300,12 @@ pub(super) fn render(cmd: &ClientCmd, value: &Value) -> anyhow::Result<()> {
             } else {
                 println!("(nothing happened)");
             }
+            println!(
+                "{} unread in {}; {} pending question(s)",
+                value["unread_in_scope"],
+                field(value, "message_scope"),
+                value["pending_questions"],
+            );
             println!("{}", field(value, "suggestion"));
         }
         ClientCmd::Lock(LockCmd::List) => {

@@ -177,12 +177,14 @@ pub fn to_call_with(
             timeout_seconds,
             kinds,
             all_channels,
+            scope,
         } => (
             "wait_for_updates",
             json!({
                 "timeout_seconds": timeout_seconds,
                 "kinds": if kinds.is_empty() { Value::Null } else { json!(kinds) },
-                "all_channels": all_channels
+                "all_channels": all_channels,
+                "scope": scope
             }),
         ),
         ClientCmd::Digest {
@@ -341,6 +343,7 @@ mod tests {
                 timeout_seconds: None,
                 kinds: vec![],
                 all_channels: false,
+                scope: None,
             },
             ClientCmd::Lock(LockCmd::List),
             ClientCmd::Digest {
@@ -419,6 +422,7 @@ mod tests {
             timeout_seconds: Some(30),
             kinds: vec![],
             all_channels: false,
+            scope: None,
         });
         assert_eq!(args["timeout_seconds"], 30);
         assert!(
@@ -430,8 +434,10 @@ mod tests {
             timeout_seconds: None,
             kinds: vec!["message".into()],
             all_channels: false,
+            scope: Some("inbox".into()),
         });
         assert_eq!(args["kinds"][0], "message");
+        assert_eq!(args["scope"], "inbox");
     }
 
     #[test]

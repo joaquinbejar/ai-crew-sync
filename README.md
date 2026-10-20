@@ -780,6 +780,20 @@ between (messages never needed it: their unread state is in the database).
 The proxy chains it from one slice of a long wait to the next. The bus keeps
 those events for about a day (`bus_event_log`, migration 0020).
 
+Wait for what you will read. `wait_for_updates` takes `scope` with the same
+values as `read_messages`: `all` (the default), `inbox`, or a channel name.
+The backlog it reports is the one the matching read drains, read from the
+same cursor, so a window that only reads its inbox waits with
+`scope: "inbox"` and is no longer returned at once by unread channel
+chatter it never reads. Only messages are narrowed; tasks, locks and notes
+still wake the wait unless `kinds` leaves them out. Every result says which
+scope it watched (`message_scope`), how much is unread there
+(`unread_in_scope`) and which call consumes it (`read_with`). A wait never
+moves a read cursor. `pending_questions` counts questions addressed to the
+window (or to you) in the last 24 hours that you have not answered yet:
+reading a question does not answer it, replying to the asker does, and a
+pending question is reported, never a reason to wake on its own.
+
 The proxy does this for you: it registers the session on connect, forwards
 every call with the credential and the epoch, renews the credential half-way
 through its lifetime whether the window is busy or idle (`BUS_SESSION_TTL_SECS`

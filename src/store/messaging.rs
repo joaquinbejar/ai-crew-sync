@@ -538,7 +538,9 @@ pub async fn verify_question(
 // ---------------------------------------------------------------- reading --
 
 /// Normalised read scope plus the cursor key used to remember the read position.
-enum Scope {
+/// `wait_for_updates` resolves its `scope` with the same rules, so a wait
+/// watches exactly the set the matching read consumes.
+pub enum Scope {
     All,
     Inbox,
     Channel { id: Uuid, name: String },
@@ -547,7 +549,7 @@ enum Scope {
 impl Scope {
     /// Namespaced per session: two windows of one person each track their own
     /// reading position, so catching up in one does not mark the other read.
-    fn cursor_key_for(&self, auth: &AuthCtx, all_sessions: bool) -> String {
+    pub fn cursor_key_for(&self, auth: &AuthCtx, all_sessions: bool) -> String {
         let base = match self {
             Scope::All => "all".to_owned(),
             Scope::Inbox => "inbox".to_owned(),
@@ -555,16 +557,25 @@ impl Scope {
         };
         cursor_scope_for(&base, &auth.session, all_sessions)
     }
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         match self {
             Scope::All => "all".into(),
             Scope::Inbox => "inbox".into(),
             Scope::Channel { name, .. } => format!("#{name}"),
         }
     }
+    /// The `read_messages` call that consumes this scope's unread messages,
+    /// written the way a model would type it.
+    pub fn read_with(&self) -> String {
+        match self {
+            Scope::All => r#"read_messages {"scope": "all"}"#.into(),
+            Scope::Inbox => r#"read_messages {"scope": "inbox"}"#.into(),
+            Scope::Channel { name, .. } => format!(r#"read_messages {{"scope": "{name}"}}"#),
+        }
+    }
 }
 
-async fn resolve_scope(pool: &PgPool, auth: &AuthCtx, raw: &str) -> BusResult<Scope> {
+pub async fn resolve_scope(pool: &PgPool, auth: &AuthCtx, raw: &str) -> BusResult<Scope> {
     match raw.trim().to_lowercase().as_str() {
         "" | "all" => Ok(Scope::All),
         "inbox" | "dm" | "direct" => Ok(Scope::Inbox),
@@ -716,6 +727,132 @@ pub async fn read_messages(
         cursor: new_cursor,
         truncated,
     })
+}
+
+// ---------------------------------------------------------------- waiting --
+
+/// How long a question stays pending for `wait_for_updates`. A question
+/// nobody answered in a day is history, not work this window is waiting on;
+/// it is still in the inbox for anyone who looks.
+pub const PENDING_QUESTION_HOURS: i64 = 24;
+
+/// Unread messages in `scope` for this session: what `read_messages` with
+/// the same scope (and `only_new`) has still to return, minus what this very
+/// session sent, which is not news to it. The cursor is the one that read
+/// moves, so a wait and the read that consumes it agree on the backlog.
+///
+/// `focus` narrows the `all` scope to the session's channel (announcements
+/// and direct messages always count); the other scopes are already narrow.
+pub async fn unread_in_scope(
+    pool: &PgPool,
+    auth: &AuthCtx,
+    scope: &Scope,
+    focus: Option<Uuid>,
+) -> BusResult<i64> {
+    let cursor = scope.cursor_key_for(auth, false);
+    let count: i64 = match scope {
+        Scope::All => {
+            sqlx::query_scalar(
+                r#"
+                SELECT count(*)
+                FROM messages m
+                LEFT JOIN read_cursors c ON c.agent_id = $1 AND c.scope = $4
+                WHERE m.team_id = $2
+                  AND m.id > COALESCE(c.last_message_id, 0)
+                  -- Only this session's own messages are excluded, so a
+                  -- sibling window's announcement still counts.
+                  AND NOT (m.sender_agent_id = $1 AND COALESCE(m.sender_session, '') = $3)
+                  AND ((m.channel_id IS NOT NULL
+                        -- An announcement counts whatever this session is
+                        -- focused on, as it wakes the wait.
+                        AND ($5::uuid IS NULL OR m.channel_id = $5 OR m.announce))
+                       OR (m.recipient_agent_id = $1
+                           AND (m.recipient_session IS NULL OR m.recipient_session = $3)))
+                "#,
+            )
+            .bind(auth.agent_id)
+            .bind(auth.team_id)
+            .bind(&auth.session)
+            .bind(&cursor)
+            .bind(focus)
+            .fetch_one(pool)
+            .await?
+        }
+        Scope::Inbox => {
+            sqlx::query_scalar(
+                r#"
+                SELECT count(*)
+                FROM messages m
+                LEFT JOIN read_cursors c ON c.agent_id = $1 AND c.scope = $3
+                WHERE m.recipient_agent_id = $1
+                  AND m.id > COALESCE(c.last_message_id, 0)
+                  AND (m.recipient_session IS NULL OR m.recipient_session = $2)
+                  AND NOT (m.sender_agent_id = $1 AND COALESCE(m.sender_session, '') = $2)
+                "#,
+            )
+            .bind(auth.agent_id)
+            .bind(&auth.session)
+            .bind(&cursor)
+            .fetch_one(pool)
+            .await?
+        }
+        Scope::Channel { id, .. } => {
+            sqlx::query_scalar(
+                r#"
+                SELECT count(*)
+                FROM messages m
+                LEFT JOIN read_cursors c ON c.agent_id = $1 AND c.scope = $3
+                WHERE m.channel_id = $4
+                  AND m.id > COALESCE(c.last_message_id, 0)
+                  AND NOT (m.sender_agent_id = $1 AND COALESCE(m.sender_session, '') = $2)
+                "#,
+            )
+            .bind(auth.agent_id)
+            .bind(&auth.session)
+            .bind(&cursor)
+            .bind(*id)
+            .fetch_one(pool)
+            .await?
+        }
+    };
+    Ok(count)
+}
+
+/// Questions addressed to this session (or to the person) in the last
+/// [`PENDING_QUESTION_HOURS`] that no answer has followed. Read state plays
+/// no part: reading a question does not answer it. The rule mirrors the
+/// asker's side (`find_answer`): a question counts as answered once this
+/// agent sent the asker a direct message after it, reaching the asking
+/// window, and from the addressed window when the question named one.
+pub async fn pending_questions(pool: &PgPool, auth: &AuthCtx) -> BusResult<i64> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*)
+        FROM messages q
+        WHERE q.recipient_agent_id = $1
+          AND (q.recipient_session IS NULL OR q.recipient_session = $2)
+          AND q.metadata @> '{"question": true}'::jsonb
+          AND q.created_at > now() - make_interval(hours => $3::int)
+          -- A question this window asked itself is not one it waits on.
+          AND NOT (q.sender_agent_id = $1 AND COALESCE(q.sender_session, '') = $2)
+          AND NOT EXISTS (
+              SELECT 1 FROM messages a
+              WHERE a.sender_agent_id = $1
+                AND a.recipient_agent_id = q.sender_agent_id
+                AND a.id > q.id
+                AND (a.recipient_session IS NULL
+                     OR a.recipient_session = COALESCE(q.sender_session, ''))
+                AND (q.recipient_session IS NULL
+                     OR COALESCE(a.sender_session, '') = q.recipient_session)
+          )
+        "#,
+    )
+    .bind(auth.agent_id)
+    .bind(&auth.session)
+    .bind(PENDING_QUESTION_HOURS as i32)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
 }
 
 pub async fn search_messages(
