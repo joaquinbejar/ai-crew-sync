@@ -103,6 +103,9 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(3);
 /// rotated, before the window gives up and goes off the bus. The old secret
 /// is already refused, so one transient failure must not strand it.
 const ADOPT_ATTEMPTS: u32 = 3;
+/// How long a request waits for the project an MCP root may name, and how
+/// long the client gets to answer `roots/list`.
+const ROOTS_WAIT: Duration = Duration::from_secs(5);
 
 pub const CONFIGURE_TOOL: &str = "configure_session";
 pub const STATUS_TOOL: &str = "session_status";
@@ -173,6 +176,33 @@ fn env_id(name: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
+}
+
+/// The local path a `file://` URI names, percent-decoded. Anything else
+/// (another scheme, a remote host) is not a directory this process can read.
+fn path_of_file_uri(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(rest.get(i + 1..i + 3)?, 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let path = PathBuf::from(String::from_utf8(out).ok()?);
+    path.is_dir().then_some(path)
 }
 
 /// Whether an MCP client name is Claude Code's own (`claude-code`).
@@ -271,6 +301,11 @@ struct State {
     /// It is still this window's identity: read it through
     /// [`State::identity`], never through `connected` alone.
     stranded: Option<Identity>,
+    /// The workspace an MCP root named, when the proxy's own directory had
+    /// no project (#236). Used for `.acs.toml` and for repo/branch in place
+    /// of the working directory, and only ever filled when nothing more
+    /// explicit chose the project.
+    roots_dir: Option<PathBuf>,
 }
 
 /// Who this window is on the bus: the agent, team and credential it speaks
@@ -504,6 +539,10 @@ pub struct Proxy {
     /// until the client names itself; held across the connect, so a request
     /// racing the first one waits for the decision instead of bypassing it.
     pending_claude: Arc<Mutex<Option<String>>>,
+    /// Held while the proxy asks the client for its roots after
+    /// `initialized`, so the first requests wait for the project it finds
+    /// instead of racing it. Bounded by [`ROOTS_WAIT`].
+    roots_gate: Arc<Mutex<()>>,
 }
 
 // -------------------------------------------------------------- local tools --
@@ -551,6 +590,11 @@ pub struct Status {
     pub credential_from: Option<String>,
     pub binding: Binding,
     pub project_root: Option<String>,
+    /// How `project_root` was found: `project-dir` (`--project-dir` /
+    /// `BUS_PROJECT_DIR`), `working-directory` (searched upward from where
+    /// the host started the proxy) or `mcp-roots` (a workspace the client
+    /// listed in `roots/list`). Absent when there is no project root.
+    pub project_root_from: Option<String>,
     pub bus: Option<String>,
     /// What this proxy last reported about the model's turn: `attending`
     /// (it saw a tool call), `waiting` (a bus wait is in flight), or absent
@@ -1300,6 +1344,7 @@ impl Proxy {
                 channel: opts.channel.clone(),
                 generation: 0,
                 stranded: None,
+                roots_dir: None,
             })),
             in_flight: Arc::new(AtomicUsize::new(0)),
             attention: Arc::new(std::sync::Mutex::new(Attention::default())),
@@ -1309,6 +1354,7 @@ impl Proxy {
             opts: Arc::new(opts),
             project_dir,
             pending_claude: Arc::new(Mutex::new(pending)),
+            roots_gate: Arc::new(Mutex::new(())),
         };
         if !deferred {
             proxy.connect_initial().await;
@@ -1319,7 +1365,7 @@ impl Proxy {
     /// The first connection of this window. Never fails: a proxy that cannot
     /// connect still serves its local tools and explains itself.
     async fn connect_initial(&self) {
-        let inputs = self.opts.inputs.clone();
+        let inputs = self.inputs(&*self.state.read().await);
         if let Err(e) = self.connect_with(&inputs, true).await {
             tracing::warn!(error = %e, "proxy started without a bus connection");
             self.state.write().await.disconnected_reason = Some(format!("{e:#}"));
@@ -1356,6 +1402,110 @@ impl Proxy {
             st.disconnected_reason = None;
         }
         self.connect_initial().await;
+    }
+
+    /// Wait, bounded, for a `roots/list` discovery in flight.
+    async fn await_roots(&self) {
+        let _ = tokio::time::timeout(ROOTS_WAIT * 2, self.roots_gate.lock()).await;
+    }
+
+    /// What the resolver is given: the command line's inputs, with the
+    /// project directory an MCP root named when there is one.
+    fn inputs(&self, st: &State) -> Inputs {
+        let mut inputs = self.opts.inputs.clone();
+        if let Some(dir) = &st.roots_dir {
+            inputs.project_dir = Some(dir.clone());
+        }
+        inputs
+    }
+
+    /// Find the project through the client's MCP roots when the proxy's own
+    /// directory has none (#236): a globally installed host plugin starts
+    /// the proxy in the plugin's directory, far from the workspace. Never
+    /// overrides `--project-dir`, a profile chosen by flag or environment,
+    /// or a `.acs.toml` the working directory already found.
+    // Roots are deprecated by SEP-2577, but Antigravity still advertises
+    // and answers them, and it is the host this exists for.
+    #[allow(deprecated)]
+    async fn discover_roots(&self, peer: &rmcp::Peer<RoleServer>) {
+        if self.opts.inputs.project_dir.is_some() || self.opts.inputs.profile.is_some() {
+            return;
+        }
+        let start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if matches!(context::find_project(&start), Ok(Some(_))) {
+            return;
+        }
+        let roots = match tokio::time::timeout(ROOTS_WAIT, peer.list_roots()).await {
+            Ok(Ok(r)) => r.roots,
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "the client did not answer roots/list");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!("the client did not answer roots/list in time");
+                return;
+            }
+        };
+        let Some(dir) = roots
+            .iter()
+            .filter_map(|r| path_of_file_uri(&r.uri))
+            .find(|p| matches!(context::find_project(p), Ok(Some(_))))
+        else {
+            return;
+        };
+        tracing::info!(root = %dir.display(), "project found through the client's MCP roots");
+        if let Err(e) = self.adopt_project_dir(dir).await {
+            tracing::warn!(error = %e, "the project an MCP root names could not be used");
+            return;
+        }
+        // The catalogue may have gone from local tools only to the bus's.
+        let _ = peer.notify_tool_list_changed().await;
+    }
+
+    /// Use `dir` as the project directory. A window already connected as the
+    /// profile the project names only picks up its labels; otherwise it
+    /// connects (or switches, within the team) through the usual path.
+    async fn adopt_project_dir(&self, dir: PathBuf) -> anyhow::Result<()> {
+        let (inputs, same_profile, connected) = {
+            let mut st = self.state.write().await;
+            let previous = st.roots_dir.replace(dir);
+            let inputs = self.inputs(&st);
+            let resolved = match context::resolve(&inputs) {
+                Ok(r) => r,
+                Err(e) => {
+                    st.roots_dir = previous;
+                    return Err(e);
+                }
+            };
+            let same = st
+                .connected
+                .as_ref()
+                .is_some_and(|c| c.resolved.profile == resolved.profile);
+            if same {
+                if st.project.is_none() {
+                    st.project = resolved.project.clone();
+                }
+                if st.channel.is_none() {
+                    st.channel = resolved.channel.clone();
+                }
+                if let Some(c) = st.connected.as_mut() {
+                    c.resolved.project_root = resolved.project_root.clone();
+                }
+            }
+            (inputs, same, st.connected.is_some())
+        };
+        if !same_profile {
+            // Connected under another profile (the user default) means a
+            // switch: that credential belongs to the identity left behind.
+            if let Err(e) = self.connect_with(&inputs, !connected).await {
+                self.state.write().await.roots_dir = None;
+                return Err(e);
+            }
+            return Ok(());
+        }
+        self.heartbeat("active").await;
+        self.write_binding().await;
+        Ok(())
     }
 
     /// Connect a context and make it current. Verifies before it touches
@@ -1544,12 +1694,16 @@ impl Proxy {
     /// One heartbeat with `fields`, plus repo/branch and this window's
     /// labels. True when the bus accepted it.
     async fn publish_presence(&self, fields: Value) -> bool {
-        let (remote, project, role) = {
+        let (remote, project, role, dir) = {
             let st = self.state.read().await;
             let Some(c) = &st.connected else { return false };
-            (c.remote.clone(), st.project.clone(), st.role.clone())
+            let dir = st
+                .roots_dir
+                .clone()
+                .unwrap_or_else(|| self.project_dir.clone());
+            (c.remote.clone(), st.project.clone(), st.role.clone(), dir)
         };
-        let (repo, branch) = git_place(&self.project_dir);
+        let (repo, branch) = git_place(&dir);
         let mut args = fields;
         args["ttl_seconds"] = json!(PRESENCE_TTL_SECS);
         if let Some(r) = repo {
@@ -1652,6 +1806,16 @@ impl Proxy {
             project_root: c
                 .and_then(|c| c.resolved.project_root.as_ref())
                 .map(|p| p.display().to_string()),
+            project_root_from: c.and_then(|c| c.resolved.project_root.as_ref()).map(|_| {
+                if st.roots_dir.is_some() {
+                    "mcp-roots"
+                } else if self.opts.inputs.project_dir.is_some() {
+                    "project-dir"
+                } else {
+                    "working-directory"
+                }
+                .to_owned()
+            }),
             bus: c.map(|c| c.resolved.mcp_url.clone()),
             attention: reported.map(|(s, _)| s.to_owned()),
             attention_reported_seconds_ago: reported.map(|(_, at)| at.elapsed().as_secs()),
@@ -1687,7 +1851,7 @@ impl Proxy {
             .map(|p| p.trim().to_owned())
             .filter(|p| !p.is_empty())
         {
-            let mut inputs = self.opts.inputs.clone();
+            let mut inputs = self.inputs(&*self.state.read().await);
             inputs.profile = Some(profile);
             // A profile switch is a switch of credentials: explicit ones from
             // the environment would otherwise win and make the call a no-op.
@@ -1790,11 +1954,11 @@ impl Proxy {
             let st = self.state.read().await;
             match st.identity() {
                 Some(id) => {
-                    let mut i = self.opts.inputs.clone();
+                    let mut i = self.inputs(&st);
                     i.profile = id.profile;
                     i
                 }
-                None => self.opts.inputs.clone(),
+                None => self.inputs(&st),
             }
         };
         match self.connect_with(&inputs, true).await {
@@ -2774,8 +2938,30 @@ impl ServerHandler for Proxy {
         ))
     }
 
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+        let wants_roots = context
+            .peer
+            .peer_info()
+            .is_some_and(|i| i.capabilities.roots.is_some());
+        if !wants_roots {
+            return;
+        }
+        // Taken before returning, so a request that follows waits on it.
+        let gate = self.roots_gate.clone().lock_owned().await;
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.discover_roots(&context.peer).await;
+            drop(gate);
+        });
+    }
+
     fn get_info(&self) -> ServerConfig {
-        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
+        let mut info = ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        );
         // `get_info` is synchronous; the state lock is uncontended at
         // initialize time, and a contended read simply yields the
         // disconnected wording until the next call.
@@ -2793,6 +2979,7 @@ impl ServerHandler for Proxy {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         self.admit(context.meta.client_info().as_ref()).await;
+        self.await_roots().await;
         let mut tools = local_tools();
         if let Some(c) = &self.state.read().await.connected {
             tools.extend(c.tools.iter().cloned().map(as_proxied));
@@ -2807,6 +2994,7 @@ impl ServerHandler for Proxy {
     ) -> Result<CallToolResponse, ErrorData> {
         // The transport lifts `_meta` out of the params into the context.
         self.admit(context.meta.client_info().as_ref()).await;
+        self.await_roots().await;
         self.observe_meta(&context.meta).await?;
         // Every host call is the model at work; a wait is the model blocked.
         let _turn = ToolTurn::enter(self, request.name.as_ref());

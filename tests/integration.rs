@@ -319,7 +319,11 @@ async fn assert_mcp_2026_07_28_results(client: &Client, tools: &[&str]) {
 }
 
 /// Call a tool and return its structured output.
-async fn call(client: &Client, name: &str, args: Value) -> Value {
+async fn call<S: rmcp::service::Service<rmcp::RoleClient>>(
+    client: &RunningService<rmcp::RoleClient, S>,
+    name: &str,
+    args: Value,
+) -> Value {
     let args: serde_json::Map<String, Value> = serde_json::from_value(args).unwrap();
     let result = client
         .call_tool(CallToolRequestParams::new(name.to_string()).with_arguments(args))
@@ -18791,6 +18795,144 @@ async fn an_inherited_claude_session_id_never_takes_over_the_parent() {
     let who = call(&modern_cc, "whoami", json!({})).await;
     assert_eq!(who["session_identity"]["session_id"], parent_id, "{who}");
     let _ = modern_cc.cancel().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// A client that advertises `roots` and lists the given directories, the
+/// way Antigravity answers `roots/list`.
+#[derive(Clone)]
+struct RootsClient(Vec<String>);
+
+impl rmcp::ClientHandler for RootsClient {
+    #[allow(deprecated)]
+    fn get_info(&self) -> ClientConfig {
+        let mut config = client_named("antigravity-client");
+        config.capabilities = rmcp::model::ClientCapabilities::builder()
+            .enable_roots()
+            .build();
+        config
+    }
+
+    #[allow(deprecated)]
+    async fn list_roots(
+        &self,
+        _context: rmcp::service::RequestContext<rmcp::RoleClient>,
+    ) -> Result<rmcp::model::ListRootsResult, rmcp::ErrorData> {
+        let mut result = rmcp::model::ListRootsResult::default();
+        result.roots = self.0.iter().map(rmcp::model::Root::new).collect();
+        Ok(result)
+    }
+}
+
+/// The proxy started the way a global host plugin starts it: in a directory
+/// of its own, with no `--project-dir`.
+fn proxy_transport_in(
+    config_dir: &std::path::Path,
+    cwd: &std::path::Path,
+) -> rmcp::transport::TokioChildProcess {
+    use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+    let bin = env!("CARGO_BIN_EXE_ai-crew-sync");
+    TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("BUS_CONFIG_DIR", config_dir)
+            .env("RUST_LOG", "warn")
+            .current_dir(cwd)
+            .args(["mcp", "proxy"]);
+    }))
+    .expect("spawn proxy")
+}
+
+/// A globally installed Antigravity plugin starts the proxy in the plugin's
+/// directory (#236). The workspace's `.acs.toml` is found through the
+/// client's MCP roots, with no user default profile, and never overrides
+/// one the working directory found itself.
+#[tokio::test]
+async fn the_proxy_finds_the_project_through_mcp_roots() {
+    let h = require_db!("t_proxy_roots");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let plugin = dir.join("plugins").join("ai-crew-sync");
+    std::fs::create_dir_all(&plugin).unwrap();
+    // A space in the path: the root arrives percent-encoded.
+    let ws = dir.join("my workspace");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(
+        ws.join(".acs.toml"),
+        "profile = \"acme\"\nproject = \"market-data\"\nchannel = \"md\"\n",
+    )
+    .unwrap();
+    let uri = |p: &std::path::Path| format!("file://{}", p.display()).replace(' ', "%20");
+
+    // A root inside the project counts; one with no project is skipped.
+    let client = RootsClient(vec![
+        "https://example.com/not-a-file".to_owned(),
+        uri(&plugin),
+        uri(&ws.join("src")),
+    ])
+    .serve(proxy_transport_in(&dir, &plugin))
+    .await
+    .expect("proxy initialize");
+    let list = client.list_tools(None).await.unwrap();
+    assert!(
+        list.tools.iter().any(|t| t.name == "whoami"),
+        "the bus's tools are listed once the root is adopted"
+    );
+    let st = call(&client, "session_status", json!({})).await;
+    assert_eq!(st["connected"], true, "{st}");
+    assert_eq!(st["profile"], "acme", "{st}");
+    assert_eq!(st["project"], "market-data", "{st}");
+    assert_eq!(st["channel"], "md", "{st}");
+    assert_eq!(st["project_root_from"], "mcp-roots", "{st}");
+    assert!(
+        st["project_root"]
+            .as_str()
+            .unwrap()
+            .ends_with("my workspace"),
+        "{st}"
+    );
+    assert_eq!(call(&client, "whoami", json!({})).await["agent"], "joaquin");
+    let _ = client.cancel().await;
+
+    // A host without roots behaves as before: nothing to connect with.
+    let plain = client_named("codex-mcp-client")
+        .serve(proxy_transport_in(&dir, &plugin))
+        .await
+        .expect("proxy initialize");
+    let st = call(&plain, "session_status", json!({})).await;
+    assert_eq!(st["connected"], false, "{st}");
+    assert!(st["project_root_from"].is_null(), "{st}");
+    let _ = plain.cancel().await;
+
+    // The working directory's own .acs.toml wins over any root.
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".acs.toml"),
+        "profile = \"acme\"\nproject = \"own\"\n",
+    )
+    .unwrap();
+    let local = RootsClient(vec![uri(&ws)])
+        .serve(proxy_transport_in(&dir, &repo))
+        .await
+        .expect("proxy initialize");
+    let st = call(&local, "session_status", json!({})).await;
+    assert_eq!(st["project"], "own", "{st}");
+    assert_eq!(st["project_root_from"], "working-directory", "{st}");
+    let _ = local.cancel().await;
+
+    // So does --project-dir.
+    let flagged = RootsClient(vec![uri(&ws)])
+        .serve(proxy_transport(&dir, &repo, &[], &[]))
+        .await
+        .expect("proxy initialize");
+    let st = call(&flagged, "session_status", json!({})).await;
+    assert_eq!(st["project"], "own", "{st}");
+    assert_eq!(st["project_root_from"], "project-dir", "{st}");
+    let _ = flagged.cancel().await;
 
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;

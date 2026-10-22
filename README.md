@@ -563,10 +563,14 @@ Antigravity has no background hooks, so an idle conversation is not woken.
 
 **Project defaults with a global install.** A plugin installed with
 `agy plugin install` starts the proxy in the plugin's directory, not in your
-workspace, so the workspace's `.acs.toml` is not found. Set a user default
-profile (`--default` above). Alternatively, install the plugin per workspace
-under `<workspace>/.agents/plugins/ai-crew-sync`, where `.acs.toml` is found.
-Issue #236 tracks finding the workspace through MCP roots.
+workspace. When no `.acs.toml` is found from there, the proxy asks the client
+for its MCP roots (`roots/list`, which Antigravity answers). It then uses the
+first `file://` root that is inside a project with a `.acs.toml`, so the
+workspace's profile, project and channel apply with no user default.
+`session_status` reports `project_root_from: mcp-roots`. A root never
+overrides `--project-dir`, a profile from `--profile` / `BUS_PROFILE`, or a
+`.acs.toml` the working directory found. Hosts without `roots` (Codex)
+behave as before.
 
 Without the plugin, register the server in `~/.gemini/config/mcp_config.json`
 (see `examples/antigravity-mcp_config.json`). `ai-crew-sync proxy-config`
