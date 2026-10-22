@@ -1,0 +1,5 @@
+# LF everywhere, whatever the checkout's platform. A Windows checkout with
+# core.autocrlf would otherwise hand the hooks' shell scripts CRLF (which a
+# POSIX shell cannot run) and make the generated plugin commands differ from
+# their recipes byte for byte (#242).
+* text=auto eol=lf
