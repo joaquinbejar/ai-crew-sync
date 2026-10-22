@@ -43,7 +43,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn default_socket() -> anyhow::Result<PathBuf> {
     let home = match std::env::var_os("CODEX_HOME") {
         Some(h) if !h.is_empty() => PathBuf::from(h),
-        _ => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".codex"),
+        _ => crate::admin_cli::home_dir()
+            .context("neither CODEX_HOME nor HOME is set")?
+            .join(".codex"),
     };
     Ok(home
         .join("app-server-control")

@@ -21,7 +21,10 @@ pub mod admin_api;
 pub mod admin_cli;
 pub mod auth;
 pub mod client;
+// The Codex app-server is reached over a Unix socket only.
+#[cfg(unix)]
 pub mod codex;
+#[cfg(unix)]
 pub mod codex_wake;
 pub mod context;
 pub mod dashboard;

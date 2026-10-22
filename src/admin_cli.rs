@@ -35,9 +35,18 @@ use crate::auth::ADMIN_TOKEN_PREFIX;
 /// configuration directory.
 pub const CONFIG_FILE: &str = "admin";
 
+/// The user's home directory: `HOME`, else `USERPROFILE`, which is what
+/// native Windows sets instead.
+pub fn home_dir() -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .find_map(|v| std::env::var_os(v).filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
 /// Where `admin login` keeps its state and `--save` writes token files.
 /// `BUS_CONFIG_DIR`, else `$XDG_CONFIG_HOME/ai-crew-sync`, else
-/// `$HOME/.config/ai-crew-sync`.
+/// `<home>/.config/ai-crew-sync` (see [`home_dir`]).
 pub fn config_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("BUS_CONFIG_DIR").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(dir));
@@ -45,10 +54,11 @@ pub fn config_dir() -> anyhow::Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(xdg).join("ai-crew-sync"));
     }
-    let home = std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .context("neither BUS_CONFIG_DIR, XDG_CONFIG_HOME nor HOME is set")?;
-    Ok(PathBuf::from(home).join(".config").join("ai-crew-sync"))
+    let home = home_dir().context(
+        "neither BUS_CONFIG_DIR, XDG_CONFIG_HOME, HOME nor USERPROFILE is set; set \
+         BUS_CONFIG_DIR to the directory that holds profiles.toml",
+    )?;
+    Ok(home.join(".config").join("ai-crew-sync"))
 }
 
 /// Endpoint and credential of a logged-in administrator.

@@ -123,6 +123,14 @@ Linux binaries are statically linked against musl, so they run on any
 distribution regardless of its glibc. Every package is installed and executed
 inside the distribution it targets before a release publishes it.
 
+**Windows** is supported as a client (CLI, console client, `mcp proxy`) built
+from source: `cargo install ai-crew-sync` with the MSVC Build Tools. The
+configuration directory is `%USERPROFILE%\.config\ai-crew-sync` unless
+`BUS_CONFIG_DIR` says otherwise. `context codex-wake` is not available
+there, because the Codex app-server listens on a Unix socket. The plugin's
+hooks need a POSIX shell (Git Bash) and Python; a `python3` that is only the
+Microsoft Store alias is detected and skipped in favour of `python`.
+
 ## Quick start (docker-compose)
 
 ```bash

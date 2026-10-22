@@ -1401,6 +1401,14 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                 );
             }
         }
+        #[cfg(not(unix))]
+        ContextCmd::CodexWake { .. } => {
+            anyhow::bail!(
+                "codex-wake reaches the Codex app-server over a Unix socket, which this platform \
+                 does not have; run it on macOS or Linux"
+            );
+        }
+        #[cfg(unix)]
         ContextCmd::CodexWake {
             thread,
             socket,

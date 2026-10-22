@@ -17,6 +17,7 @@ bad() { echo "  FAIL  $1: $2"; FAIL=1; }
 mkdir -p "$WORK/bin"
 cp "$ROOT/heartbeat.sh" "$WORK/bin/heartbeat.sh"
 cp "$ROOT/host-payload.sh" "$WORK/bin/host-payload.sh"
+cp "$ROOT/python.sh" "$WORK/bin/python.sh"
 cat > "$WORK/bin/bus-call.sh" <<'FAKE'
 #!/bin/sh
 printf '%s\t%s\n' "$1" "${2:-{\}}" >> "$CAPTURE"
@@ -732,6 +733,32 @@ for event, handlers in agy["ai-crew-sync"].items():
 mcp = json.load(open(os.path.join(root, "mcp_config.json")))["mcpServers"]["ai-crew-sync"]
 assert mcp == {"command": "ai-crew-sync", "args": ["mcp", "proxy"]}, mcp
 PY
+
+# A python3 that is found but does not run (the Microsoft Store alias on
+# Windows exits 49) is not a Python (#242): the probe falls through to
+# `python`, and with neither the hooks take their no-Python path.
+mkdir -p "$WORK/storepy" "$WORK/storepy2"
+printf '#!/bin/sh\nexit 49\n' > "$WORK/storepy/python3"
+chmod +x "$WORK/storepy/python3"
+for tool in dirname cat; do ln -sf "$(command -v "$tool")" "$WORK/storepy/$tool"; done
+cp "$WORK/storepy/python3" "$WORK/storepy2/python3"
+ln -sf "$(command -v python3)" "$WORK/storepy2/python"
+picked="$(PATH="$WORK/storepy2" ROOT="$ROOT" /bin/sh -c '. "$ROOT/python.sh"; printf %s "$PY"')"
+[ "$picked" = python ] && ok "a python3 that does not run falls through to python" \
+    || bad "python probe" "the probe picked '$picked' with a broken python3 and a working python"
+none="$(PATH="$WORK/storepy" ROOT="$ROOT" /bin/sh -c '. "$ROOT/python.sh"; printf %s "$PY"')"
+[ -z "$none" ] && ok "a python3 that does not run is no Python" \
+    || bad "python probe" "the probe trusted a python3 that exits 49: '$none'"
+out="$(printf '{}' | PATH="$WORK/storepy" ANTIGRAVITY_CONVERSATION_ID=ag-x \
+    /bin/sh "$ROOT/session-start.sh" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "{}" ] \
+    && ok "SessionStart takes its no-Python path with only a broken python3" \
+    || bad "python probe" "SessionStart with only a broken python3: rc=$rc out=$out"
+out="$(printf '{}' | PATH="$WORK/storepy" ANTIGRAVITY_CONVERSATION_ID=ag-x \
+    /bin/sh "$ROOT/stop-drain.sh" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "{}" ] \
+    && ok "the Stop drain takes its no-Python path with only a broken python3" \
+    || bad "python probe" "the Stop drain with only a broken python3: rc=$rc out=$out"
 
 [ "$FAIL" -eq 0 ] && echo "plugin hooks: clean" || echo "plugin hooks: FAILURES"
 exit "$FAIL"

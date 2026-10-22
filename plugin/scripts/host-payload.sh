@@ -10,10 +10,11 @@
 #   exports ANTIGRAVITY_CONVERSATION_ID to every hook it runs (verified with
 #   agy 1.4.3).
 #
-# Without python3 nothing can be parsed: HOOK_HOST stays claude and
+# Without Python nothing can be parsed: HOOK_HOST stays claude and
 # HOST_SESSION empty, which every hook already treats as "no binding".
 PAYLOAD="$(cat 2>/dev/null || true)"
-_acs_ids="$(PAYLOAD="$PAYLOAD" python3 -c 'import json, os
+. "$DIR/python.sh"
+_acs_ids="$(PAYLOAD="$PAYLOAD" "${PY:-python3}" -c 'import json, os
 try:
     p = json.loads(os.environ.get("PAYLOAD") or "{}")
 except Exception:
@@ -61,7 +62,7 @@ acs_quiet_exit() {
 
 # Hand TEXT to the model at session start, in this host's contract.
 acs_context() {
-    ACS_TEXT="$1" HOOK_HOST="$HOOK_HOST" python3 -c 'import json, os
+    ACS_TEXT="$1" HOOK_HOST="$HOOK_HOST" "${PY:-python3}" -c 'import json, os
 text = os.environ["ACS_TEXT"]
 if os.environ.get("HOOK_HOST") == "antigravity":
     print(json.dumps({"injectSteps": [{"systemMessage": {"systemMessage": text}}]}))

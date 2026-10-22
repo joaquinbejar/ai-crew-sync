@@ -4,9 +4,10 @@
 # Always exits 0; produces no output when the bus is unreachable.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-# Without python3 the payload cannot be read; under Antigravity, which reads
+# Without Python the payload cannot be read; under Antigravity, which reads
 # every hook's stdout as JSON, still answer an empty object.
-if ! command -v python3 >/dev/null 2>&1; then
+. "$DIR/python.sh"
+if [ -z "$PY" ]; then
     [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ] && printf '{}\n'
     exit 0
 fi
@@ -113,7 +114,7 @@ SUGGESTED="$(git config --get remote.origin.url 2>/dev/null \
 DIG="$("$DIR/bus-call.sh" team_digest "{\"hours\":$HOURS}" 2>/dev/null || true)"
 export WHO DIG BUS_DIGEST_HOURS="$HOURS" SUGGESTED BUS_SESSION="${BUS_SESSION:-}" HOOK_HOST
 
-python3 - <<'PY' 2>/dev/null || true
+"$PY" - <<'PY' 2>/dev/null || true
 import json, os
 
 def quiet():

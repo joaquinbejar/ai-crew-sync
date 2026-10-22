@@ -65,6 +65,25 @@ jobs:
           AI_CREW_SYNC_REQUIRE_NATS: "1"
           TEST_NATS_URL: nats://127.0.0.1:4222
 
+  # Native Windows (#242): the binary and its unit tests, without the
+  # Postgres/NATS integration suite, which needs Linux service containers.
+  # What is Unix-only (the Codex app-server client) is compiled out there.
+  windows:
+    name: windows (build, clippy, unit tests)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+      - name: Clippy
+        run: cargo clippy --lib --bins -- -D warnings
+      - name: Unit tests
+        run: cargo test --lib --bins
+
   # The floor declared in Cargo.toml. A dependency bump or a language feature
   # needing a newer compiler fails HERE rather than in a user's `cargo install`.
   # Raising this pin is a deliberate change — see the MSRV policy in the README.

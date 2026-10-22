@@ -14,7 +14,8 @@
 # unreachable, or when the bus is not configured at all.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-if ! command -v python3 >/dev/null 2>&1; then
+. "$DIR/python.sh"
+if [ -z "$PY" ]; then
     [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ] && printf '{}\n'
     exit 0
 fi
@@ -62,7 +63,7 @@ STATE_DIR="${TMPDIR:-/tmp}"
 export PAYLOAD FEED WHO STATE_DIR HOOK_HOST HOST_SESSION
 # Which session this window is, as the server reports it: with the proxy the
 # label is derived from the conversation id, not exported in BUS_SESSION.
-MY_SESSION="$(WHO="$WHO" python3 -c 'import json,os,sys
+MY_SESSION="$(WHO="$WHO" "$PY" -c 'import json,os,sys
 try:
     sc = json.loads(os.environ.get("WHO") or "{}")["result"]["structuredContent"]
     sys.stdout.write(str(sc.get("session") or ""))
@@ -70,7 +71,7 @@ except Exception:
     sys.stdout.write("")' 2>/dev/null || true)"
 export BUS_SESSION="${MY_SESSION:-${BUS_SESSION:-}}"
 
-python3 - <<'PY' 2>/dev/null || true
+"$PY" - <<'PY' 2>/dev/null || true
 import json, os, re
 
 def quiet():

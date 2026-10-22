@@ -127,6 +127,15 @@ funcionan en cualquier distribución sea cual sea su glibc. Cada paquete se
 instala y se ejecuta dentro de la distribución a la que apunta antes de que
 una release lo publique.
 
+**Windows** está soportado como cliente (CLI, cliente de consola,
+`mcp proxy`) compilado desde el código: `cargo install ai-crew-sync` con las
+MSVC Build Tools. El directorio de configuración es
+`%USERPROFILE%\.config\ai-crew-sync` salvo que `BUS_CONFIG_DIR` diga otra
+cosa. `context codex-wake` no está disponible ahí, porque el app-server de
+Codex escucha en un socket Unix. Los hooks del plugin necesitan una shell
+POSIX (Git Bash) y Python; un `python3` que solo es el alias de la Microsoft
+Store se detecta y se descarta en favor de `python`.
+
 ## Arranque rápido (docker-compose)
 
 ```bash
