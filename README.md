@@ -203,7 +203,7 @@ make deploy                       # preflight, then docker stack deploy
 without `BUS_PUBLIC_HOST`; it also refuses when the proxy network
 (`TRAEFIK_NETWORK`, default `edge`) does not exist on the swarm. `make
 deploy-check` runs the variable checks alone and never contacts the cluster.
-Pin a full version such as `0.7.7`: each release also publishes a moving
+Pin a full version such as `0.7.8`: each release also publishes a moving
 `0.7` tag, and the preflight does not catch it.
 
 On a swarm of more than one node, pin the stateful services: the database
@@ -1265,7 +1265,7 @@ applied but is missing in the resolved migrations"). To roll back, set
 the older version.
 
 ```bash
-export BUS_VERSION=0.7.7
+export BUS_VERSION=0.7.8
 make deploy                                    # Swarm; or, from the repository root:
 docker compose --project-directory . -f Docker/docker-compose.yml pull && make up
 ```
