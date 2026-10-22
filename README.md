@@ -878,7 +878,8 @@ the credential it saved.
 
 **Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
 (any host that can set a per-window variable), `CLAUDE_CODE_SESSION_ID`
-(Claude Code sets it on MCP server processes), `ANTIGRAVITY_CONVERSATION_ID`
+(Claude Code sets it on MCP server processes; honoured only for Claude Code's
+own client, see below), `ANTIGRAVITY_CONVERSATION_ID`
 (where an Antigravity surface exports it to MCP servers), the conversation
 id a request carries in `_meta` (Antigravity's
 `antigravity.google/conversation_id`, Codex's `threadId`), otherwise the
@@ -896,11 +897,14 @@ sends the conversation id in `_meta` on every `tools/call`, so `session_status`
 reports `binding: antigravity` and hooks of the same conversation find its
 binding.
 
-One known limitation: a host started from inside a Claude Code session (its
-terminal, or a tool it runs) inherits `CLAUDE_CODE_SESSION_ID`, and so do the
-proxies that host starts. They then bind to the Claude conversation, taking
-over its session. Start other hosts from a plain terminal, or clear the
-variable when launching them (`env -u CLAUDE_CODE_SESSION_ID agy`).
+A host started from inside a Claude Code session (its terminal, or a tool it
+runs) inherits `CLAUDE_CODE_SESSION_ID`, and so do the proxies that host
+starts. The variable alone is therefore not trusted: the proxy waits until the
+client names itself (`clientInfo` in `initialize`, or in a request's `_meta`)
+and binds to that Claude conversation only when the client is Claude Code
+(`claude-code`). Codex, Antigravity or any other client started there gets a
+conversation of its own, and the parent window keeps its session, epoch and
+binding record untouched.
 
 The `initialize` result's `instructions` tell the model who and where this
 window is (agent, team, session address, project, role, channel) plus the

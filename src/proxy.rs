@@ -16,7 +16,9 @@
 //!
 //! - **Conversation identity**, in order: `--host-session` / `BUS_HOST_SESSION`
 //!   (any host that can set per-window environment), `CLAUDE_CODE_SESSION_ID`
-//!   (Claude Code exports it to MCP server processes),
+//!   (Claude Code exports it to MCP server processes; trusted only once the
+//!   client names itself `claude-code`, because hosts started from a Claude
+//!   Code terminal inherit it),
 //!   `ANTIGRAVITY_CONVERSATION_ID` (where an Antigravity surface exports it
 //!   to MCP servers), the conversation id a request carries in `_meta`
 //!   (`antigravity.google/conversation_id` from Antigravity, `threadId` from
@@ -124,7 +126,8 @@ pub const ANTIGRAVITY_META_KEY: &str = "antigravity.google/conversation_id";
 pub enum Binding {
     /// `--host-session` or `BUS_HOST_SESSION`.
     Explicit,
-    /// `CLAUDE_CODE_SESSION_ID` in the environment.
+    /// `CLAUDE_CODE_SESSION_ID` in the environment, with a client that named
+    /// itself Claude Code.
     ClaudeCode,
     /// Google Antigravity's conversation id: `_meta["antigravity.google/
     /// conversation_id"]` on the first forwarded call, or
@@ -162,6 +165,19 @@ fn check_label(field: &str, raw: &str) -> Result<Option<String>, ErrorData> {
     crate::store::presence::normalize_label(field, raw)
         .map(|v| (!v.is_empty()).then_some(v))
         .map_err(|e| ErrorData::invalid_params(e.to_string(), None))
+}
+
+/// A non-blank environment variable, trimmed.
+fn env_id(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether an MCP client name is Claude Code's own (`claude-code`).
+fn is_claude_code(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case("claude-code")
 }
 
 fn random_session() -> String {
@@ -481,6 +497,13 @@ pub struct Proxy {
     wake: Arc<tokio::sync::Notify>,
     opts: Arc<ProxyOptions>,
     project_dir: PathBuf,
+    /// A `CLAUDE_CODE_SESSION_ID` from the environment that is not yet
+    /// trusted. A host started from a Claude Code terminal inherits the
+    /// parent's id, so the variable alone cannot tell a Claude Code child
+    /// from Codex or Antigravity launched there (#234). Nothing is resumed
+    /// until the client names itself; held across the connect, so a request
+    /// racing the first one waits for the decision instead of bypassing it.
+    pending_claude: Arc<Mutex<Option<String>>>,
 }
 
 // -------------------------------------------------------------- local tools --
@@ -1236,37 +1259,38 @@ impl Proxy {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let (host_id, binding) = if let Some(id) = opts
+        let explicit = opts
             .host_session
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-        {
-            (Some(id.to_owned()), Binding::Explicit)
-        } else if let Some(id) = std::env::var("CLAUDE_CODE_SESSION_ID")
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-        {
-            (Some(id), Binding::ClaudeCode)
-        } else if let Some(id) = std::env::var("ANTIGRAVITY_CONVERSATION_ID")
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-        {
-            (Some(id), Binding::Antigravity)
-        } else {
-            (None, Binding::Instance)
+            .map(str::to_owned);
+        let claude = env_id("CLAUDE_CODE_SESSION_ID");
+        let (host_id, binding) = match (&explicit, &claude) {
+            (Some(id), _) => (Some(id.clone()), Binding::Explicit),
+            // Deferred: see `pending_claude`. Until then the window is not
+            // bound and not connected.
+            (None, Some(_)) => (None, Binding::Instance),
+            (None, None) => match env_id("ANTIGRAVITY_CONVERSATION_ID") {
+                Some(id) => (Some(id), Binding::Antigravity),
+                None => (None, Binding::Instance),
+            },
         };
+        let pending = explicit.is_none().then_some(claude).flatten();
         let session = match &host_id {
             Some(id) => session_for(id),
             None => random_session(),
         };
+        let deferred = pending.is_some();
 
         let proxy = Self {
             state: Arc::new(RwLock::new(State {
                 connected: None,
-                disconnected_reason: None,
+                disconnected_reason: deferred.then(|| {
+                    "waiting for the MCP client to identify itself before binding the \
+                     conversation"
+                        .to_owned()
+                }),
                 session,
                 binding,
                 host_id,
@@ -1284,13 +1308,54 @@ impl Proxy {
             wake: Arc::new(tokio::sync::Notify::new()),
             opts: Arc::new(opts),
             project_dir,
+            pending_claude: Arc::new(Mutex::new(pending)),
         };
-        let inputs = proxy.opts.inputs.clone();
-        if let Err(e) = proxy.connect_with(&inputs, true).await {
-            tracing::warn!(error = %e, "proxy started without a bus connection");
-            proxy.state.write().await.disconnected_reason = Some(format!("{e:#}"));
+        if !deferred {
+            proxy.connect_initial().await;
         }
         proxy
+    }
+
+    /// The first connection of this window. Never fails: a proxy that cannot
+    /// connect still serves its local tools and explains itself.
+    async fn connect_initial(&self) {
+        let inputs = self.opts.inputs.clone();
+        if let Err(e) = self.connect_with(&inputs, true).await {
+            tracing::warn!(error = %e, "proxy started without a bus connection");
+            self.state.write().await.disconnected_reason = Some(format!("{e:#}"));
+        }
+    }
+
+    /// Decide a deferred Claude Code binding once the client has named
+    /// itself, then connect. Only Claude Code's own client gets the
+    /// conversation the variable names; any other host started under it is
+    /// a conversation of its own, so the parent's session, epoch and binding
+    /// record are never touched (#234). A no-op after the first call.
+    async fn admit(&self, client: Option<&rmcp::model::Implementation>) {
+        let mut pending = self.pending_claude.lock().await;
+        let Some(id) = pending.take() else { return };
+        let name = client.map(|c| c.name.as_str()).unwrap_or_default();
+        {
+            let mut st = self.state.write().await;
+            if is_claude_code(name) {
+                st.session = session_for(&id);
+                st.host_id = Some(id);
+                st.binding = Binding::ClaudeCode;
+            } else {
+                tracing::info!(
+                    client = name,
+                    "CLAUDE_CODE_SESSION_ID is set but the client is not Claude Code; it was \
+                     inherited from a parent window and is ignored"
+                );
+                if let Some(ag) = env_id("ANTIGRAVITY_CONVERSATION_ID") {
+                    st.session = session_for(&ag);
+                    st.host_id = Some(ag);
+                    st.binding = Binding::Antigravity;
+                }
+            }
+            st.disconnected_reason = None;
+        }
+        self.connect_initial().await;
     }
 
     /// Connect a context and make it current. Verifies before it touches
@@ -2686,6 +2751,29 @@ fn tool_error(msg: String) -> CallToolResult {
 }
 
 impl ServerHandler for Proxy {
+    async fn initialize(
+        &self,
+        request: rmcp::model::InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::InitializeResult, ErrorData> {
+        // Bound and connected before answering, so the instructions the
+        // host hands the model name the right window.
+        self.admit(Some(&request.client_info)).await;
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
+    }
+
+    async fn discover(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::DiscoverResult, ErrorData> {
+        self.admit(context.meta.client_info().as_ref()).await;
+        Ok(rmcp::model::DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        ))
+    }
+
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         // `get_info` is synchronous; the state lock is uncontended at
@@ -2702,8 +2790,9 @@ impl ServerHandler for Proxy {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        self.admit(context.meta.client_info().as_ref()).await;
         let mut tools = local_tools();
         if let Some(c) = &self.state.read().await.connected {
             tools.extend(c.tools.iter().cloned().map(as_proxied));
@@ -2717,6 +2806,7 @@ impl ServerHandler for Proxy {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         // The transport lifts `_meta` out of the params into the context.
+        self.admit(context.meta.client_info().as_ref()).await;
         self.observe_meta(&context.meta).await?;
         // Every host call is the model at work; a wait is the model blocked.
         let _turn = ToolTurn::enter(self, request.name.as_ref());
