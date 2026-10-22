@@ -277,8 +277,17 @@ where
     T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
+    connect_modern_as(ClientConfig::default(), transport).await
+}
+
+/// [`connect_modern`] with a client of the caller's choosing (its name).
+async fn connect_modern_as<T, E, A>(config: ClientConfig, transport: T) -> Client
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
     use rmcp::{ClientLifecycleMode, ClientServiceExt};
-    ClientConfig::default()
+    config
         .serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Discover {
@@ -5900,6 +5909,27 @@ async fn spawn_proxy(
         .expect("proxy initialize")
 }
 
+/// A client that names itself `name` in `initialize`, the way a host does.
+fn client_named(name: &str) -> ClientConfig {
+    let mut config = ClientConfig::default();
+    config.client_info.name = name.to_owned();
+    config
+}
+
+/// [`spawn_proxy`] started by Claude Code: the only client whose
+/// `CLAUDE_CODE_SESSION_ID` the proxy trusts (#234).
+async fn spawn_claude_proxy(
+    config_dir: &std::path::Path,
+    project_dir: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Client {
+    client_named("claude-code")
+        .serve(proxy_transport(config_dir, project_dir, args, env))
+        .await
+        .expect("proxy initialize")
+}
+
 /// The proxy binary as a stdio transport, not yet connected.
 fn proxy_transport(
     config_dir: &std::path::Path,
@@ -6767,7 +6797,8 @@ async fn proxy_binds_a_conversation_id_to_a_stable_session() {
     assert_ne!(s2["session"], s1["session"]);
     assert_eq!(s2["session"], session_for("conv-2"));
     // Claude Code's variable binds the same way.
-    let claude = spawn_proxy(&dir, &repo, &[], &[("CLAUDE_CODE_SESSION_ID", "conv-1")]).await;
+    let claude =
+        spawn_claude_proxy(&dir, &repo, &[], &[("CLAUDE_CODE_SESSION_ID", "conv-1")]).await;
     let s3 = call(&claude, "session_status", json!({})).await;
     assert_eq!(s3["binding"], "claude-code");
     assert_eq!(
@@ -7150,7 +7181,11 @@ async fn five_conversations_share_a_repo_and_stay_separate() {
             Some(c) => vec![("BUS_HOST_SESSION", c)],
             None => vec![],
         };
-        let c = spawn_proxy(&dir, &repo, &["--role", role], &env).await;
+        let c = if name == "impl" {
+            spawn_claude_proxy(&dir, &repo, &["--role", role], &env).await
+        } else {
+            spawn_proxy(&dir, &repo, &["--role", role], &env).await
+        };
         let st = call(&c, "session_status", json!({})).await;
         assert_eq!(st["connected"], true, "{name}: {st}");
         assert_eq!(st["agent"], "joaquin");
@@ -18596,7 +18631,7 @@ async fn proxy_binds_an_antigravity_conversation() {
     let _ = meta.cancel().await;
 
     // Precedence.
-    let both = spawn_proxy(
+    let both = spawn_claude_proxy(
         &dir,
         &repo,
         &[],
@@ -18649,6 +18684,114 @@ async fn proxy_binds_an_antigravity_conversation() {
     for c in [explicit, blank] {
         let _ = c.cancel().await;
     }
+    let _ = std::fs::remove_dir_all(&dir);
+    h.shutdown().await;
+}
+
+/// A host started from a Claude Code terminal inherits the parent's
+/// `CLAUDE_CODE_SESSION_ID` (#234). Its proxy must not resume, fence or
+/// rewrite the parent's window: only Claude Code's own client gets that
+/// conversation, and a genuine Claude Code restart still resumes it.
+#[tokio::test]
+async fn an_inherited_claude_session_id_never_takes_over_the_parent() {
+    use ai_crew_sync::proxy::session_for;
+
+    let h = require_db!("t_proxy_inherited_claude");
+    let token = seed_agent(&h.pool, "acme", "joaquin").await;
+    let dir = proxy_config_dir(&h.base, &[("acme", "acme", "joaquin", &token)]);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join(".acs.toml"), "profile = \"acme\"\n").unwrap();
+    let inherited = [("CLAUDE_CODE_SESSION_ID", "cc-parent")];
+
+    // The parent Claude Code window.
+    let parent = spawn_claude_proxy(&dir, &repo, &[], &inherited).await;
+    let ps = call(&parent, "session_status", json!({})).await;
+    assert_eq!(ps["binding"], "claude-code", "{ps}");
+    assert_eq!(ps["session"], session_for("cc-parent"), "{ps}");
+    let parent_id =
+        call(&parent, "whoami", json!({})).await["session_identity"]["session_id"].clone();
+    let record = |dir: &std::path::Path| {
+        let b = ai_crew_sync::context::read_binding(dir, "cc-parent").expect("parent binding");
+        (b.session_token, b.epoch, b.binding)
+    };
+    let before = record(&dir);
+
+    // Hosts started from its terminal, legacy and 2026-07-28 lifecycles:
+    // each is a conversation of its own.
+    let codex = client_named("codex-mcp-client")
+        .serve(proxy_transport(&dir, &repo, &[], &inherited))
+        .await
+        .expect("proxy initialize");
+    let modern = connect_modern_as(
+        client_named("antigravity-client"),
+        proxy_transport(&dir, &repo, &[], &inherited),
+    )
+    .await;
+    for child in [&codex, &modern] {
+        let st = call(child, "session_status", json!({})).await;
+        assert_eq!(st["binding"], "instance", "{st}");
+        assert_ne!(st["session"], ps["session"], "{st}");
+        assert_eq!(st["connected"], true, "{st}");
+        let who = call(child, "whoami", json!({})).await;
+        assert_ne!(who["session_identity"]["session_id"], parent_id, "{who}");
+    }
+    // An Antigravity id in the environment still binds the child.
+    let agy = client_named("antigravity-client")
+        .serve(proxy_transport(
+            &dir,
+            &repo,
+            &[],
+            &[
+                ("CLAUDE_CODE_SESSION_ID", "cc-parent"),
+                ("ANTIGRAVITY_CONVERSATION_ID", "ag-child"),
+            ],
+        ))
+        .await
+        .expect("proxy initialize");
+    let st = call(&agy, "session_status", json!({})).await;
+    assert_eq!(st["binding"], "antigravity", "{st}");
+    assert_eq!(st["session"], session_for("ag-child"), "{st}");
+
+    // The parent kept its session, its epoch and its binding record, and
+    // still speaks: it was never fenced.
+    assert_eq!(
+        record(&dir),
+        before,
+        "the parent's binding record was rewritten"
+    );
+    let who = call(&parent, "whoami", json!({})).await;
+    assert_eq!(who["session_identity"]["session_id"], parent_id, "{who}");
+    for c in [codex, modern, agy] {
+        let _ = c.cancel().await;
+    }
+    assert_eq!(
+        record(&dir),
+        before,
+        "a child's exit touched the parent's record"
+    );
+    let _ = parent.cancel().await;
+
+    // A genuine Claude Code restart resumes the same session.
+    let again = spawn_claude_proxy(&dir, &repo, &[], &inherited).await;
+    let st = call(&again, "session_status", json!({})).await;
+    assert!(st["error"].is_null(), "the restart was refused: {st}");
+    let who = call(&again, "whoami", json!({})).await;
+    assert_eq!(who["session_identity"]["session_id"], parent_id, "{who}");
+    // And under the 2026-07-28 lifecycle, Claude Code is recognised from
+    // the clientInfo each request carries.
+    let _ = again.cancel().await;
+    let modern_cc = connect_modern_as(
+        client_named("claude-code"),
+        proxy_transport(&dir, &repo, &[], &inherited),
+    )
+    .await;
+    let st = call(&modern_cc, "session_status", json!({})).await;
+    assert_eq!(st["binding"], "claude-code", "{st}");
+    let who = call(&modern_cc, "whoami", json!({})).await;
+    assert_eq!(who["session_identity"]["session_id"], parent_id, "{who}");
+    let _ = modern_cc.cancel().await;
+
     let _ = std::fs::remove_dir_all(&dir);
     h.shutdown().await;
 }

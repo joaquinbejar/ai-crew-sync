@@ -908,7 +908,8 @@ credencial que guardó.
 
 **Identidad de la conversación**, por orden: `--host-session` /
 `BUS_HOST_SESSION` (cualquier host que pueda fijar una variable por ventana),
-`CLAUDE_CODE_SESSION_ID` (Claude Code la exporta a los procesos MCP),
+`CLAUDE_CODE_SESSION_ID` (Claude Code la exporta a los procesos MCP; solo
+vale para el propio cliente de Claude Code, ver abajo),
 `ANTIGRAVITY_CONVERSATION_ID` (donde una superficie de Antigravity la exporta
 a los servidores MCP), el id de conversación que una petición lleva en
 `_meta` (`antigravity.google/conversation_id` de Antigravity, `threadId` de
@@ -926,12 +927,15 @@ pero no a los servidores MCP, y manda el id de conversación en `_meta` en cada
 `tools/call`, así que `session_status` informa `binding: antigravity` y los
 hooks de la misma conversación encuentran su binding.
 
-Una limitación conocida: un host arrancado desde dentro de una sesión de
-Claude Code (su terminal, o una herramienta que ejecuta) hereda
-`CLAUDE_CODE_SESSION_ID`, y también lo heredan los proxies que ese host
-arranca. Se vinculan entonces a la conversación de Claude y se quedan con su
-sesión. Arranca los demás hosts desde un terminal normal, o borra la variable
-al lanzarlos (`env -u CLAUDE_CODE_SESSION_ID agy`).
+Un host arrancado desde dentro de una sesión de Claude Code (su terminal, o
+una herramienta que ejecuta) hereda `CLAUDE_CODE_SESSION_ID`, y también lo
+heredan los proxies que ese host arranca. Por eso la variable sola no basta:
+el proxy espera a que el cliente se identifique (`clientInfo` en
+`initialize`, o en el `_meta` de una petición) y solo se vincula a esa
+conversación de Claude cuando el cliente es Claude Code (`claude-code`).
+Codex, Antigravity o cualquier otro cliente arrancado ahí recibe una
+conversación propia, y la ventana padre conserva intactos su sesión, su epoch
+y su binding.
 
 El campo `instructions` del resultado de `initialize` le dice al modelo quién
 es y dónde está esta ventana (agente, equipo, dirección de sesión, proyecto,
