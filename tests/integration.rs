@@ -6595,6 +6595,58 @@ async fn the_proxy_serves_the_fields_mcp_2026_07_28_requires() {
     h.shutdown().await;
 }
 
+/// Native Windows sets USERPROFILE, not HOME (#242): with neither
+/// BUS_CONFIG_DIR nor XDG_CONFIG_HOME, the config directory lives under the
+/// user profile instead of failing.
+#[test]
+fn the_config_directory_falls_back_to_userprofile() {
+    let profile = std::env::temp_dir().join(format!("acs-userprofile-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&profile).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ai-crew-sync");
+    let run = |envs: &[(&str, &std::path::Path)]| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .current_dir(&profile)
+            .args([
+                "context",
+                "profile",
+                "add",
+                "--name",
+                "w",
+                "--url",
+                "https://bus.example",
+                "--team",
+                "acme",
+                "--agent",
+                "joaquin",
+            ]);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.output().expect("run ai-crew-sync")
+    };
+    let out = run(&[("USERPROFILE", &profile)]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        profile
+            .join(".config")
+            .join("ai-crew-sync")
+            .join("profiles.toml")
+            .is_file(),
+        "the profile store is under USERPROFILE"
+    );
+    // With no home at all, the error names what to set.
+    let out = run(&[]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("USERPROFILE") && err.contains("BUS_CONFIG_DIR"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&profile);
+}
+
 /// Adding a profile never makes it the user default on its own (#193): a
 /// default answers for every directory without a .acs.toml and for every
 /// host that starts the proxy without BUS_TOKEN. When a default is set on

@@ -45,10 +45,11 @@ RESET="${2:-}"
 HOOK_HOST=claude
 if [ "$RESET" = "--from-payload" ]; then
     RESET=""
-    # Without python3 the payload cannot be read; the environment still says
+    # Without Python the payload cannot be read; the environment still says
     # whether Antigravity is asking.
     [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ] && HOOK_HOST=antigravity
-    if command -v python3 >/dev/null 2>&1; then
+    . "$DIR/python.sh"
+    if [ -n "$PY" ]; then
         . "$DIR/host-payload.sh"
         [ -z "${BUS_HOST_SESSION:-}" ] && [ -n "$HOST_SESSION" ] \
             && export BUS_HOST_SESSION="$HOST_SESSION"
@@ -96,10 +97,11 @@ BRANCH="$(git branch --show-current 2>/dev/null || true)"
 
 # Git allows quotes, backslashes and other JSON-hostile characters in branch
 # names and remote URLs, so the payload is encoded by json.dumps rather than
-# string-concatenated. Without python3 we still publish presence, just without
+# string-concatenated. Without Python we still publish presence, just without
 # repo/branch — degraded detail beats a malformed request.
-if command -v python3 >/dev/null 2>&1; then
-    ARGS="$(STATUS="$STATUS" TTL="$TTL" REPO="$REPO" BRANCH="$BRANCH" RESET="$RESET" ATTENTION="$ATTENTION" python3 - <<'PY'
+[ -z "${PY+x}" ] && . "$DIR/python.sh"
+if [ -n "$PY" ]; then
+    ARGS="$(STATUS="$STATUS" TTL="$TTL" REPO="$REPO" BRANCH="$BRANCH" RESET="$RESET" ATTENTION="$ATTENTION" "$PY" - <<'PY'
 import json, os
 
 args = {"status": os.environ["STATUS"], "ttl_seconds": int(os.environ["TTL"])}

@@ -15,9 +15,10 @@
 # does nothing; a watcher must never act as a guessed identity.
 set -u
 command -v ai-crew-sync >/dev/null 2>&1 || exit 0
-command -v python3 >/dev/null 2>&1 || exit 0
+. "$(cd "$(dirname "$0")" && pwd)/python.sh"
+[ -n "$PY" ] || exit 0
 PAYLOAD="$(cat 2>/dev/null || true)"
-HOST_SESSION="$(PAYLOAD="$PAYLOAD" python3 -c 'import json,os,sys
+HOST_SESSION="$(PAYLOAD="$PAYLOAD" "$PY" -c 'import json,os,sys
 try:
     v = json.loads(os.environ.get("PAYLOAD") or "{}").get("session_id")
 except Exception:
