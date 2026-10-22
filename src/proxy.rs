@@ -1477,10 +1477,13 @@ impl Proxy {
                     return Err(e);
                 }
             };
-            let same = st
-                .connected
-                .as_ref()
-                .is_some_and(|c| c.resolved.profile == resolved.profile);
+            // The same credential, not just the same profile: the project's
+            // `key` or name can pick another token entry of that profile.
+            let same = st.connected.as_ref().is_some_and(|c| {
+                c.resolved.profile == resolved.profile
+                    && c.resolved.token == resolved.token
+                    && c.resolved.mcp_url == resolved.mcp_url
+            });
             if same {
                 if st.project.is_none() {
                     st.project = resolved.project.clone();
