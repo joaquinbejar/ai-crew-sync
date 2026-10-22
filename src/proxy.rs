@@ -543,6 +543,12 @@ pub struct Proxy {
     /// `initialized`, so the first requests wait for the project it finds
     /// instead of racing it. Bounded by [`ROOTS_WAIT`].
     roots_gate: Arc<Mutex<()>>,
+    /// The gate, taken while answering `initialize` and handed to the
+    /// discovery `initialized` starts. Taken there because the `initialize`
+    /// answer precedes every later request of the client, whereas the
+    /// `initialized` notification and the first `tools/list` are handled
+    /// concurrently and the request could slip past a gate taken later.
+    roots_hold: Arc<std::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>,
 }
 
 // -------------------------------------------------------------- local tools --
@@ -1355,6 +1361,7 @@ impl Proxy {
             project_dir,
             pending_claude: Arc::new(Mutex::new(pending)),
             roots_gate: Arc::new(Mutex::new(())),
+            roots_hold: Arc::new(std::sync::Mutex::new(None)),
         };
         if !deferred {
             proxy.connect_initial().await;
@@ -2926,6 +2933,14 @@ impl ServerHandler for Proxy {
         // Bound and connected before answering, so the instructions the
         // host hands the model name the right window.
         self.admit(Some(&request.client_info)).await;
+        if request.capabilities.roots.is_some()
+            && self.opts.inputs.project_dir.is_none()
+            && self.opts.inputs.profile.is_none()
+            && let Ok(gate) = self.roots_gate.clone().try_lock_owned()
+            && let Ok(mut hold) = self.roots_hold.lock()
+        {
+            *hold = Some(gate);
+        }
         context.peer.set_peer_info(request.clone());
         self.negotiate_initialize(&request)
     }
@@ -2942,15 +2957,10 @@ impl ServerHandler for Proxy {
     }
 
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
-        let wants_roots = context
-            .peer
-            .peer_info()
-            .is_some_and(|i| i.capabilities.roots.is_some());
-        if !wants_roots {
+        // Held since `initialize` when the client advertised roots.
+        let Some(gate) = self.roots_hold.lock().ok().and_then(|mut h| h.take()) else {
             return;
-        }
-        // Taken before returning, so a request that follows waits on it.
-        let gate = self.roots_gate.clone().lock_owned().await;
+        };
         let this = self.clone();
         tokio::spawn(async move {
             this.discover_roots(&context.peer).await;
