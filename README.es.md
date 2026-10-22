@@ -586,11 +586,14 @@ inactiva no se despierta.
 
 **Valores del proyecto con una instalación global.** Un plugin instalado con
 `agy plugin install` arranca el proxy en el directorio del plugin, no en tu
-workspace, así que no encuentra el `.acs.toml` del workspace. Fija un perfil
-por defecto (`--default` arriba). Otra opción es instalar el plugin por
-workspace en `<workspace>/.agents/plugins/ai-crew-sync`, donde sí se
-encuentra el `.acs.toml`. La issue #236 sigue el trabajo de encontrar el
-workspace mediante los roots de MCP.
+workspace. Cuando desde ahí no encuentra ningún `.acs.toml`, el proxy pide al
+cliente sus roots de MCP (`roots/list`, que Antigravity responde). Después usa
+el primer root `file://` que esté dentro de un proyecto con `.acs.toml`, así
+que se aplican el perfil, el proyecto y el canal del workspace sin perfil por
+defecto. `session_status` informa `project_root_from: mcp-roots`. Un root
+nunca sustituye a `--project-dir`, a un perfil de `--profile` / `BUS_PROFILE`
+ni a un `.acs.toml` encontrado desde el directorio de trabajo. Los hosts sin
+`roots` (Codex) se comportan como antes.
 
 Sin el plugin, registra el servidor en `~/.gemini/config/mcp_config.json` (ver
 `examples/antigravity-mcp_config.json`). `ai-crew-sync proxy-config` imprime
