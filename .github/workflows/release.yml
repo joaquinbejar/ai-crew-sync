@@ -122,6 +122,14 @@ jobs:
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true }
           - { target: x86_64-apple-darwin,        os: macos-latest,  cross: false }
           - { target: aarch64-apple-darwin,       os: macos-latest,  cross: false }
+          # MSVC, like the windows job in ci.yml: the dependency set is known
+          # to build there, and the binary needs no toolchain at runtime.
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest, cross: false }
+    # Windows runners default to PowerShell; every step below is bash, which
+    # Git for Windows provides there.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -140,16 +148,41 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
+      # A Windows binary that does not start must not reach the release:
+      # nothing downstream runs it, unlike the musl ones the packages job
+      # installs.
+      - name: Smoke test (Windows)
+        if: contains(matrix.target, 'windows')
+        run: |
+          set -e
+          bin="target/${{ matrix.target }}/release/ai-crew-sync.exe"
+          out=$("$bin" --version)
+          echo "$out"
+          [ "$out" = "ai-crew-sync ${GITHUB_REF_NAME#v}" ] || { echo "unexpected version: $out"; exit 1; }
+          "$bin" mcp-config --help >/dev/null
+
       - name: Archive
         id: archive
         run: |
           name="ai-crew-sync-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/ai-crew-sync" "dist/$name/"
           cp README.md LICENSE .env.example "dist/$name/"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          # Homebrew verifies this, and so should anyone downloading by hand.
-          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          case "${{ matrix.target }}" in
+            *-windows-*)
+              # A zip, the format Windows opens without extra tools; 7-Zip
+              # ships on the runner, zip does not. sha256sum comes with Git
+              # for Windows.
+              cp "target/${{ matrix.target }}/release/ai-crew-sync.exe" "dist/$name/"
+              (cd dist && 7z a -tzip "$name.zip" "$name" >/dev/null)
+              (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
+              ;;
+            *)
+              cp "target/${{ matrix.target }}/release/ai-crew-sync" "dist/$name/"
+              tar -C dist -czf "dist/$name.tar.gz" "$name"
+              # Homebrew verifies this, and so should anyone downloading by hand.
+              (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+              ;;
+          esac
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
@@ -157,6 +190,7 @@ jobs:
           name: ${{ steps.archive.outputs.name }}
           path: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
           retention-days: 1
 
@@ -316,7 +350,7 @@ jobs:
           # happily published eight tarballs and no packages, and every job
           # went green — a partial release is worse than a failed one, because
           # nobody goes looking.
-          for want in '*.tar.gz' '*.sha256' '*.deb' '*.rpm'; do
+          for want in '*.tar.gz' '*.zip' '*.sha256' '*.deb' '*.rpm'; do
             n=$(find dl -type f -name "$want" | wc -l)
             echo "  $want: $n"
             [ "$n" -gt 0 ] || { echo "no $want among the artifacts — refusing to publish a partial release"; exit 1; }
@@ -324,7 +358,9 @@ jobs:
           [ "$(find dl -type f -name '*.deb' | wc -l)" -ge 2 ] || { echo "expected both architectures of .deb"; exit 1; }
           [ "$(find dl -type f -name '*.rpm' | wc -l)" -ge 2 ] || { echo "expected both architectures of .rpm"; exit 1; }
 
-          find dl -type f \( -name '*.tar.gz' -o -name '*.sha256' \
+          [ "$(find dl -type f -name '*-pc-windows-msvc.zip.sha256' | wc -l)" -ge 1 ] || { echo "the Windows zip has no checksum"; exit 1; }
+
+          find dl -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \
                               -o -name '*.deb' -o -name '*.rpm' \) -print0 \
             | xargs -0 gh release upload "$GITHUB_REF_NAME" --clobber --repo "$GITHUB_REPOSITORY"
 

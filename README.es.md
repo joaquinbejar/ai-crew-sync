@@ -128,8 +128,13 @@ instala y se ejecuta dentro de la distribución a la que apunta antes de que
 una release lo publique.
 
 **Windows** está soportado como cliente (CLI, cliente de consola,
-`mcp proxy`) compilado desde el código: `cargo install ai-crew-sync` con las
-MSVC Build Tools. El directorio de configuración es
+`mcp proxy`). Cada release publica
+`ai-crew-sync-<tag>-x86_64-pc-windows-msvc.zip` y su `.sha256` en la
+[página de releases](https://github.com/joaquinbejar/ai-crew-sync/releases/latest):
+extrae `ai-crew-sync.exe` en algún directorio de tu `PATH`; no necesita
+toolchain de Rust ni de Visual C++. Compilarlo desde el código
+(`cargo install ai-crew-sync`) necesita las MSVC Build Tools. El directorio
+de configuración es
 `%USERPROFILE%\.config\ai-crew-sync` salvo que `BUS_CONFIG_DIR` diga otra
 cosa. `context codex-wake` no está disponible ahí, porque el app-server de
 Codex escucha en un socket Unix. Los hooks del plugin necesitan una shell

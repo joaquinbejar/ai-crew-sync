@@ -123,8 +123,12 @@ Linux binaries are statically linked against musl, so they run on any
 distribution regardless of its glibc. Every package is installed and executed
 inside the distribution it targets before a release publishes it.
 
-**Windows** is supported as a client (CLI, console client, `mcp proxy`) built
-from source: `cargo install ai-crew-sync` with the MSVC Build Tools. The
+**Windows** is supported as a client (CLI, console client, `mcp proxy`).
+Each release ships `ai-crew-sync-<tag>-x86_64-pc-windows-msvc.zip` and its
+`.sha256` on the [releases page](https://github.com/joaquinbejar/ai-crew-sync/releases/latest):
+extract `ai-crew-sync.exe` somewhere on your `PATH`; it needs no Rust or
+Visual C++ toolchain. Building from source (`cargo install ai-crew-sync`)
+needs the MSVC Build Tools. The
 configuration directory is `%USERPROFILE%\.config\ai-crew-sync` unless
 `BUS_CONFIG_DIR` says otherwise. `context codex-wake` is not available
 there, because the Codex app-server listens on a Unix socket. The plugin's
