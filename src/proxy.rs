@@ -525,6 +525,11 @@ pub struct Proxy {
     attention_changed: Arc<tokio::sync::Notify>,
     /// Serialises context switches.
     switch: Arc<Mutex<()>>,
+    /// Serialises heartbeats, from reading the labels to the bus's answer.
+    /// The bus stores whatever labels arrive last, so a keepalive or
+    /// attention report that read them before a `configure_session` and
+    /// landed after it would put the old role back (#246).
+    presence: Arc<Mutex<()>>,
     /// Pinged whenever the connected context changes, so the keepalive
     /// recomputes its renewal deadline at once instead of on its next
     /// presence tick: a credential established after startup, or after a
@@ -1356,6 +1361,7 @@ impl Proxy {
             attention: Arc::new(std::sync::Mutex::new(Attention::default())),
             attention_changed: Arc::new(tokio::sync::Notify::new()),
             switch: Arc::new(Mutex::new(())),
+            presence: Arc::new(Mutex::new(())),
             wake: Arc::new(tokio::sync::Notify::new()),
             opts: Arc::new(opts),
             project_dir,
@@ -1704,6 +1710,7 @@ impl Proxy {
     /// One heartbeat with `fields`, plus repo/branch and this window's
     /// labels. True when the bus accepted it.
     async fn publish_presence(&self, fields: Value) -> bool {
+        let _ordered = self.presence.lock().await;
         let (remote, project, role, dir) = {
             let st = self.state.read().await;
             let Some(c) = &st.connected else { return false };
