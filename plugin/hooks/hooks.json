@@ -5,12 +5,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/session-start.sh",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh\"",
             "timeout": 15000
           },
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/watch.sh",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/watch.sh\"",
             "async": true,
             "asyncRewake": true,
             "timeout": 14400
@@ -23,7 +23,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/heartbeat.sh prompt --from-payload",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" prompt --from-payload",
             "timeout": 10000
           }
         ]
@@ -34,17 +34,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/heartbeat.sh stop --from-payload",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" stop --from-payload",
             "timeout": 10000
           },
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/stop-drain.sh",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/stop-drain.sh\"",
             "timeout": 12000
           },
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/watch.sh",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/watch.sh\"",
             "async": true,
             "asyncRewake": true,
             "timeout": 14400
@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/heartbeat.sh idle --from-payload",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" idle --from-payload",
             "timeout": 10000
           }
         ]

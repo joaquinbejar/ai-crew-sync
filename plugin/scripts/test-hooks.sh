@@ -734,6 +734,32 @@ mcp = json.load(open(os.path.join(root, "mcp_config.json")))["mcpServers"]["ai-c
 assert mcp == {"command": "ai-crew-sync", "args": ["mcp", "proxy"]}, mcp
 PY
 
+# Hosts substitute ${CLAUDE_PLUGIN_ROOT} as plain text and run the result
+# with `bash -c` (#251). Devin on Windows hands over a root that ends in a
+# backslash, which turned the old `"${CLAUDE_PLUGIN_ROOT}"/scripts/...` into
+# an escaped quote and a syntax error before any script started. Every
+# Claude Code hook must still reach its script with such a root, and with
+# one that has a space in it; stubs stand in for the scripts.
+PLUGIN_DIR="$PLUGIN_DIR" WORK="$WORK" python3 - <<'PY' && ok "every hook command survives a plugin root ending in a backslash or with a space" \
+    || bad "hook quoting" "a hook command does not reach its script for some plugin root"
+import json, os, subprocess
+manifest = json.load(open(os.path.join(os.environ["PLUGIN_DIR"], "hooks", "hooks.json")))["hooks"]
+commands = [h["command"] for groups in manifest.values() for g in groups for h in g["hooks"]]
+for name in ("trailing-backslash\\", "with space"):
+    root = os.path.join(os.environ["WORK"], "quoting", name)
+    os.makedirs(os.path.join(root, "scripts"), exist_ok=True)
+    for script in os.listdir(os.path.join(os.environ["PLUGIN_DIR"], "scripts")):
+        if script.endswith(".sh"):
+            with open(os.path.join(root, "scripts", script), "w") as f:
+                f.write('#!/bin/sh\nprintf "ran %s" "$(basename "$0")"\n')
+    for command in commands:
+        assert command.startswith('sh "${CLAUDE_PLUGIN_ROOT}/scripts/'), command
+        script = command.split("/scripts/", 1)[1].split('"', 1)[0]
+        run = subprocess.run(["bash", "-c", command.replace("${CLAUDE_PLUGIN_ROOT}", root)],
+                             input="{}", capture_output=True, text=True, timeout=10)
+        assert run.returncode == 0 and run.stdout == "ran " + script, (name, command, run)
+PY
+
 # A python3 that is found but does not run (the Microsoft Store alias on
 # Windows exits 49) is not a Python (#242): the probe falls through to
 # `python`, and with neither the hooks take their no-Python path.

@@ -139,7 +139,10 @@ de configuración es
 cosa. `context codex-wake` no está disponible ahí, porque el app-server de
 Codex escucha en un socket Unix. Los hooks del plugin necesitan una shell
 POSIX (Git Bash) y Python; un `python3` que solo es el alias de la Microsoft
-Store se detecta y se descarta en favor de `python`.
+Store se detecta y se descarta en favor de `python`. Los hosts que cargan el
+`hooks/hooks.json` del plugin (Claude Code, Devin) ejecutan cada hook como
+`sh "<raíz del plugin>/scripts/<hook>.sh"`, así que el `sh` de Git Bash tiene
+que estar en el `PATH`.
 
 ## Arranque rápido (docker-compose)
 

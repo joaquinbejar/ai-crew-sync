@@ -133,7 +133,10 @@ configuration directory is `%USERPROFILE%\.config\ai-crew-sync` unless
 `BUS_CONFIG_DIR` says otherwise. `context codex-wake` is not available
 there, because the Codex app-server listens on a Unix socket. The plugin's
 hooks need a POSIX shell (Git Bash) and Python; a `python3` that is only the
-Microsoft Store alias is detected and skipped in favour of `python`.
+Microsoft Store alias is detected and skipped in favour of `python`. Hosts
+that load the plugin's `hooks/hooks.json` (Claude Code, Devin) run each hook
+as `sh "<plugin root>/scripts/<hook>.sh"`, so Git Bash's `sh` must be on the
+`PATH`.
 
 ## Quick start (docker-compose)
 
