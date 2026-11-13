@@ -2294,12 +2294,10 @@ If you have any questions, issues, or would like to provide feedback, please fee
 maintainer:
 
 ### **Contact Information**
-
 - **Author**: Joaquín Béjar García
-- **Email**: <jb@taunais.com>
+- **Email**: jb@taunais.com
 - **Telegram**: [@joaquin_bejar](https://t.me/joaquin_bejar)
 - **Repository**: <https://github.com/joaquinbejar/ai-crew-sync>
-- **Crate**: <https://crates.io/crates/ai-crew-sync>
 - **Documentation**: <https://docs.rs/ai-crew-sync>
 
 We appreciate your interest and look forward to your contributions!
@@ -2315,6 +2313,6 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [homebrew-tap](https://github.com/joaquinbejar/homebrew-tap) | Homebrew formulae for joaquinbejar's tools. *(Homebrew formula)* |
+| [homebrew-tap](https://github.com/joaquinbejar/homebrew-tap) | Homebrew formulae for joaquinbejar's command-line tools; ships the ai-crew-sync formula. |
 
 <!-- related-projects:end -->
