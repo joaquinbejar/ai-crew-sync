@@ -2307,6 +2307,12 @@ We appreciate your interest and look forward to your contributions!
 <!-- related-projects:start -->
 ## Related projects
 
-No other repositories by the same author depend on this project, and it depends on none of them. See all of them at <https://github.com/joaquinbejar?tab=repositories>.
+Repositories by the same author that this project depends on, and repositories that depend on it.
+
+### Used by
+
+| Repository | Description |
+|------------|-------------|
+| [homebrew-tap](https://github.com/joaquinbejar/homebrew-tap) | Homebrew formulae for joaquinbejar's command-line tools; ships the ai-crew-sync formula. |
 
 <!-- related-projects:end -->
