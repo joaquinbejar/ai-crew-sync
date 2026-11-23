@@ -148,19 +148,22 @@ que estar en el `PATH`.
 
 ```bash
 make up      # crea la red `edge` si no existe, y después:
-             # docker compose --project-directory . -f Docker/docker-compose.yml up -d --no-build
+             # docker compose --project-directory . -f Docker/docker-compose.yml \
+             #   -f Docker/docker-compose.local.yml up -d --no-build
 ```
 
 Todas las variables tienen default razonable; se sobrescriben por entorno o
 en `./.env` (parte de `.env.example`, que documenta cada knob con su
-default — pon un `POSTGRES_PASSWORD` real para cualquier cosa no local). El
+default — pon un `POSTGRES_PASSWORD` real para cualquier cosa no local;
+`make up` lo escribe una vez en `.secrets/db_password`, el sustituto local del
+secret de la base de datos). El
 `--project-directory .` es lo que hace que compose lea `./.env`; ejecuta los
 comandos de compose con él desde la raíz del repositorio, o usa los targets de
 `make`. `make up-dev` construye desde el checkout. **Docker Swarm** funciona
 con el mismo fichero:
 
 ```bash
-export POSTGRES_PASSWORD=...   # Swarm no lee ficheros .env
+printf %s "$PW" | docker secret create ai_crew_sync_db_password -   # una vez por clúster
 docker network create --driver overlay --attachable edge   # el bus siempre se une a ella, con Traefik o sin él
 docker stack deploy -c Docker/docker-compose.yml crew
 ```
@@ -205,15 +208,18 @@ que `make up` arranque en un portátil. Lo que protege producción es el
 preflight que `make deploy` ejecuta antes de tocar el clúster:
 
 ```bash
-export POSTGRES_PASSWORD=…        # no el valor de ejemplo
-export BUS_VERSION=0.7.0          # una versión de release completa, nunca `latest`
+printf %s "$PW" | docker secret create ai_crew_sync_db_password -   # una vez
+export BUS_VERSION=0.7.11         # una versión de release completa, nunca `latest`, 0.7.11 o posterior
 export BUS_ALLOWED_HOSTS=crew.example.com
 export BUS_DASHBOARD_SECRET=…     # compartido, para que la sesión valga en cualquier réplica
 make deploy                       # preflight y después docker stack deploy
 ```
 
-`make deploy` se niega si falta alguno, si la contraseña sigue siendo
-`change-me`, si `BUS_VERSION` es `latest`, o si se pone `TRAEFIK_ENABLE=true`
+Bajo Swarm la contraseña de la base de datos nunca es una variable de entorno:
+el servidor y el bus leen el secret (`DB_PASSWORD_SECRET`, por defecto
+`ai_crew_sync_db_password`) con `POSTGRES_PASSWORD_FILE` y
+`DATABASE_PASSWORD_FILE`. `make deploy` se niega si el secret no existe, si
+falta alguna de esas variables, si `BUS_VERSION` es `latest`, o si se pone `TRAEFIK_ENABLE=true`
 sin `BUS_PUBLIC_HOST`; también se niega cuando la red del proxy
 (`TRAEFIK_NETWORK`, por defecto `edge`) no existe en el swarm. `make
 deploy-check` ejecuta solo las comprobaciones de variables y nunca contacta
@@ -1313,6 +1319,18 @@ arrancar la versión anterior.
 export BUS_VERSION=0.7.10
 make deploy                                    # Swarm; o, desde la raíz del repositorio:
 docker compose --project-directory . -f Docker/docker-compose.yml pull && make up
+```
+
+Un bus anterior a 0.7.11 no lee `DATABASE_PASSWORD_FILE`, y este fichero de
+compose guarda la contraseña solo en el secret, así que el Makefile actual
+rechaza esa versión y `make up` monta el secret. Volver tan atrás necesita el
+fichero de compose Y el Makefile de esa release a la vez, con
+`POSTGRES_PASSWORD` exportada (el mismo valor que el secret):
+
+```bash
+git checkout v0.7.10 -- Docker/docker-compose.yml Makefile
+export POSTGRES_PASSWORD=…  BUS_VERSION=0.7.10
+make deploy                  # o: make up
 ```
 
 El contenedor migra al arrancar, y el servicio empaquetado también — los dos
