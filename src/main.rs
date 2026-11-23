@@ -837,15 +837,12 @@ fn db_connect_options_from(
     // The user goes into the URL BEFORE sqlx parses it: parsing is where sqlx
     // looks the password up in .pgpass (PGPASSFILE), keyed by the user, so a
     // user applied afterwards would read the entry of the URL's user instead.
+    // It is appended as the LAST `user` query parameter, which sqlx applies
+    // after the authority and after any earlier `user=`, so it wins over both,
+    // and the rest of the URL (a host-less socket URL, a literal `%41` in
+    // the authority) is left exactly as written.
     let url = match read_secret_file(&var, "DATABASE_USER_FILE")? {
-        Some(user) => {
-            let mut parsed =
-                url::Url::parse(url).context("DATABASE_URL is not a valid Postgres URL")?;
-            parsed
-                .set_username(&user)
-                .map_err(|()| anyhow::anyhow!("DATABASE_URL cannot carry a user"))?;
-            std::borrow::Cow::Owned(parsed.to_string())
-        }
+        Some(user) => std::borrow::Cow::Owned(with_final_user_param(url, &user)),
         None => std::borrow::Cow::Borrowed(url),
     };
     let mut options: sqlx::postgres::PgConnectOptions = url
@@ -855,6 +852,18 @@ fn db_connect_options_from(
         options = options.password(&password);
     }
     Ok(options)
+}
+
+/// `url` with `user=<user>` (form-encoded) appended as its last query
+/// parameter, before any fragment.
+fn with_final_user_param(url: &str, user: &str) -> String {
+    let (base, fragment) = match url.find('#') {
+        Some(i) => url.split_at(i),
+        None => (url, ""),
+    };
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let user: String = url::form_urlencoded::byte_serialize(user.as_bytes()).collect();
+    format!("{base}{separator}user={user}{fragment}")
 }
 
 /// The trimmed content of the file named by `name`, or `None` when the
@@ -1796,15 +1805,32 @@ mod db_credentials_tests {
 
     /// The file user is in place before sqlx reads .pgpass, so the lookup
     /// finds that user's entry, not the one of the user in the URL.
+    ///
+    /// sqlx reads PGPASSFILE and PGPASSWORD from the process environment, so
+    /// the check runs in a child process of this test binary with exactly that
+    /// environment, instead of mutating the shared one under parallel tests.
     #[test]
     fn pgpass_is_looked_up_for_the_file_user() {
+        if let Some(user) = std::env::var_os("ACS_TEST_PGPASS_CHILD_USER_FILE") {
+            let opts = db_connect_options_from(
+                "postgres://urluser@db:5432/bus?user=queryuser",
+                env(&[("DATABASE_USER_FILE", std::path::Path::new(&user))]),
+            )
+            .unwrap();
+            assert_eq!(opts.get_username(), "fileuser");
+            let debug = format!("{opts:?}");
+            assert!(debug.contains("right-one"), "pgpass entry of the file user");
+            assert!(!debug.contains("wrong-one"));
+            return;
+        }
         let dir = TempDir::new();
         let user = dir.path().join("user");
         std::fs::write(&user, "fileuser\n").unwrap();
         let pgpass = dir.path().join("pgpass");
         std::fs::write(
             &pgpass,
-            "db:5432:bus:urluser:wrong-one\ndb:5432:bus:fileuser:right-one\n",
+            "db:5432:bus:urluser:wrong-one\ndb:5432:bus:queryuser:wrong-one\n\
+             db:5432:bus:fileuser:right-one\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1812,19 +1838,36 @@ mod db_credentials_tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&pgpass, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        // PGPASSFILE is read by sqlx from the process environment; no other
-        // test in this binary reads it.
-        unsafe { std::env::set_var("PGPASSFILE", &pgpass) };
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "db_credentials_tests::pgpass_is_looked_up_for_the_file_user",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env("ACS_TEST_PGPASS_CHILD_USER_FILE", &user)
+            .env("PGPASSFILE", &pgpass)
+            .env_remove("PGPASSWORD")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the child check failed");
+    }
+
+    #[test]
+    fn a_host_less_url_keeps_its_socket_and_a_literal_escape_survives() {
+        let dir = TempDir::new();
+        let user = dir.path().join("user");
+        std::fs::write(&user, "fileuser").unwrap();
         let opts = db_connect_options_from(
-            "postgres://urluser@db:5432/bus",
+            "postgres:///bus?host=/var/run/postgresql",
             env(&[("DATABASE_USER_FILE", &user)]),
-        );
-        unsafe { std::env::remove_var("PGPASSFILE") };
-        let opts = opts.unwrap();
+        )
+        .unwrap();
         assert_eq!(opts.get_username(), "fileuser");
-        let debug = format!("{opts:?}");
-        assert!(debug.contains("right-one"), "pgpass entry of the file user");
-        assert!(!debug.contains("wrong-one"));
+        assert_eq!(opts.get_database(), Some("bus"));
+        // No user file: the authority is untouched, `%41` decodes as sqlx
+        // always decoded it.
+        let opts = db_connect_options_from("postgres://worker%41@db/bus", env(&[])).unwrap();
+        assert_eq!(opts.get_username(), "workerA");
     }
 
     #[test]
