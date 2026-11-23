@@ -2105,6 +2105,7 @@ servidor con sus defaults.
 | Variable | Default | Qué hace |
 |---|---|---|
 | `DATABASE_URL` | — (obligatoria) | Cadena de conexión a Postgres. También la necesita cada comando de operador. |
+| `DATABASE_USER_FILE`, `DATABASE_PASSWORD_FILE` | sin fijar | Ficheros (secrets de Docker) cuyo contenido, sin espacios alrededor, sustituye al usuario o la contraseña de `DATABASE_URL`; el fichero gana. Un fichero ilegible o vacío es un error. |
 | `BUS_BIND` | `0.0.0.0:8787` | Dirección de escucha. |
 | `BUS_AUTO_MIGRATE` | `true` | Aplica las migraciones al arrancar. Desactívala para volver a un binario anterior. |
 | `BUS_ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0,[::1]` | Cabeceras `Host` aceptadas (anti DNS-rebinding). El fichero compose, `.env.example` y el fichero de entorno empaquetado traen `*` por defecto, que desactiva la comprobación. |

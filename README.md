@@ -2044,6 +2044,7 @@ server's with their defaults.
 | Variable | Default | What it does |
 |---|---|---|
 | `DATABASE_URL` | — (required) | Postgres connection string. Also needed by every operator command. |
+| `DATABASE_USER_FILE`, `DATABASE_PASSWORD_FILE` | unset | Files (Docker secrets) whose trimmed content replaces the user or password of `DATABASE_URL`; the file wins. An unreadable or empty file is an error. |
 | `BUS_BIND` | `0.0.0.0:8787` | Listen address. |
 | `BUS_AUTO_MIGRATE` | `true` | Apply migrations on startup. Turn off to roll back to an older binary. |
 | `BUS_ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0,[::1]` | Accepted `Host` headers (anti DNS-rebinding). The compose file, `.env.example` and the packaged env file default to `*`, which disables the check. |
