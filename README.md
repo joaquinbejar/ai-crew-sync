@@ -1284,10 +1284,16 @@ docker compose --project-directory . -f Docker/docker-compose.yml pull && make u
 ```
 
 A bus older than 0.7.11 cannot read `DATABASE_PASSWORD_FILE`, and this compose
-file keeps the password only in the secret: going back that far also needs the
-compose file of that release (`git checkout v0.7.10 -- Docker/docker-compose.yml`)
-with `POSTGRES_PASSWORD` exported, and `make deploy` refuses the older version
-with the current file.
+file keeps the password only in the secret, so the current Makefile refuses
+such a version and `make up` mounts the secret. Going back that far takes that
+release's compose file AND Makefile together, with `POSTGRES_PASSWORD`
+exported (the same value as the secret):
+
+```bash
+git checkout v0.7.10 -- Docker/docker-compose.yml Makefile
+export POSTGRES_PASSWORD=…  BUS_VERSION=0.7.10
+make deploy                  # or: make up
+```
 
 The container migrates on startup, and so does the packaged service — both
 default to `BUS_AUTO_MIGRATE=true` — so a `.deb` or `.rpm` upgrade is the
