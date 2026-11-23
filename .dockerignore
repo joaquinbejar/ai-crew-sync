@@ -1,0 +1,3 @@
+# The local stand-in for the database password secret (make secret) must
+# never reach a build context; `make up-dev` builds from the repository root.
+.secrets/

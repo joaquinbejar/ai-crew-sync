@@ -104,7 +104,7 @@ services:
     # Published multi-arch image by default. `make up-dev` sets BUS_IMAGE and
     # BUS_VERSION to a local tag and passes --build, so a checkout build never
     # shadows the published tag. Production pins an immutable BUS_VERSION.
-    image: ${BUS_IMAGE:-ghcr.io/joaquinbejar/ai-crew-sync}:${BUS_VERSION:-latest}
+    image: ${BUS_IMAGE:-ghcr.io/joaquinbejar/ai-crew-sync}:${BUS_VERSION:-0.7.11}
     build:
       # Relative to the project directory (the repo root, which the Makefile
       # pins with --project-directory), NOT to this file's location. Swarm
@@ -114,7 +114,11 @@ services:
     environment:
       # No password in the URL: the bus reads it from DATABASE_PASSWORD_FILE,
       # which wins over anything the URL carries.
-      DATABASE_URL: ${DATABASE_URL:-postgres://bus@db:5432/bus}
+      # Fixed, not ${DATABASE_URL}: that variable in .env is the admin CLI's
+      # host-side URL (localhost), and the container must never inherit it,
+      # nor a password embedded in it. BUS_DATABASE_URL moves the bus to
+      # another server (credential-free; the password stays in the secret).
+      DATABASE_URL: ${BUS_DATABASE_URL:-postgres://bus@db:5432/bus}
       DATABASE_PASSWORD_FILE: /run/secrets/db_password
       BUS_BIND: 0.0.0.0:8787
       # Anti DNS-rebinding. "*" is fine behind a proxy that validates Host;

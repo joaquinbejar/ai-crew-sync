@@ -12,9 +12,9 @@
 COMPOSE      = docker compose --project-directory . -f Docker/docker-compose.yml -f Docker/docker-compose.local.yml
 # The Swarm file alone, as `docker stack deploy` (and Portainer) reads it.
 COMPOSE_SWARM = docker compose --project-directory . -f Docker/docker-compose.yml
-# The local stand-in for the database password secret (make secret), and the
-# secret's name on a swarm.
-DB_PASSWORD_FILE ?= .secrets/db_password
+# The database password secret's name on a swarm. Its local stand-in (make
+# secret) is resolved inside the recipe, like compose resolves it: the
+# environment first, then ./.env, then .secrets/db_password.
 DB_PASSWORD_SECRET ?= ai_crew_sync_db_password
 STACK       ?= crew
 # The reverse proxy's network the bus attaches to (external in the compose
@@ -171,15 +171,29 @@ up: network secret ## Start the local stack (published image), detached
 up-dev: network secret ## Start the local stack built from this checkout
 	BUS_IMAGE=ai-crew-sync BUS_VERSION=dev $(COMPOSE) up -d --build
 
-# The local stand-in for the Swarm secret: written once, from POSTGRES_PASSWORD
-# (the example `change-me` when unset), and never overwritten, because the
-# database keeps the password it was initialised with.
+# The local stand-in for the Swarm secret: written once and never overwritten,
+# because the database keeps the password it was initialised with. Both
+# POSTGRES_PASSWORD and DB_PASSWORD_FILE are resolved as compose resolves them:
+# the environment, then ./.env (last assignment, optional surrounding quotes),
+# then the default (`change-me`, .secrets/db_password). The file is 0644 so
+# the container users can read it through the bind mount whatever their UID;
+# the directory that holds it is 0700, so other host users cannot.
 .PHONY: secret
 secret: ## Write the local database password file if missing
-	@[ -s "$(DB_PASSWORD_FILE)" ] || { \
-		mkdir -p "$$(dirname "$(DB_PASSWORD_FILE)")"; \
-		( umask 077; printf %s "$${POSTGRES_PASSWORD:-change-me}" > "$(DB_PASSWORD_FILE)" ); \
-		echo "wrote $(DB_PASSWORD_FILE)"; }
+	@set -e; \
+	dotenv() { [ -f .env ] || return 0; \
+		sed -n "s/^[[:space:]]*$$1=//p" .env | tail -n 1 \
+		| sed -e 's/^"\(.*\)"$$/\1/' -e "s/^'\(.*\)'$$/\1/"; }; \
+	file="$${DB_PASSWORD_FILE:-$$(dotenv DB_PASSWORD_FILE)}"; file="$${file:-.secrets/db_password}"; \
+	[ -s "$$file" ] && exit 0; \
+	pw="$${POSTGRES_PASSWORD:-$$(dotenv POSTGRES_PASSWORD)}"; pw="$${pw:-change-me}"; \
+	dir="$$(dirname "$$file")"; \
+	mkdir -p "$$dir"; \
+	[ "$$dir" != .secrets ] || chmod 700 "$$dir"; \
+	( umask 022; printf %s "$$pw" > "$$file.tmp" ); \
+	chmod 644 "$$file.tmp"; \
+	mv "$$file.tmp" "$$file"; \
+	echo "wrote $$file"
 
 .PHONY: network
 network: ## Create the proxy network locally if it does not exist
