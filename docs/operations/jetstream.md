@@ -81,6 +81,36 @@ A credential that reaches the broker grants nothing on the bus: ACS checks
 every ACL itself, against Postgres, and no subject, stream or consumer name
 is ever a client-facing argument.
 
+### TODO: the bundled broker runs without authentication
+
+The `nats` service in `Docker/docker-compose.yml` (zero replicas by default)
+writes its configuration inline and declares no `authorization` or
+`accounts` block, so any client on the stack network can publish, subscribe
+and manage streams. The two credentials above are not enforced by it yet.
+Closing that, when the broker is turned on, takes:
+
+1. **Broker side.** Accounts or users in the generated `nats.conf` that
+   carry the two permission sets above (runtime: publish/subscribe on
+   `acs.<team>.>` and `acsi.<team>.>` plus its own consumers; provisioning:
+   the JetStream API). Prefer the decentralised model (operator/account JWTs
+   with nkeys, `resolver: MEMORY`): the server then holds only public keys
+   and no password at all. A plain `users` block also works, with each
+   password read from a Swarm secret by the entrypoint
+   (`password: $NATS_RUNTIME_PASSWORD`, exported from `/run/secrets/...` only
+   inside the `sh -c` that execs `nats-server`).
+2. **Server side (`bus`).** Nothing new in the code for creds files:
+   `BUS_NATS_CREDENTIALS` already names one, so mount the runtime `.creds`
+   as a Swarm secret and point the variable at `/run/secrets/<name>`. A
+   user/password pair instead would need a code change (user/password
+   connect options, read from `*_FILE`), which is why creds files are the
+   recommended path.
+3. **Operator side.** `ai-crew-sync team stream` connects with the
+   provisioning credential; it stays on the operator's machine and is never
+   mounted into the stack.
+4. **Secrets.** New per-cluster secrets for the runtime creds (and, with the
+   `users` block, the provisioning password). The shared `nats_user` /
+   `nats_password` are the platform's admin and must not be reused here.
+
 ## Quotas, retention and storage
 
 Two streams per team, with deliberately different policies:

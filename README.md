@@ -210,7 +210,7 @@ make deploy                       # preflight, then docker stack deploy
 without `BUS_PUBLIC_HOST`; it also refuses when the proxy network
 (`TRAEFIK_NETWORK`, default `edge`) does not exist on the swarm. `make
 deploy-check` runs the variable checks alone and never contacts the cluster.
-Pin a full version such as `0.7.10`: each release also publishes a moving
+Pin a full version such as `0.7.11`: each release also publishes a moving
 `0.7` tag, and the preflight does not catch it.
 
 On a swarm of more than one node, pin the stateful services: the database
@@ -2044,6 +2044,7 @@ server's with their defaults.
 | Variable | Default | What it does |
 |---|---|---|
 | `DATABASE_URL` | — (required) | Postgres connection string. Also needed by every operator command. |
+| `DATABASE_USER_FILE`, `DATABASE_PASSWORD_FILE` | unset | Files (Docker secrets) whose trimmed content replaces the user or password of `DATABASE_URL`; the file wins. An unreadable or empty file is an error. |
 | `BUS_BIND` | `0.0.0.0:8787` | Listen address. |
 | `BUS_AUTO_MIGRATE` | `true` | Apply migrations on startup. Turn off to roll back to an older binary. |
 | `BUS_ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0,[::1]` | Accepted `Host` headers (anti DNS-rebinding). The compose file, `.env.example` and the packaged env file default to `*`, which disables the check. |

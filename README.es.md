@@ -217,7 +217,7 @@ make deploy                       # preflight y después docker stack deploy
 sin `BUS_PUBLIC_HOST`; también se niega cuando la red del proxy
 (`TRAEFIK_NETWORK`, por defecto `edge`) no existe en el swarm. `make
 deploy-check` ejecuta solo las comprobaciones de variables y nunca contacta
-con el clúster. Fija una versión completa como `0.7.10`: cada release publica
+con el clúster. Fija una versión completa como `0.7.11`: cada release publica
 además un tag móvil `0.7`, y el preflight no lo detecta.
 
 En un swarm de más de un nodo, fija los servicios con estado: los volúmenes
@@ -2105,6 +2105,7 @@ servidor con sus defaults.
 | Variable | Default | Qué hace |
 |---|---|---|
 | `DATABASE_URL` | — (obligatoria) | Cadena de conexión a Postgres. También la necesita cada comando de operador. |
+| `DATABASE_USER_FILE`, `DATABASE_PASSWORD_FILE` | sin fijar | Ficheros (secrets de Docker) cuyo contenido, sin espacios alrededor, sustituye al usuario o la contraseña de `DATABASE_URL`; el fichero gana. Un fichero ilegible o vacío es un error. |
 | `BUS_BIND` | `0.0.0.0:8787` | Dirección de escucha. |
 | `BUS_AUTO_MIGRATE` | `true` | Aplica las migraciones al arrancar. Desactívala para volver a un binario anterior. |
 | `BUS_ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0,[::1]` | Cabeceras `Host` aceptadas (anti DNS-rebinding). El fichero compose, `.env.example` y el fichero de entorno empaquetado traen `*` por defecto, que desactiva la comprobación. |

@@ -807,14 +807,83 @@ async fn main() -> anyhow::Result<()> {
         .database_url
         .clone()
         .context("DATABASE_URL is not set (pass --database-url or set the env var)")?;
+    let options = db_connect_options(&url)?;
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .acquire_timeout(std::time::Duration::from_secs(10))
-        .connect(&url)
+        .connect_with(options)
         .await
         .context("could not connect to Postgres")?;
 
     dispatch(cli.command, pool).await
+}
+
+/// Connection options from `DATABASE_URL`, with the credentials optionally
+/// taken from files (Docker/Swarm secrets) instead of the URL.
+///
+/// `DATABASE_USER_FILE` and `DATABASE_PASSWORD_FILE` each name a file whose
+/// trimmed content replaces the user or password of the URL; a file wins over
+/// whatever the URL carries, so the URL can stay credential-free. A variable
+/// that is set but names an unreadable file is an error, never a silent
+/// fallback. The values are never logged.
+fn db_connect_options(url: &str) -> anyhow::Result<sqlx::postgres::PgConnectOptions> {
+    db_connect_options_from(url, |name| std::env::var_os(name))
+}
+
+fn db_connect_options_from(
+    url: &str,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<sqlx::postgres::PgConnectOptions> {
+    // The user goes into the URL BEFORE sqlx parses it: parsing is where sqlx
+    // looks the password up in .pgpass (PGPASSFILE), keyed by the user, so a
+    // user applied afterwards would read the entry of the URL's user instead.
+    // It is appended as the LAST `user` query parameter, which sqlx applies
+    // after the authority and after any earlier `user=`, so it wins over both,
+    // and the rest of the URL (a host-less socket URL, a literal `%41` in
+    // the authority) is left exactly as written.
+    let url = match read_secret_file(&var, "DATABASE_USER_FILE")? {
+        Some(user) => std::borrow::Cow::Owned(with_final_user_param(url, &user)),
+        None => std::borrow::Cow::Borrowed(url),
+    };
+    let mut options: sqlx::postgres::PgConnectOptions = url
+        .parse()
+        .context("DATABASE_URL is not a valid Postgres URL")?;
+    if let Some(password) = read_secret_file(&var, "DATABASE_PASSWORD_FILE")? {
+        options = options.password(&password);
+    }
+    Ok(options)
+}
+
+/// `url` with `user=<user>` (form-encoded) appended as its last query
+/// parameter, before any fragment.
+fn with_final_user_param(url: &str, user: &str) -> String {
+    let (base, fragment) = match url.find('#') {
+        Some(i) => url.split_at(i),
+        None => (url, ""),
+    };
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let user: String = url::form_urlencoded::byte_serialize(user.as_bytes()).collect();
+    format!("{base}{separator}user={user}{fragment}")
+}
+
+/// The trimmed content of the file named by `name`, or `None` when the
+/// variable is unset or empty.
+fn read_secret_file(
+    var: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    name: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(path) = var(name).filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let content = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "{name}: cannot read {}",
+            std::path::Path::new(&path).display()
+        )
+    })?;
+    let value = content.trim();
+    anyhow::ensure!(!value.is_empty(), "{name}: the file is empty");
+    Ok(Some(value.to_owned()))
 }
 
 /// Every command that needs a database, once the pool exists.
@@ -1641,4 +1710,177 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod db_credentials_tests {
+    use super::db_connect_options_from;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+
+    /// A throwaway directory, removed on drop (no tempfile dependency).
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "acs-db-cred-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn env(pairs: &[(&str, &std::path::Path)]) -> impl Fn(&str) -> Option<OsString> {
+        let map: HashMap<String, OsString> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.as_os_str().to_owned()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn url_alone_is_used_as_is() {
+        let opts = db_connect_options_from("postgres://bus:pw@db:5432/bus", env(&[])).unwrap();
+        assert_eq!(opts.get_username(), "bus");
+        assert_eq!(opts.get_host(), "db");
+        assert_eq!(opts.get_database(), Some("bus"));
+    }
+
+    #[test]
+    fn files_win_over_the_url_and_are_trimmed() {
+        let dir = TempDir::new();
+        let user = dir.path().join("user");
+        let password = dir.path().join("password");
+        std::fs::write(&user, "fileuser\n").unwrap();
+        std::fs::write(&password, "  s3cr3t\n").unwrap();
+        let opts = db_connect_options_from(
+            "postgres://bus:old@db:5432/bus",
+            env(&[
+                ("DATABASE_USER_FILE", &user),
+                ("DATABASE_PASSWORD_FILE", &password),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(opts.get_username(), "fileuser");
+        // PgConnectOptions has no password getter; the Debug output carries it.
+        assert!(format!("{opts:?}").contains("s3cr3t"));
+        assert!(!format!("{opts:?}").contains("old"));
+    }
+
+    #[test]
+    fn unreadable_file_is_an_error() {
+        let dir = TempDir::new();
+        let missing = dir.path().join("nope");
+        let err = db_connect_options_from(
+            "postgres://bus@db/bus",
+            env(&[("DATABASE_PASSWORD_FILE", &missing)]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("DATABASE_PASSWORD_FILE"));
+    }
+
+    #[test]
+    fn empty_file_is_an_error() {
+        let dir = TempDir::new();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        assert!(
+            db_connect_options_from(
+                "postgres://bus@db/bus",
+                env(&[("DATABASE_PASSWORD_FILE", &empty)])
+            )
+            .is_err()
+        );
+    }
+
+    /// The file user is in place before sqlx reads .pgpass, so the lookup
+    /// finds that user's entry, not the one of the user in the URL.
+    ///
+    /// sqlx reads PGPASSFILE and PGPASSWORD from the process environment, so
+    /// the check runs in a child process of this test binary with exactly that
+    /// environment, instead of mutating the shared one under parallel tests.
+    #[test]
+    fn pgpass_is_looked_up_for_the_file_user() {
+        if let Some(user) = std::env::var_os("ACS_TEST_PGPASS_CHILD_USER_FILE") {
+            let opts = db_connect_options_from(
+                "postgres://urluser@db:5432/bus?user=queryuser",
+                env(&[("DATABASE_USER_FILE", std::path::Path::new(&user))]),
+            )
+            .unwrap();
+            assert_eq!(opts.get_username(), "fileuser");
+            let debug = format!("{opts:?}");
+            assert!(debug.contains("right-one"), "pgpass entry of the file user");
+            assert!(!debug.contains("wrong-one"));
+            return;
+        }
+        let dir = TempDir::new();
+        let user = dir.path().join("user");
+        std::fs::write(&user, "fileuser\n").unwrap();
+        let pgpass = dir.path().join("pgpass");
+        std::fs::write(
+            &pgpass,
+            "db:5432:bus:urluser:wrong-one\ndb:5432:bus:queryuser:wrong-one\n\
+             db:5432:bus:fileuser:right-one\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pgpass, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "db_credentials_tests::pgpass_is_looked_up_for_the_file_user",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env("ACS_TEST_PGPASS_CHILD_USER_FILE", &user)
+            .env("PGPASSFILE", &pgpass)
+            .env_remove("PGPASSWORD")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the child check failed");
+    }
+
+    #[test]
+    fn a_host_less_url_keeps_its_socket_and_a_literal_escape_survives() {
+        let dir = TempDir::new();
+        let user = dir.path().join("user");
+        std::fs::write(&user, "fileuser").unwrap();
+        let opts = db_connect_options_from(
+            "postgres:///bus?host=/var/run/postgresql",
+            env(&[("DATABASE_USER_FILE", &user)]),
+        )
+        .unwrap();
+        assert_eq!(opts.get_username(), "fileuser");
+        assert_eq!(opts.get_database(), Some("bus"));
+        // No user file: the authority is untouched, `%41` decodes as sqlx
+        // always decoded it.
+        let opts = db_connect_options_from("postgres://worker%41@db/bus", env(&[])).unwrap();
+        assert_eq!(opts.get_username(), "workerA");
+    }
+
+    #[test]
+    fn a_file_user_is_percent_encoded_into_the_url() {
+        let dir = TempDir::new();
+        let user = dir.path().join("user");
+        std::fs::write(&user, "we@ird:user").unwrap();
+        let opts = db_connect_options_from(
+            "postgres://bus:pw@db:5432/bus",
+            env(&[("DATABASE_USER_FILE", &user)]),
+        )
+        .unwrap();
+        assert_eq!(opts.get_username(), "we@ird:user");
+        assert_eq!(opts.get_host(), "db");
+    }
 }
