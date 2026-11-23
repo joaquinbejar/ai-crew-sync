@@ -19,9 +19,12 @@ services:
     image: ${POSTGRES_IMAGE:-postgres:18.4-alpine3.24}
     environment:
       POSTGRES_USER: bus
-      # Change it for anything reachable from outside your machine.
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      # The password is a secret, never an environment value: the image reads
+      # it from the file when it initialises an empty volume.
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
       POSTGRES_DB: bus
+    secrets:
+      - db_password
     volumes:
       # postgres:18+ expects the mount at /var/lib/postgresql (data lives in a
       # versioned subdir), which keeps future pg_upgrade --link possible.
@@ -109,7 +112,10 @@ services:
       context: .
       dockerfile: Docker/Dockerfile
     environment:
-      DATABASE_URL: postgres://bus:${POSTGRES_PASSWORD:-change-me}@db:5432/bus
+      # No password in the URL: the bus reads it from DATABASE_PASSWORD_FILE,
+      # which wins over anything the URL carries.
+      DATABASE_URL: ${DATABASE_URL:-postgres://bus@db:5432/bus}
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
       BUS_BIND: 0.0.0.0:8787
       # Anti DNS-rebinding. "*" is fine behind a proxy that validates Host;
       # set your real hostname when the bus is exposed directly.
@@ -133,6 +139,8 @@ services:
       # Swarm's IPVS from forgetting the idle LISTEN connection (15 min).
       BUS_EVENT_PING_SECS: ${BUS_EVENT_PING_SECS:-30}
       RUST_LOG: ${RUST_LOG:-ai_crew_sync=info}
+    secrets:
+      - db_password
     ports:
       - "${BUS_PORT:-8787}:8787"
     # Short-form only: Swarm rejects the condition syntax. If the bus starts
@@ -180,6 +188,18 @@ networks:
   edge:
     external: true
     name: ${TRAEFIK_NETWORK:-edge}
+
+# The database password, read by the server (POSTGRES_PASSWORD_FILE) and the
+# bus (DATABASE_PASSWORD_FILE). Under Swarm it is an existing secret, created
+# once per cluster:
+#   printf %s "$PW" | docker secret create ai_crew_sync_db_password -
+# DB_PASSWORD_SECRET names another one. Plain compose cannot mount an external
+# secret, so the make targets add Docker/docker-compose.local.yml, which turns
+# it into a local file.
+secrets:
+  db_password:
+    external: true
+    name: ${DB_PASSWORD_SECRET:-ai_crew_sync_db_password}
 
 volumes:
   bus-data:

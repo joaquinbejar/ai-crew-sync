@@ -9,7 +9,13 @@
 # --project-directory keeps the repo root as the project dir, so compose
 # reads ./.env and names the project from COMPOSE_PROJECT_NAME there even
 # though the files live under Docker/.
-COMPOSE      = docker compose --project-directory . -f Docker/docker-compose.yml
+COMPOSE      = docker compose --project-directory . -f Docker/docker-compose.yml -f Docker/docker-compose.local.yml
+# The Swarm file alone, as `docker stack deploy` (and Portainer) reads it.
+COMPOSE_SWARM = docker compose --project-directory . -f Docker/docker-compose.yml
+# The local stand-in for the database password secret (make secret), and the
+# secret's name on a swarm.
+DB_PASSWORD_FILE ?= .secrets/db_password
+DB_PASSWORD_SECRET ?= ai_crew_sync_db_password
 STACK       ?= crew
 # The reverse proxy's network the bus attaches to (external in the compose
 # file). `up` creates it locally when missing; `deploy` requires it to exist.
@@ -68,7 +74,16 @@ lint-fix: ## Apply the clippy fixes that are machine-applicable
 validate: ## Render the compose file from defaults and check its build context
 	@env -u POSTGRES_PASSWORD -u BUS_VERSION -u BUS_IMAGE -u BUS_ALLOWED_HOSTS \
 		-u BUS_DASHBOARD_SECRET -u BUS_PUBLIC_HOST $(COMPOSE) --env-file /dev/null config -q \
-		&& echo "  ok  Docker/docker-compose.yml renders from defaults"
+		&& echo "  ok  Docker/docker-compose.yml + local override render from defaults"
+	@env -u POSTGRES_PASSWORD -u BUS_VERSION -u BUS_IMAGE -u BUS_ALLOWED_HOSTS \
+		-u BUS_DASHBOARD_SECRET -u BUS_PUBLIC_HOST $(COMPOSE_SWARM) --env-file /dev/null config -q \
+		&& echo "  ok  Docker/docker-compose.yml renders alone (Swarm)"
+	@if $(COMPOSE_SWARM) --env-file /dev/null config 2>/dev/null \
+		| grep -qE 'POSTGRES_PASSWORD:|postgres://[^@/ ]*:[^@/ ]*@'; then \
+		echo "  FAIL  the Swarm compose carries a database password in the environment"; exit 1; \
+	else \
+		echo "  ok  + no database password in the environment"; \
+	fi
 	@ctx=$$($(COMPOSE) config --format json 2>/dev/null \
 		| python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["bus"]["build"]["context"])'); \
 	if [ -d "$$ctx" ] && [ -f "$$ctx/Cargo.toml" ]; then \
@@ -86,7 +101,7 @@ config-check: ## Fail if a configuration variable is missing from .env.example
 	@missing=""; \
 	for v in $$(grep -rhoE '\b(BUS|POSTGRES|DATABASE|RUST)_[A-Z_]+' \
 			src Docker plugin 2>/dev/null | sort -u); do \
-		case "$$v" in POSTGRES_USER|POSTGRES_DB) continue ;; esac; \
+		case "$$v" in POSTGRES_USER|POSTGRES_DB|POSTGRES_PASSWORD_FILE) continue ;; esac; \
 		grep -q "^#\? *$$v[=:]\?" .env.example || missing="$$missing $$v"; \
 	done; \
 	if [ -n "$$missing" ]; then \
@@ -148,13 +163,23 @@ run: ## Run the server from source against $$DATABASE_URL
 # The compose file carries a build block for up-dev; `up` must never build,
 # so an image that is missing locally is pulled instead.
 .PHONY: up
-up: network ## Start the local stack (published image), detached
+up: network secret ## Start the local stack (published image), detached
 	$(COMPOSE) up -d --no-build
 
 # A local tag, so a checkout build never shadows the published image tag.
 .PHONY: up-dev
-up-dev: network ## Start the local stack built from this checkout
+up-dev: network secret ## Start the local stack built from this checkout
 	BUS_IMAGE=ai-crew-sync BUS_VERSION=dev $(COMPOSE) up -d --build
+
+# The local stand-in for the Swarm secret: written once, from POSTGRES_PASSWORD
+# (the example `change-me` when unset), and never overwritten, because the
+# database keeps the password it was initialised with.
+.PHONY: secret
+secret: ## Write the local database password file if missing
+	@[ -s "$(DB_PASSWORD_FILE)" ] || { \
+		mkdir -p "$$(dirname "$(DB_PASSWORD_FILE)")"; \
+		( umask 077; printf %s "$${POSTGRES_PASSWORD:-change-me}" > "$(DB_PASSWORD_FILE)" ); \
+		echo "wrote $(DB_PASSWORD_FILE)"; }
 
 .PHONY: network
 network: ## Create the proxy network locally if it does not exist
@@ -183,12 +208,14 @@ logs: ## Follow stack logs
 # sessions.
 .PHONY: deploy-check
 deploy-check: ## Verify production values are present and safe (no cluster contact)
-	@fail=0; 	[ -n "$$POSTGRES_PASSWORD" ] || { echo "POSTGRES_PASSWORD is not set"; fail=1; }; 	[ "$$POSTGRES_PASSWORD" != "change-me" ] || { echo "POSTGRES_PASSWORD is still the example value"; fail=1; }; 	[ -n "$$BUS_VERSION" ] || { echo "BUS_VERSION is not set (pin an immutable tag)"; fail=1; }; 	case "$$BUS_VERSION" in latest|"") echo "BUS_VERSION must be immutable, not 'latest'"; fail=1 ;; esac; 	[ -n "$$BUS_DASHBOARD_SECRET" ] || { echo "BUS_DASHBOARD_SECRET is not set (dashboard sessions would not survive a restart or work across replicas)"; fail=1; }; 	if [ -z "$$BUS_ALLOWED_HOSTS" ]; then 		echo "BUS_ALLOWED_HOSTS is not set (use your hostname, or '*' if a proxy validates Host)"; fail=1; 	elif [ "$$BUS_ALLOWED_HOSTS" = "*" ]; then 		echo "note: BUS_ALLOWED_HOSTS=* — only safe behind a proxy that validates the Host header"; 	fi; 	if [ "$$TRAEFIK_ENABLE" = "true" ] && [ -z "$$BUS_PUBLIC_HOST" ]; then 		echo "TRAEFIK_ENABLE=true but BUS_PUBLIC_HOST is not set (the proxy needs the hostname to route)"; fail=1; 	fi; 	[ $$fail -eq 0 ] || { echo ""; echo "refusing to deploy: fix the above, then re-run"; exit 1; }; 	echo "deploy preflight: ok"
+	@fail=0; 	[ -n "$$BUS_VERSION" ] || { echo "BUS_VERSION is not set (pin an immutable tag)"; fail=1; }; 	case "$$BUS_VERSION" in latest|"") echo "BUS_VERSION must be immutable, not 'latest'"; fail=1 ;; esac; 	[ -n "$$BUS_DASHBOARD_SECRET" ] || { echo "BUS_DASHBOARD_SECRET is not set (dashboard sessions would not survive a restart or work across replicas)"; fail=1; }; 	if [ -z "$$BUS_ALLOWED_HOSTS" ]; then 		echo "BUS_ALLOWED_HOSTS is not set (use your hostname, or '*' if a proxy validates Host)"; fail=1; 	elif [ "$$BUS_ALLOWED_HOSTS" = "*" ]; then 		echo "note: BUS_ALLOWED_HOSTS=* — only safe behind a proxy that validates the Host header"; 	fi; 	if [ "$$TRAEFIK_ENABLE" = "true" ] && [ -z "$$BUS_PUBLIC_HOST" ]; then 		echo "TRAEFIK_ENABLE=true but BUS_PUBLIC_HOST is not set (the proxy needs the hostname to route)"; fail=1; 	fi; 	[ $$fail -eq 0 ] || { echo ""; echo "refusing to deploy: fix the above, then re-run"; exit 1; }; 	echo "deploy preflight: ok"
 
 .PHONY: deploy
 deploy: deploy-check ## Deploy to the current Docker Swarm as stack '$(STACK)' -- REACHES A REAL ENVIRONMENT
 	@docker network inspect $(TRAEFIK_NETWORK) >/dev/null 2>&1 \
 		|| { echo "network '$(TRAEFIK_NETWORK)' does not exist on this swarm: the proxy's stack must create it (attachable overlay), or set TRAEFIK_NETWORK"; exit 1; }
+	@docker secret inspect $(DB_PASSWORD_SECRET) >/dev/null 2>&1 \
+		|| { echo "secret '$(DB_PASSWORD_SECRET)' does not exist on this swarm: create it with docker secret create $(DB_PASSWORD_SECRET) -, or set DB_PASSWORD_SECRET"; exit 1; }
 	docker stack deploy -c Docker/docker-compose.yml $(STACK)
 
 # --- housekeeping -----------------------------------------------------------

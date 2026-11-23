@@ -1,0 +1,12 @@
+# Plain-compose override, added by every make target that runs the local stack
+# (COMPOSE in the Makefile). Docker/docker-compose.yml declares the database
+# password as an external Swarm secret, which plain compose refuses to mount
+# ("unsupported external secret"); here it becomes a file instead.
+#
+# `make secret` writes ./.secrets/db_password (git-ignored) from
+# POSTGRES_PASSWORD, `change-me` by default, when it does not exist yet.
+# DB_PASSWORD_FILE points at another file. Never deploy this file to a swarm.
+secrets:
+  db_password:
+    external: false
+    file: ${DB_PASSWORD_FILE:-./.secrets/db_password}

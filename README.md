@@ -142,19 +142,22 @@ as `sh "<plugin root>/scripts/<hook>.sh"`, so Git Bash's `sh` must be on the
 
 ```bash
 make up      # creates the `edge` network if missing, then:
-             # docker compose --project-directory . -f Docker/docker-compose.yml up -d --no-build
+             # docker compose --project-directory . -f Docker/docker-compose.yml \
+             #   -f Docker/docker-compose.local.yml up -d --no-build
 ```
 
 Every variable has a sane default; override via the environment or
 `./.env` (start from `.env.example`, which documents every knob with its
-default — set a real `POSTGRES_PASSWORD` for anything not local). The
+default — set a real `POSTGRES_PASSWORD` for anything not local; `make up`
+writes it once to `.secrets/db_password`, the local stand-in for the database
+secret). The
 `--project-directory .` is what makes compose read `./.env`; run compose
 commands from the repository root with it, or use the `make` targets. `make
 up-dev` builds from the checkout instead. **Docker Swarm** works with the same
 file:
 
 ```bash
-export POSTGRES_PASSWORD=...   # Swarm does not read .env files
+printf %s "$PW" | docker secret create ai_crew_sync_db_password -   # once per cluster
 docker network create --driver overlay --attachable edge   # the bus always joins it, Traefik or not
 docker stack deploy -c Docker/docker-compose.yml crew
 ```
@@ -198,15 +201,18 @@ so `make up` boots on a laptop. What keeps production safe is the preflight
 that `make deploy` runs before touching the cluster:
 
 ```bash
-export POSTGRES_PASSWORD=…        # not the example value
+printf %s "$PW" | docker secret create ai_crew_sync_db_password -   # once
 export BUS_VERSION=0.7.0          # a full release version, never `latest`
 export BUS_ALLOWED_HOSTS=crew.example.com
 export BUS_DASHBOARD_SECRET=…     # shared, so sessions work across replicas
 make deploy                       # preflight, then docker stack deploy
 ```
 
-`make deploy` refuses if any of those is unset, if the password is still
-`change-me`, if `BUS_VERSION` is `latest`, or if `TRAEFIK_ENABLE=true` is set
+The database password is never an environment value under Swarm: the server
+and the bus read the secret (`DB_PASSWORD_SECRET`, default
+`ai_crew_sync_db_password`) through `POSTGRES_PASSWORD_FILE` and
+`DATABASE_PASSWORD_FILE`. `make deploy` refuses if the secret does not exist,
+if any of those variables is unset, if `BUS_VERSION` is `latest`, or if `TRAEFIK_ENABLE=true` is set
 without `BUS_PUBLIC_HOST`; it also refuses when the proxy network
 (`TRAEFIK_NETWORK`, default `edge`) does not exist on the swarm. `make
 deploy-check` runs the variable checks alone and never contacts the cluster.

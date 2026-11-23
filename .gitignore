@@ -2,3 +2,6 @@
 .env
 *.log
 .idea/
+
+# Local stand-in for the database password secret (make secret)
+/.secrets/
