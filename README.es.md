@@ -1310,7 +1310,7 @@ in the resolved migrations"). Para volver atrás, pon
 arrancar la versión anterior.
 
 ```bash
-export BUS_VERSION=0.7.11
+export BUS_VERSION=0.7.10
 make deploy                                    # Swarm; o, desde la raíz del repositorio:
 docker compose --project-directory . -f Docker/docker-compose.yml pull && make up
 ```

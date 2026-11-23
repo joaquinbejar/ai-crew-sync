@@ -834,12 +834,23 @@ fn db_connect_options_from(
     url: &str,
     var: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> anyhow::Result<sqlx::postgres::PgConnectOptions> {
+    // The user goes into the URL BEFORE sqlx parses it: parsing is where sqlx
+    // looks the password up in .pgpass (PGPASSFILE), keyed by the user, so a
+    // user applied afterwards would read the entry of the URL's user instead.
+    let url = match read_secret_file(&var, "DATABASE_USER_FILE")? {
+        Some(user) => {
+            let mut parsed =
+                url::Url::parse(url).context("DATABASE_URL is not a valid Postgres URL")?;
+            parsed
+                .set_username(&user)
+                .map_err(|()| anyhow::anyhow!("DATABASE_URL cannot carry a user"))?;
+            std::borrow::Cow::Owned(parsed.to_string())
+        }
+        None => std::borrow::Cow::Borrowed(url),
+    };
     let mut options: sqlx::postgres::PgConnectOptions = url
         .parse()
         .context("DATABASE_URL is not a valid Postgres URL")?;
-    if let Some(user) = read_secret_file(&var, "DATABASE_USER_FILE")? {
-        options = options.username(&user);
-    }
     if let Some(password) = read_secret_file(&var, "DATABASE_PASSWORD_FILE")? {
         options = options.password(&password);
     }
@@ -1781,5 +1792,52 @@ mod db_credentials_tests {
             )
             .is_err()
         );
+    }
+
+    /// The file user is in place before sqlx reads .pgpass, so the lookup
+    /// finds that user's entry, not the one of the user in the URL.
+    #[test]
+    fn pgpass_is_looked_up_for_the_file_user() {
+        let dir = TempDir::new();
+        let user = dir.path().join("user");
+        std::fs::write(&user, "fileuser\n").unwrap();
+        let pgpass = dir.path().join("pgpass");
+        std::fs::write(
+            &pgpass,
+            "db:5432:bus:urluser:wrong-one\ndb:5432:bus:fileuser:right-one\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pgpass, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        // PGPASSFILE is read by sqlx from the process environment; no other
+        // test in this binary reads it.
+        unsafe { std::env::set_var("PGPASSFILE", &pgpass) };
+        let opts = db_connect_options_from(
+            "postgres://urluser@db:5432/bus",
+            env(&[("DATABASE_USER_FILE", &user)]),
+        );
+        unsafe { std::env::remove_var("PGPASSFILE") };
+        let opts = opts.unwrap();
+        assert_eq!(opts.get_username(), "fileuser");
+        let debug = format!("{opts:?}");
+        assert!(debug.contains("right-one"), "pgpass entry of the file user");
+        assert!(!debug.contains("wrong-one"));
+    }
+
+    #[test]
+    fn a_file_user_is_percent_encoded_into_the_url() {
+        let dir = TempDir::new();
+        let user = dir.path().join("user");
+        std::fs::write(&user, "we@ird:user").unwrap();
+        let opts = db_connect_options_from(
+            "postgres://bus:pw@db:5432/bus",
+            env(&[("DATABASE_USER_FILE", &user)]),
+        )
+        .unwrap();
+        assert_eq!(opts.get_username(), "we@ird:user");
+        assert_eq!(opts.get_host(), "db");
     }
 }

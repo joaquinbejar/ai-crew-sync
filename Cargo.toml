@@ -15,6 +15,7 @@ name = "ai-crew-sync"
 path = "src/main.rs"
 
 [dependencies]
+url = "2"
 rmcp = { version = "3.4", features = [
     "server",
     "macros",

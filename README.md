@@ -1272,7 +1272,7 @@ applied but is missing in the resolved migrations"). To roll back, set
 the older version.
 
 ```bash
-export BUS_VERSION=0.7.11
+export BUS_VERSION=0.7.10
 make deploy                                    # Swarm; or, from the repository root:
 docker compose --project-directory . -f Docker/docker-compose.yml pull && make up
 ```
