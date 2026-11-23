@@ -209,7 +209,7 @@ preflight que `make deploy` ejecuta antes de tocar el clúster:
 
 ```bash
 printf %s "$PW" | docker secret create ai_crew_sync_db_password -   # una vez
-export BUS_VERSION=0.7.0          # una versión de release completa, nunca `latest`
+export BUS_VERSION=0.7.11         # una versión de release completa, nunca `latest`, 0.7.11 o posterior
 export BUS_ALLOWED_HOSTS=crew.example.com
 export BUS_DASHBOARD_SECRET=…     # compartido, para que la sesión valga en cualquier réplica
 make deploy                       # preflight y después docker stack deploy
@@ -1320,6 +1320,12 @@ export BUS_VERSION=0.7.10
 make deploy                                    # Swarm; o, desde la raíz del repositorio:
 docker compose --project-directory . -f Docker/docker-compose.yml pull && make up
 ```
+
+Un bus anterior a 0.7.11 no lee `DATABASE_PASSWORD_FILE`, y este fichero de
+compose guarda la contraseña solo en el secret: volver tan atrás necesita
+también el fichero de compose de esa release
+(`git checkout v0.7.10 -- Docker/docker-compose.yml`) con `POSTGRES_PASSWORD`
+exportada, y `make deploy` rechaza la versión antigua con el fichero actual.
 
 El contenedor migra al arrancar, y el servicio empaquetado también — los dos
 traen `BUS_AUTO_MIGRATE=true` — así que actualizar por `.deb` o `.rpm` es el

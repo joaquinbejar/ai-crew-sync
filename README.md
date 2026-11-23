@@ -202,7 +202,7 @@ that `make deploy` runs before touching the cluster:
 
 ```bash
 printf %s "$PW" | docker secret create ai_crew_sync_db_password -   # once
-export BUS_VERSION=0.7.0          # a full release version, never `latest`
+export BUS_VERSION=0.7.11         # a full release version, never `latest`, 0.7.11 or later
 export BUS_ALLOWED_HOSTS=crew.example.com
 export BUS_DASHBOARD_SECRET=…     # shared, so sessions work across replicas
 make deploy                       # preflight, then docker stack deploy
@@ -1282,6 +1282,12 @@ export BUS_VERSION=0.7.10
 make deploy                                    # Swarm; or, from the repository root:
 docker compose --project-directory . -f Docker/docker-compose.yml pull && make up
 ```
+
+A bus older than 0.7.11 cannot read `DATABASE_PASSWORD_FILE`, and this compose
+file keeps the password only in the secret: going back that far also needs the
+compose file of that release (`git checkout v0.7.10 -- Docker/docker-compose.yml`)
+with `POSTGRES_PASSWORD` exported, and `make deploy` refuses the older version
+with the current file.
 
 The container migrates on startup, and so does the packaged service — both
 default to `BUS_AUTO_MIGRATE=true` — so a `.deb` or `.rpm` upgrade is the
