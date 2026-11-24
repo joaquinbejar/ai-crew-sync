@@ -119,6 +119,7 @@ pub async fn team_stream(
         .with_limits(quotas.max_messages, quotas.max_bytes)
         .with_inbox_limits(quotas.inbox_max_messages, quotas.inbox_max_bytes);
     config.credentials = credentials;
+    let config = config.with_password_from_env()?;
     config.validate_quotas()?;
     if remove {
         let (routed,): (String,) =
@@ -333,6 +334,7 @@ pub async fn conversations_migrate(
 
     let mut config = crate::store::jetstream::Config::new(nats_url.to_owned());
     config.credentials = credentials;
+    let config = config.with_password_from_env()?;
     // Fail here rather than halfway through: a move that cannot reach the
     // broker is a move that should not start.
     let jetstream = crate::store::jetstream::JetStreamBackend::connect(&config, id).await?;

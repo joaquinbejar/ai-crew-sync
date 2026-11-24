@@ -2134,6 +2134,7 @@ servidor con sus defaults.
 | `BUS_EVENT_PING_SECS` | `30` | Cada cuánto hace ping cada réplica a su propia conexión LISTEN; tres ecos perdidos la vuelven a enganchar. |
 | `BUS_NATS_URL` | sin fijar | El broker. Sin fijar significa que nunca se contacta con ningún broker. También la leen `team stream` y `conversations migrate`. |
 | `BUS_NATS_CREDENTIALS` | sin fijar | El fichero de credenciales de *runtime* del servidor (no puede crear streams). |
+| `BUS_NATS_USER`, `BUS_NATS_PASSWORD_FILE` | `bus`, sin fijar | Usuario y contraseña para un broker con bloque `authorization`; el fichero de contraseña (un secret de Docker) se recorta. Lo usan el servidor y `team stream`/`team migrate`. Un fichero ilegible o vacío es un error, y también combinarlo con `BUS_NATS_CREDENTIALS`. |
 | `BUS_PUBLICATION_WORKER` | `true` | Si esta réplica drena el outbox (solo con broker). |
 | `RUST_LOG` | `ai_crew_sync=info,tower_http=info,warn` | Filtro de logs. |
 

@@ -40,6 +40,10 @@ pub struct ServeOptions {
     /// provisioning credential is an operator's and this process never
     /// holds it.
     pub nats_credentials: Option<String>,
+    /// User and password for a broker with an `authorization` block, read
+    /// from `BUS_NATS_PASSWORD_FILE` (a Docker secret) at startup. Mutually
+    /// exclusive with `nats_credentials`.
+    pub nats_user_password: Option<(String, String)>,
     /// Drain the publication outbox in this process. On by default wherever
     /// a broker is configured; an operator running dedicated drainer
     /// replicas turns it off on the ones serving requests, and a test that
@@ -378,6 +382,7 @@ pub fn build_router(pool: PgPool, opts: &ServeOptions, ct: CancellationToken) ->
         Some(url) => {
             let mut config = crate::store::jetstream::Config::new(url.to_owned());
             config.credentials = configured(&opts.nats_credentials).map(str::to_owned);
+            config.user_password = opts.nats_user_password.clone();
             tracing::info!(%url, "JetStream available for teams routed to it");
             crate::store::routing::Backends::with_jetstream(pool.clone(), config)
         }

@@ -928,6 +928,13 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
                     ai_crew_sync::auth::generate_token().into_bytes()
                 }
             };
+            // Read the broker password here, where a bad secret can stop the
+            // process, rather than inside the infallible router setup.
+            let nats_user_password = {
+                let mut probe = ai_crew_sync::store::jetstream::Config::new(String::new());
+                probe.credentials = args.nats_credentials.clone().filter(|c| !c.is_empty());
+                probe.with_password_from_env()?.user_password
+            };
             serve::run(
                 pool,
                 serve::ServeOptions {
@@ -939,6 +946,7 @@ async fn dispatch(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
                     dashboard_secret,
                     nats_url: args.nats_url,
                     nats_credentials: args.nats_credentials,
+                    nats_user_password,
                     publication_worker: args.publication_worker,
                     event_ping_secs: args.event_ping_secs,
                 },
