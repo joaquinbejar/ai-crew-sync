@@ -60,7 +60,9 @@ services:
   # with `ai-crew-sync team stream`, and only then routes a team to it. None
   # of those steps implies the next.
   nats:
-    image: ${NATS_IMAGE:-nats:2.12-alpine}
+    # An exact version and digest: a moving tag would change the broker that
+    # holds the streams on any redeploy, without anyone deciding it.
+    image: ${NATS_IMAGE:-nats:2.12.15-alpine3.22@sha256:b270f5e2428354c0335612694d7dd2fb588148e567a5757fdff325ef9c9332e6}
     # The configuration is written by the container rather than mounted from
     # the repository. A relative path in `configs.file` resolves against the
     # project directory, and who deploys decides what that is: the Makefile
@@ -71,12 +73,24 @@ services:
     # max_payload is why there is a file at all: nats-server takes it only
     # from configuration (there is no flag), and its 1 MiB default refuses a
     # 1 MiB body once envelope headers are added, by about two hundred bytes.
+    #
+    # Clients authenticate with a user and a password; anonymous connections
+    # are refused. The password is the nats_password secret, read from its
+    # file at start and handed to nats-server through the environment, so it
+    # never appears in this file, in the service spec or in the config text.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        NATS_PASSWORD="$$(cat /run/secrets/nats_password)"
+        [ -n "$$NATS_PASSWORD" ] || { echo "nats_password secret is empty" >&2; exit 1; }
+        export NATS_USER NATS_PASSWORD
         cat > /tmp/nats.conf <<'CONF'
         max_payload: 2MB
         http_port: 8222
+        authorization {
+            user: $$NATS_USER
+            password: $$NATS_PASSWORD
+        }
         jetstream {
             store_dir: /data
             max_memory_store: 256MB
@@ -84,6 +98,10 @@ services:
         }
         CONF
         exec nats-server -c /tmp/nats.conf
+    environment:
+      NATS_USER: ${NATS_USER:-bus}
+    secrets:
+      - nats_password
     volumes:
       - nats-data:/data
     deploy:
@@ -104,7 +122,7 @@ services:
     # Published multi-arch image by default. `make up-dev` sets BUS_IMAGE and
     # BUS_VERSION to a local tag and passes --build, so a checkout build never
     # shadows the published tag. Production pins an immutable BUS_VERSION.
-    image: ${BUS_IMAGE:-ghcr.io/joaquinbejar/ai-crew-sync}:${BUS_VERSION:-0.7.11}
+    image: ${BUS_IMAGE:-ghcr.io/joaquinbejar/ai-crew-sync}:${BUS_VERSION:-0.7.12}
     build:
       # Relative to the project directory (the repo root, which the Makefile
       # pins with --project-directory), NOT to this file's location. Swarm
@@ -132,6 +150,10 @@ services:
       # optional path available. It routes nobody on its own.
       BUS_NATS_URL: ${BUS_NATS_URL:-}
       BUS_NATS_CREDENTIALS: ${BUS_NATS_CREDENTIALS:-}
+      # The broker's user and password (nats_password secret). Ignored while
+      # BUS_NATS_URL is empty.
+      BUS_NATS_USER: ${NATS_USER:-bus}
+      BUS_NATS_PASSWORD_FILE: /run/secrets/nats_password
       # Drain the publication outbox here. Turn it off on the replicas that
       # only serve requests when you run dedicated drainers.
       BUS_PUBLICATION_WORKER: ${BUS_PUBLICATION_WORKER:-true}
@@ -145,6 +167,7 @@ services:
       RUST_LOG: ${RUST_LOG:-ai_crew_sync=info}
     secrets:
       - db_password
+      - nats_password
     ports:
       - "${BUS_PORT:-8787}:8787"
     # Short-form only: Swarm rejects the condition syntax. If the bus starts
@@ -204,6 +227,14 @@ secrets:
   db_password:
     external: true
     name: ${DB_PASSWORD_SECRET:-ai_crew_sync_db_password}
+  # The broker password, read by nats (authorization block) and the bus
+  # (BUS_NATS_PASSWORD_FILE). Required even with NATS_REPLICAS=0, because
+  # the bus mounts it; create it once per cluster like the database one:
+  #   openssl rand -hex 32 | docker secret create ai_crew_sync_nats_password -
+  # NATS_PASSWORD_SECRET names another one (a versioned name rotates it).
+  nats_password:
+    external: true
+    name: ${NATS_PASSWORD_SECRET:-ai_crew_sync_nats_password}
 
 volumes:
   bus-data:

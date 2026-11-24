@@ -10,3 +10,8 @@ secrets:
   db_password:
     external: false
     file: ${DB_PASSWORD_FILE:-./.secrets/db_password}
+  # `make secret` also writes ./.secrets/nats_password, a random password,
+  # when it does not exist yet. NATS_PASSWORD_FILE points at another file.
+  nats_password:
+    external: false
+    file: ${NATS_PASSWORD_FILE:-./.secrets/nats_password}
