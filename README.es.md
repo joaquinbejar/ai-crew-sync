@@ -209,7 +209,8 @@ preflight que `make deploy` ejecuta antes de tocar el clúster:
 
 ```bash
 printf %s "$PW" | docker secret create ai_crew_sync_db_password -   # una vez
-export BUS_VERSION=0.7.11         # una versión de release completa, nunca `latest`, 0.7.11 o posterior
+openssl rand -hex 32 | docker secret create ai_crew_sync_nats_password -   # una vez
+export BUS_VERSION=0.7.12         # una versión de release completa, nunca `latest`, 0.7.12 o posterior
 export BUS_ALLOWED_HOSTS=crew.example.com
 export BUS_DASHBOARD_SECRET=…     # compartido, para que la sesión valga en cualquier réplica
 make deploy                       # preflight y después docker stack deploy
@@ -223,7 +224,11 @@ falta alguna de esas variables, si `BUS_VERSION` es `latest`, o si se pone `TRAE
 sin `BUS_PUBLIC_HOST`; también se niega cuando la red del proxy
 (`TRAEFIK_NETWORK`, por defecto `edge`) no existe en el swarm. `make
 deploy-check` ejecuta solo las comprobaciones de variables y nunca contacta
-con el clúster. Fija una versión completa como `0.7.11`: cada release publica
+con el clúster. El broker se autentica igual: `nats` rechaza conexiones anónimas y toma su
+contraseña del secret `NATS_PASSWORD_SECRET` (por defecto
+`ai_crew_sync_nats_password`, usuario `NATS_USER`, por defecto `bus`), que el
+bus lee con `BUS_NATS_PASSWORD_FILE`; `make deploy` se niega también si ese
+secret no existe, aun con `NATS_REPLICAS=0`. Fija una versión completa como `0.7.12`: cada release publica
 además un tag móvil `0.7`, y el preflight no lo detecta.
 
 En un swarm de más de un nodo, fija los servicios con estado: los volúmenes

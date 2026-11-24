@@ -202,7 +202,8 @@ that `make deploy` runs before touching the cluster:
 
 ```bash
 printf %s "$PW" | docker secret create ai_crew_sync_db_password -   # once
-export BUS_VERSION=0.7.11         # a full release version, never `latest`, 0.7.11 or later
+openssl rand -hex 32 | docker secret create ai_crew_sync_nats_password -   # once
+export BUS_VERSION=0.7.12         # a full release version, never `latest`, 0.7.12 or later
 export BUS_ALLOWED_HOSTS=crew.example.com
 export BUS_DASHBOARD_SECRET=…     # shared, so sessions work across replicas
 make deploy                       # preflight, then docker stack deploy
@@ -216,7 +217,12 @@ if any of those variables is unset, if `BUS_VERSION` is `latest`, or if `TRAEFIK
 without `BUS_PUBLIC_HOST`; it also refuses when the proxy network
 (`TRAEFIK_NETWORK`, default `edge`) does not exist on the swarm. `make
 deploy-check` runs the variable checks alone and never contacts the cluster.
-Pin a full version such as `0.7.11`: each release also publishes a moving
+The broker is authenticated the same way: `nats` refuses anonymous
+connections and takes its password from the `NATS_PASSWORD_SECRET` secret
+(default `ai_crew_sync_nats_password`, user `NATS_USER`, default `bus`),
+which the bus reads through `BUS_NATS_PASSWORD_FILE`; `make deploy` refuses
+if that secret does not exist either, even with `NATS_REPLICAS=0`.
+Pin a full version such as `0.7.12`: each release also publishes a moving
 `0.7` tag, and the preflight does not catch it.
 
 On a swarm of more than one node, pin the stateful services: the database

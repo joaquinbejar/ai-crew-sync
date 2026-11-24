@@ -16,6 +16,8 @@ COMPOSE_SWARM = docker compose --project-directory . -f Docker/docker-compose.ym
 # secret) is resolved inside the recipe, like compose resolves it: the
 # environment first, then ./.env, then .secrets/db_password.
 DB_PASSWORD_SECRET ?= ai_crew_sync_db_password
+# The broker password secret's name on a swarm (nats and bus both mount it).
+NATS_PASSWORD_SECRET ?= ai_crew_sync_nats_password
 STACK       ?= crew
 # The reverse proxy's network the bus attaches to (external in the compose
 # file). `up` creates it locally when missing; `deploy` requires it to exist.
@@ -27,7 +29,7 @@ TEST_PG_NAME  = ai-crew-sync-test-pg
 # broker is a visible failure rather than a silent one.
 TEST_NATS_NAME  = ai-crew-sync-test-nats
 TEST_NATS_PORT ?= 14222
-TEST_NATS_IMAGE = nats:2.12-alpine
+TEST_NATS_IMAGE = nats:2.12.15-alpine3.22@sha256:b270f5e2428354c0335612694d7dd2fb588148e567a5757fdff325ef9c9332e6
 TEST_PG_PORT ?= 55432
 TEST_PG_IMAGE ?= postgres:18-alpine
 
@@ -179,7 +181,7 @@ up-dev: network secret ## Start the local stack built from this checkout
 # the container users can read it through the bind mount whatever their UID;
 # the directory that holds it is 0700, so other host users cannot.
 .PHONY: secret
-secret: ## Write the local database password file if missing
+secret: ## Write the local database and broker password files if missing
 	@set -e; \
 	dotenv() { [ -f .env ] || return 0; \
 		sed -n "s/^[[:space:]]*$$1=//p" .env | tail -n 1 \
@@ -191,6 +193,19 @@ secret: ## Write the local database password file if missing
 	mkdir -p "$$dir"; \
 	[ "$$dir" != .secrets ] || chmod 700 "$$dir"; \
 	( umask 022; printf %s "$$pw" > "$$file.tmp" ); \
+	chmod 644 "$$file.tmp"; \
+	mv "$$file.tmp" "$$file"; \
+	echo "wrote $$file"
+	@set -e; \
+	dotenv() { [ -f .env ] || return 0; \
+		sed -n "s/^[[:space:]]*$$1=//p" .env | tail -n 1 \
+		| sed -e 's/^"\(.*\)"$$/\1/' -e "s/^'\(.*\)'$$/\1/"; }; \
+	file="$${NATS_PASSWORD_FILE:-$$(dotenv NATS_PASSWORD_FILE)}"; file="$${file:-.secrets/nats_password}"; \
+	[ -s "$$file" ] && exit 0; \
+	dir="$$(dirname "$$file")"; \
+	mkdir -p "$$dir"; \
+	[ "$$dir" != .secrets ] || chmod 700 "$$dir"; \
+	( umask 022; openssl rand -hex 32 > "$$file.tmp" ); \
 	chmod 644 "$$file.tmp"; \
 	mv "$$file.tmp" "$$file"; \
 	echo "wrote $$file"
@@ -222,7 +237,7 @@ logs: ## Follow stack logs
 # sessions.
 .PHONY: deploy-check
 deploy-check: ## Verify production values are present and safe (no cluster contact)
-	@fail=0; 	[ -n "$$BUS_VERSION" ] || { echo "BUS_VERSION is not set (pin an immutable tag)"; fail=1; }; 	case "$$BUS_VERSION" in latest|"") echo "BUS_VERSION must be immutable, not 'latest'"; fail=1 ;; esac; case "$$BUS_VERSION" in [0-9]*.[0-9]*.[0-9]*) [ "$$(printf '%s\n' 0.7.11 "$$BUS_VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)" = 0.7.11 ] || { echo "BUS_VERSION $$BUS_VERSION is older than 0.7.11, the first bus that reads DATABASE_PASSWORD_FILE (the password is a secret in this compose file)"; fail=1; } ;; esac; 	[ -n "$$BUS_DASHBOARD_SECRET" ] || { echo "BUS_DASHBOARD_SECRET is not set (dashboard sessions would not survive a restart or work across replicas)"; fail=1; }; 	if [ -z "$$BUS_ALLOWED_HOSTS" ]; then 		echo "BUS_ALLOWED_HOSTS is not set (use your hostname, or '*' if a proxy validates Host)"; fail=1; 	elif [ "$$BUS_ALLOWED_HOSTS" = "*" ]; then 		echo "note: BUS_ALLOWED_HOSTS=* — only safe behind a proxy that validates the Host header"; 	fi; 	if [ "$$TRAEFIK_ENABLE" = "true" ] && [ -z "$$BUS_PUBLIC_HOST" ]; then 		echo "TRAEFIK_ENABLE=true but BUS_PUBLIC_HOST is not set (the proxy needs the hostname to route)"; fail=1; 	fi; 	[ $$fail -eq 0 ] || { echo ""; echo "refusing to deploy: fix the above, then re-run"; exit 1; }; 	echo "deploy preflight: ok"
+	@fail=0; 	[ -n "$$BUS_VERSION" ] || { echo "BUS_VERSION is not set (pin an immutable tag)"; fail=1; }; 	case "$$BUS_VERSION" in latest|"") echo "BUS_VERSION must be immutable, not 'latest'"; fail=1 ;; esac; case "$$BUS_VERSION" in [0-9]*.[0-9]*.[0-9]*) [ "$$(printf '%s\n' 0.7.12 "$$BUS_VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)" = 0.7.12 ] || { echo "BUS_VERSION $$BUS_VERSION is older than 0.7.12, the first bus that reads BUS_NATS_PASSWORD_FILE (the broker password is a secret in this compose file; 0.7.11 added DATABASE_PASSWORD_FILE)"; fail=1; } ;; esac; 	[ -n "$$BUS_DASHBOARD_SECRET" ] || { echo "BUS_DASHBOARD_SECRET is not set (dashboard sessions would not survive a restart or work across replicas)"; fail=1; }; 	if [ -z "$$BUS_ALLOWED_HOSTS" ]; then 		echo "BUS_ALLOWED_HOSTS is not set (use your hostname, or '*' if a proxy validates Host)"; fail=1; 	elif [ "$$BUS_ALLOWED_HOSTS" = "*" ]; then 		echo "note: BUS_ALLOWED_HOSTS=* — only safe behind a proxy that validates the Host header"; 	fi; 	if [ "$$TRAEFIK_ENABLE" = "true" ] && [ -z "$$BUS_PUBLIC_HOST" ]; then 		echo "TRAEFIK_ENABLE=true but BUS_PUBLIC_HOST is not set (the proxy needs the hostname to route)"; fail=1; 	fi; 	[ $$fail -eq 0 ] || { echo ""; echo "refusing to deploy: fix the above, then re-run"; exit 1; }; 	echo "deploy preflight: ok"
 
 .PHONY: deploy
 deploy: deploy-check ## Deploy to the current Docker Swarm as stack '$(STACK)' -- REACHES A REAL ENVIRONMENT
@@ -230,6 +245,8 @@ deploy: deploy-check ## Deploy to the current Docker Swarm as stack '$(STACK)' -
 		|| { echo "network '$(TRAEFIK_NETWORK)' does not exist on this swarm: the proxy's stack must create it (attachable overlay), or set TRAEFIK_NETWORK"; exit 1; }
 	@docker secret inspect $(DB_PASSWORD_SECRET) >/dev/null 2>&1 \
 		|| { echo "secret '$(DB_PASSWORD_SECRET)' does not exist on this swarm: create it with docker secret create $(DB_PASSWORD_SECRET) -, or set DB_PASSWORD_SECRET"; exit 1; }
+	@docker secret inspect $(NATS_PASSWORD_SECRET) >/dev/null 2>&1 \
+		|| { echo "secret '$(NATS_PASSWORD_SECRET)' does not exist on this swarm: create it with openssl rand -hex 32 | docker secret create $(NATS_PASSWORD_SECRET) -, or set NATS_PASSWORD_SECRET"; exit 1; }
 	docker stack deploy -c Docker/docker-compose.yml $(STACK)
 
 # --- housekeeping -----------------------------------------------------------
