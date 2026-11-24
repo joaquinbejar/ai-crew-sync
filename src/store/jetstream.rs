@@ -141,7 +141,7 @@ pub struct InboxStatus {
 
 /// Connection settings. Kept away from the bus's own configuration: this is
 /// infrastructure an operator points at, never something a client supplies.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     /// e.g. `nats://127.0.0.1:4222`. TLS in production; the fixture runs
     /// plaintext on a private port.
@@ -149,6 +149,10 @@ pub struct Config {
     /// Runtime credential: publish and fetch only. Provisioning uses a
     /// different one, which the server process does not hold.
     pub credentials: Option<String>,
+    /// User and password, for a broker that authenticates with an
+    /// `authorization { user, password }` block instead of credentials
+    /// files. Mutually exclusive with `credentials`. Never logged.
+    pub user_password: Option<(String, String)>,
     /// Per-team stream ceilings for the body stream. Quotas are an operator
     /// decision — the right number depends on the disk the broker actually
     /// has — so they are configuration with a documented default, not a
@@ -160,6 +164,27 @@ pub struct Config {
     pub inbox_max_bytes: i64,
 }
 
+/// By hand so the password never reaches a log line or a panic message.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("url", &self.url)
+            .field("credentials", &self.credentials)
+            .field(
+                "user_password",
+                &self
+                    .user_password
+                    .as_ref()
+                    .map(|(user, _)| (user, "<redacted>")),
+            )
+            .field("max_messages", &self.max_messages)
+            .field("max_bytes", &self.max_bytes)
+            .field("inbox_max_messages", &self.inbox_max_messages)
+            .field("inbox_max_bytes", &self.inbox_max_bytes)
+            .finish()
+    }
+}
+
 impl Config {
     /// Production defaults: bounded, file-backed, refusing new writes when
     /// full rather than discarding history.
@@ -167,11 +192,55 @@ impl Config {
         Self {
             url: url.into(),
             credentials: None,
+            user_password: None,
             max_messages: DEFAULT_MAX_MESSAGES,
             max_bytes: DEFAULT_MAX_BYTES,
             inbox_max_messages: DEFAULT_INBOX_MAX_MESSAGES,
             inbox_max_bytes: DEFAULT_INBOX_MAX_BYTES,
         }
+    }
+
+    /// Takes the user and password from `BUS_NATS_USER` (default `bus`) and
+    /// `BUS_NATS_PASSWORD_FILE`, a file (a Docker secret) whose trimmed
+    /// content is the password. Nothing changes when the file variable is
+    /// unset or empty. A set variable naming an unreadable or empty file is
+    /// an error, never a silent fallback to an anonymous connection, and so
+    /// is combining it with a credentials file.
+    pub fn with_password_from_env(self) -> BusResult<Self> {
+        self.with_password_from(|name| std::env::var_os(name))
+    }
+
+    fn with_password_from(
+        mut self,
+        var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> BusResult<Self> {
+        let Some(path) = var("BUS_NATS_PASSWORD_FILE").filter(|p| !p.is_empty()) else {
+            return Ok(self);
+        };
+        if self.credentials.is_some() {
+            return Err(BusError::invalid(
+                "BUS_NATS_PASSWORD_FILE and a NATS credentials file are both set; use one",
+            ));
+        }
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            BusError::invalid(format!(
+                "BUS_NATS_PASSWORD_FILE: cannot read {}: {e}",
+                std::path::Path::new(&path).display()
+            ))
+        })?;
+        let password = content.trim();
+        if password.is_empty() {
+            return Err(BusError::invalid(
+                "BUS_NATS_PASSWORD_FILE: the file is empty",
+            ));
+        }
+        let user = var("BUS_NATS_USER")
+            .and_then(|u| u.into_string().ok())
+            .map(|u| u.trim().to_owned())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "bus".to_owned());
+        self.user_password = Some((user, password.to_owned()));
+        Ok(self)
     }
 
     /// Smaller ceilings for both streams, for a fixture whose broker has a
@@ -915,7 +984,12 @@ async fn connect_client(config: &Config) -> BusResult<async_nats::Client> {
                 .await
                 .map_err(|e| BusError::invalid(format!("could not read NATS credentials: {e}")))?
         }
-        None => async_nats::ConnectOptions::new(),
+        None => match &config.user_password {
+            Some((user, password)) => {
+                async_nats::ConnectOptions::with_user_and_password(user.clone(), password.clone())
+            }
+            None => async_nats::ConnectOptions::new(),
+        },
     };
     options
         // Reconnect is the client's job and it does it; what matters here is
@@ -1092,6 +1166,69 @@ fn classify(error: &str) -> Published {
 
 #[cfg(test)]
 mod tests {
+    fn temp_secret(name: &str, content: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "acs-nats-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn password_file_sets_user_and_password() {
+        let path = temp_secret("ok", "s3cret\n");
+        let p = path.clone();
+        let c = Config::new("nats://x")
+            .with_password_from(move |n| match n {
+                "BUS_NATS_PASSWORD_FILE" => Some(p.clone().into()),
+                "BUS_NATS_USER" => Some("crew".into()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(c.user_password, Some(("crew".into(), "s3cret".into())));
+        assert!(!format!("{c:?}").contains("s3cret"));
+        let p = path.clone();
+        let c = Config::new("nats://x")
+            .with_password_from(move |n| (n == "BUS_NATS_PASSWORD_FILE").then(|| p.clone().into()))
+            .unwrap();
+        assert_eq!(c.user_password.unwrap().0, "bus");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn password_file_errors_are_never_silent() {
+        let none = Config::new("nats://x")
+            .with_password_from(|_| None)
+            .unwrap();
+        assert!(none.user_password.is_none());
+        let missing =
+            Config::new("nats://x").with_password_from(|_| Some("/nonexistent/acs-nats".into()));
+        assert!(missing.is_err());
+        let empty = temp_secret("empty", "  \n");
+        let p = empty.clone();
+        assert!(
+            Config::new("nats://x")
+                .with_password_from(
+                    move |n| (n == "BUS_NATS_PASSWORD_FILE").then(|| p.clone().into())
+                )
+                .is_err()
+        );
+        let full = temp_secret("both", "pw");
+        let p = full.clone();
+        let mut both = Config::new("nats://x");
+        both.credentials = Some("/x.creds".into());
+        assert!(
+            both.with_password_from(
+                move |n| (n == "BUS_NATS_PASSWORD_FILE").then(|| p.clone().into())
+            )
+            .is_err()
+        );
+        std::fs::remove_file(empty).ok();
+        std::fs::remove_file(full).ok();
+    }
+
     use super::*;
 
     #[test]
@@ -1133,6 +1270,7 @@ mod tests {
         let err = none.validate_quotas().unwrap_err().to_string();
         assert!(err.contains("at least 1"), "{err}");
         let defaults = Config::new("nats://x");
+        assert!(defaults.user_password.is_none());
         assert_eq!(defaults.inbox_max_bytes, DEFAULT_INBOX_MAX_BYTES);
         assert!(defaults.inbox_max_bytes < defaults.max_bytes);
     }

@@ -2073,6 +2073,7 @@ server's with their defaults.
 | `BUS_EVENT_PING_SECS` | `30` | How often each replica pings its own LISTEN connection; three missed echoes reattach it. |
 | `BUS_NATS_URL` | unset | The broker. Unset means no broker is ever contacted. Also read by `team stream` and `conversations migrate`. |
 | `BUS_NATS_CREDENTIALS` | unset | The server's *runtime* credentials file (it cannot create streams). |
+| `BUS_NATS_USER`, `BUS_NATS_PASSWORD_FILE` | `bus`, unset | User and password for a broker with an `authorization` block; the password file (a Docker secret) is trimmed. Used by the server and by `team stream`/`team migrate`. An unreadable or empty file is an error, and so is combining it with `BUS_NATS_CREDENTIALS`. |
 | `BUS_PUBLICATION_WORKER` | `true` | Whether this replica drains the outbox (only with a broker). |
 | `RUST_LOG` | `ai_crew_sync=info,tower_http=info,warn` | Log filter. |
 

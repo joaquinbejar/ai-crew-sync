@@ -130,6 +130,7 @@ async fn spawn_server_with_ping(
             dashboard_secret: b"test-dashboard-secret".to_vec(),
             nats_url: nats,
             nats_credentials: None,
+            nats_user_password: None,
             // The publication tests drive the outbox themselves, one step at
             // a time, so the timing under test is the test's and not a
             // background loop's.
@@ -415,6 +416,7 @@ async fn setup_rate_limited(schema: &str, per_minute: u32) -> Option<Harness> {
             dashboard_secret: b"test-dashboard-secret".to_vec(),
             nats_url: None,
             nats_credentials: None,
+            nats_user_password: None,
             publication_worker: false,
             event_ping_secs: ai_crew_sync::events::DEFAULT_PING_SECS,
         },
