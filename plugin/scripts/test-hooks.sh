@@ -396,6 +396,21 @@ out="$(drain "$SELF_SAME" sess-k market-data)"
 [ -z "$out" ] && ok "this window's own message is still not raised to itself" \
     || bad "own-window message must stay silent" "$out"
 
+# Scope "all" also returns the questions this agent asked other people. One
+# sent from another window, or from a window without a session, is not "sent
+# by this window", so the drain used to block and ask the model to answer its
+# own ask_agent. Only a question addressed to this agent is one to answer.
+OWN_ASK_CROSS='[{"id":33,"from":"joaquin","from_session":"coordination","to":"dani","body":"which port does the api use?","metadata":{"question":true}}]'
+OWN_ASK_NOSESSION='[{"id":34,"from":"joaquin","to":"dani","body":"is the api deployed?","metadata":{"question":true}}]'
+
+out="$(drain "$OWN_ASK_CROSS" sess-p market-data)"
+[ -z "$out" ] && ok "a question this agent asked someone else is not raised to itself" \
+    || bad "own ask_agent to another agent surfaced as incoming" "$out"
+
+out="$(drain "$OWN_ASK_NOSESSION" sess-q market-data)"
+[ -z "$out" ] && ok "a sessionless own question to someone else stays silent" \
+    || bad "own sessionless ask_agent surfaced as incoming" "$out"
+
 # A single malformed message used to abort the whole comprehension and mute
 # every pending question for that turn — silently, and for as long as the bad
 # row stayed in the 50-message window.
