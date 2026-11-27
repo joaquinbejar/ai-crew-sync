@@ -611,6 +611,8 @@ Dale a Antigravity su propio agente, como a cualquier otra herramienta (ver
 
 Antigravity no tiene hooks en segundo plano, así que una conversación
 inactiva no se despierta.
+Un patrón de ayudante local para ello, y sus límites, están en
+[docs/adapters/antigravity-wake.md](docs/adapters/antigravity-wake.md) (en inglés).
 
 **Valores del proyecto con una instalación global.** Un plugin instalado con
 `agy plugin install` arranca el proxy en el directorio del plugin, no en tu
