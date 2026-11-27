@@ -587,6 +587,8 @@ tool"). What was verified with `agy` 1.4.3:
 - **Stop.** It keeps the loop going to answer a waiting question.
 
 Antigravity has no background hooks, so an idle conversation is not woken.
+A local helper pattern for it, and its limits, are in
+[docs/adapters/antigravity-wake.md](docs/adapters/antigravity-wake.md).
 
 **Project defaults with a global install.** A plugin installed with
 `agy plugin install` starts the proxy in the plugin's directory, not in your
