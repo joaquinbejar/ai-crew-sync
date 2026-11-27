@@ -466,7 +466,9 @@ The plugin comes fully preconfigured:
   unread messages never wake a window twice, a newer watcher replaces the
   older one, and it gives up quietly after `BUS_WATCH_SECS` (default 14000 s,
   under the hook's 4 h timeout). Authenticated mode only (it needs the binary
-  and the window's own credential). Codex has no such hook; for it there is
+  and the window's own credential). Set `BUS_WATCH=off` (for example in the
+  project's host settings) for a window that has its own reader of the bus.
+  Codex has no such hook; for it there is
   an opt-in adapter (see "Waking an idle Codex thread" below).
 
 You no longer set `BUS_SESSION` for this: the proxy derives the session from
@@ -2096,6 +2098,7 @@ server's with their defaults.
 | `BUS_SESSION_TTL_SECS` | Lifetime the proxy asks for its session credential (60 – 86400; default the bus's 24 h). |
 | `BUS_SESSION_RENEW_LEAD_SECS` | How long before expiry the proxy renews it (default: half-way). |
 | `BUS_DIGEST_HOURS` | How far back the session-start summary looks (default 8). |
+| `BUS_WATCH` | `off` stops the background watcher (`watch.sh`) for the window or project where it is set; any other value, or none, leaves it on. |
 | `BUS_WATCH_SECS` | How long the background watcher waits on the bus for an idle window before giving up quietly (60-86400, default 14000; keep it under the hook's 4 h timeout). |
 | `BUS_RESUME_WAIT_SECS` | How long SessionStart waits for a resumed conversation's new proxy to resume its session before reporting the credential gone: whole seconds, 0 to 10, default 6 (anything else falls back to 6). |
 | `BUS_ADMIN_URL`, `BUS_ADMIN_TOKEN` | Together, replace the `admin login` file (CI). |

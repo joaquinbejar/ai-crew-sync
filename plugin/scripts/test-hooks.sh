@@ -786,5 +786,22 @@ out="$(printf '{}' | PATH="$WORK/storepy" ANTIGRAVITY_CONVERSATION_ID=ag-x \
     && ok "the Stop drain takes its no-Python path with only a broken python3" \
     || bad "python probe" "the Stop drain with only a broken python3: rc=$rc out=$out"
 
+# --- BUS_WATCH=off keeps the background watcher from starting ------------------
+mkdir -p "$WORK/watchbin"
+cat > "$WORK/watchbin/ai-crew-sync" <<'FAKE'
+#!/bin/sh
+echo started >> "$WATCH_LOG"
+FAKE
+chmod +x "$WORK/watchbin/ai-crew-sync"
+export WATCH_LOG="$WORK/watch.log"
+: > "$WATCH_LOG"
+printf '{"session_id":"w-on"}' | PATH="$WORK/watchbin:$PATH" sh "$ROOT/watch.sh" >/dev/null 2>&1
+[ -s "$WATCH_LOG" ] && ok "the watcher starts when BUS_WATCH is unset" \
+    || bad "watcher starts" "watch.sh did not run ai-crew-sync"
+: > "$WATCH_LOG"
+printf '{"session_id":"w-off"}' | BUS_WATCH=off PATH="$WORK/watchbin:$PATH" sh "$ROOT/watch.sh" >/dev/null 2>&1; rc=$?
+{ [ "$rc" -eq 0 ] && [ ! -s "$WATCH_LOG" ]; } && ok "BUS_WATCH=off starts no watcher and exits 0" \
+    || bad "BUS_WATCH=off" "rc=$rc, started: $(cat "$WATCH_LOG")"
+
 [ "$FAIL" -eq 0 ] && echo "plugin hooks: clean" || echo "plugin hooks: FAILURES"
 exit "$FAIL"

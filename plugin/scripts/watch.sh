@@ -14,6 +14,9 @@
 # binding. Without them (legacy mode, no bus, another host) it exits 0 and
 # does nothing; a watcher must never act as a guessed identity.
 set -u
+# BUS_WATCH=off: this window (or project) has its own reader of the bus, so
+# the wake-up would only repeat it. Checked first, before anything is started.
+[ "${BUS_WATCH:-}" = "off" ] && exit 0
 command -v ai-crew-sync >/dev/null 2>&1 || exit 0
 . "$(cd "$(dirname "$0")" && pwd)/python.sh"
 [ -n "$PY" ] || exit 0
