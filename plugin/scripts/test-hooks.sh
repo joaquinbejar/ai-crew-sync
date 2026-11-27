@@ -411,6 +411,13 @@ out="$(drain "$OWN_ASK_NOSESSION" sess-q market-data)"
 [ -z "$out" ] && ok "a sessionless own question to someone else stays silent" \
     || bad "own sessionless ask_agent surfaced as incoming" "$out"
 
+# The reverse pairing: a window with no session sees a question this agent
+# asked someone else from another window. Same message as the cross-session
+# case above, drained without a session name.
+out="$(drain "$OWN_ASK_CROSS" sess-r)"
+[ -z "$out" ] && ok "a sessionless window does not answer another window's own question" \
+    || bad "own cross-window ask_agent surfaced in a sessionless window" "$out"
+
 # A single malformed message used to abort the whole comprehension and mute
 # every pending question for that turn — silently, and for as long as the bad
 # row stayed in the 50-message window.
