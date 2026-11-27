@@ -145,7 +145,15 @@ def is_question(m):
     try:
         if not isinstance(m, dict) or not isinstance(m.get("id"), int):
             return False
-        if not m.get("to") or sent_by_this_window(m) or not for_this_window(m):
+        # Addressed to this agent, not merely a direct message. Scope "all"
+        # carries this agent's own outgoing messages too, so a question this
+        # agent asked someone else from another window (or before the window
+        # had a session) passed every check below, and the drain told the
+        # model to answer its own question. The server's pending_questions
+        # applies the same rule: recipient_agent_id is this agent.
+        if m.get("to") != me:
+            return False
+        if sent_by_this_window(m) or not for_this_window(m):
             return False
         metadata = m.get("metadata")
         if isinstance(metadata, str):
