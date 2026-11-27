@@ -484,7 +484,9 @@ El plugin trae todo preconfigurado:
   despiertan dos veces una ventana, un vigilante nuevo sustituye al anterior, y
   se rinde en silencio tras `BUS_WATCH_SECS` (por defecto 14000 s, por debajo
   del límite de 4 h del hook). Solo en modo autenticado (necesita el binario y
-  la credencial propia de la ventana). Codex no tiene un hook así; para él hay
+  la credencial propia de la ventana). Pon `BUS_WATCH=off` (por ejemplo en los
+  ajustes del proyecto del host) en una ventana que ya tiene su propio lector
+  del bus. Codex no tiene un hook así; para él hay
   un adaptador opcional (ver «Despertar un hilo de Codex inactivo» más abajo).
 
 Para esto ya no hace falta `BUS_SESSION`: el proxy deriva la sesión del id de
@@ -2156,6 +2158,7 @@ servidor con sus defaults.
 | `BUS_SESSION_TTL_SECS` | La vida que pide el proxy para su credencial de sesión (60 – 86400; por defecto las 24 h del bus). |
 | `BUS_SESSION_RENEW_LEAD_SECS` | Con cuánta antelación a que caduque la renueva el proxy (por defecto: a mitad de su vida). |
 | `BUS_DIGEST_HOURS` | Cuánto mira hacia atrás el resumen del arranque de sesión (por defecto 8). |
+| `BUS_WATCH` | `off` detiene el vigilante en segundo plano (`watch.sh`) en la ventana o el proyecto donde se define; cualquier otro valor, o ninguno, lo deja activo. |
 | `BUS_WATCH_SECS` | Cuánto espera en el bus el vigilante en segundo plano de una ventana inactiva antes de rendirse en silencio (60-86400, por defecto 14000; por debajo del límite de 4 h del hook). |
 | `BUS_RESUME_WAIT_SECS` | Cuánto espera el arranque de sesión a que el proxy nuevo de una conversación reanudada recupere su sesión antes de dar la credencial por perdida: segundos enteros de 0 a 10, por defecto 6 (cualquier otro valor vuelve a 6). |
 | `BUS_ADMIN_URL`, `BUS_ADMIN_TOKEN` | Juntas, sustituyen al fichero de `admin login` (CI). |
