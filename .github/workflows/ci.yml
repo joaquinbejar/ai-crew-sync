@@ -150,3 +150,14 @@ jobs:
       - name: Validate
         run: |
           docker compose --project-directory . -f Docker/docker-compose.yml config -q
+
+  # The plugin's hook scripts have their own regression tests (`make
+  # hooks-check`). They need no bus, database or network, and take about a
+  # minute. Ubuntu only: macOS `sh` differences are a separate question.
+  hooks:
+    name: plugin hook tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hook tests
+        run: make hooks-check
